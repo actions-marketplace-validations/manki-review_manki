@@ -43,6 +43,28 @@
 #   reviewer: claude-sonnet-4-6    # fast, parallel reviewers
 #   judge: claude-sonnet-4-6        # precise, single judge
 #   dedup: claude-haiku-4-5        # fast LLM dedup against prior findings
+#   # Per-agent model overrides. Keys must match a known reviewer name
+#   # (built-in agent or one declared under `reviewers:` above).
+#   # Resolution order per agent: agents[name] -> models.reviewer -> default.
+#   agents:
+#     "Security & Safety": claude-opus-4-7
+#
+# To use OpenAI, set `openai_api_key` (or `openai_oauth_token` for Codex CLI) and override models:
+# models:
+#   planner: gpt-4o-mini
+#   reviewer: gpt-4o-mini
+#   judge: o4-mini
+#   dedup: gpt-4o-mini
+#
+# To use Gemini, set `gemini_api_key` (or `gemini_oauth_token` for Gemini CLI) and override models:
+# models:
+#   planner: gemini-2.5-flash
+#   reviewer: gemini-2.5-flash
+#   judge: gemini-2.5-pro
+#   dedup: gemini-2.5-flash
+#
+# Models are auto-detected by prefix: `claude-*` -> Anthropic, `gpt-*` / `o*` -> OpenAI, `gemini-*` -> Gemini.
+# You can also use explicit `provider/model` syntax (e.g. `anthropic/claude-haiku-4-5`).
 
 # Planner stage (default: enabled)
 # When enabled and review_level is "auto", a fast pre-review pass chooses the
@@ -59,6 +81,10 @@
 # Only findings that appear consistently across passes are kept, reducing false positives.
 # Must be an integer between 1 and 5. Default: 1 (no multi-pass).
 # review_passes: 1
+
+# Hide the structured `Manki context` block as an HTML comment instead of a `<details>` block (default: false)
+# stats:
+#   hidden: false
 
 # Review memory (requires memory_repo_token)
 # Stores learnings, suppressions, and patterns to improve reviews over time

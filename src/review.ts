@@ -1,90 +1,63 @@
 import * as core from '@actions/core';
 import { minimatch } from 'minimatch';
 
-import { ClaudeClient } from './claude';
+import { TRIVIAL_VERIFIER_AGENT, buildAgentPool } from './agents';
+import { addUsage, LLMClient, LLMUsage, wrapClientForUsage, ZERO_USAGE, sanitizeLogOutput } from './providers';
 import { runJudgeAgent, JudgeInput, computeProvenanceMap } from './judge';
 import { RepoMemory, applySuppressions, buildMemoryContext } from './memory';
 import { LinkedIssue, titleToSlug } from './github';
-import { collectInPrSuppressions, deduplicateFindings, llmDeduplicateFindings, PreviousFinding } from './recap';
-import { ReviewConfig, ReviewerAgent, Finding, HandoverFinding, HandoverRound, OpenThread, ReviewResult, ReviewVerdict, VerdictReason, ParsedDiff, DiffFile, TeamRoster, PrContext, PlannerResult, PlannerRoundHint, SpecialistOutcome, EffortLevel, AgentPick, ProvenanceEntry, ThreadEvaluation, MAX_AGENT_RETRIES } from './types';
+import { collectInPrSuppressions, collectResolvedThreadIds, deduplicateFindings, llmDeduplicateFindings, PreviousFinding } from './recap';
+import { ReviewConfig, ReviewerAgent, Finding, FindingFingerprint, FindingFingerprintEntry, NoiseLevel, OpenThread, ReviewResult, ReviewVerdict, VerdictReason, ParsedDiff, DiffFile, TeamRoster, PrContext, PlannerResult, PlannerRoundHint, PriorRoundEffortDowngrade, RoundContext, RoundDedupDuplicateMatch, RoundPlannerSource, SpecialistOutcome, EffortLevel, AgentPick, ProvenanceEntry, ThreadEvaluation, VerdictTrace, VerdictTraceEntry, MAX_AGENT_RETRIES, VALID_PR_TYPES, ValidPrType } from './types';
 import { extractJSON } from './json';
+import { indexThreadEvaluations, isPriorAddressedByJudge } from './finding-fingerprint';
 
 const DISMISSED_LINE_TOLERANCE = 5;
 
-export const PLANNER_TIMEOUT_MS = 30_000;
+export const PLANNER_TIMEOUT_MS = 60_000;
+
+class PlannerTimeoutError extends Error {
+  constructor() {
+    super('Planner timed out');
+    this.name = 'PlannerTimeoutError';
+  }
+}
 
 const SUSPICIOUS_FAST_THRESHOLD_MS = 15_000;
 
-// Standard reviewer pool used for teamSize >= 3. TRIVIAL_VERIFIER_AGENT is
-// intentionally excluded — it is only active for the teamSize=1 path and does
-// not participate in scoring, focusAreas validation, or planner prompts.
-export const AGENT_POOL: readonly ReviewerAgent[] = Object.freeze([
-  {
-    name: 'Security & Safety',
-    focus: 'Vulnerabilities, injection, auth, data leaks, memory safety, crypto correctness, key exposure, timing side-channels',
-  },
-  {
-    name: 'Architecture & Design',
-    focus: 'Design patterns, coupling, abstractions, API design, module boundaries, separation of concerns, SOLID principles',
-  },
-  {
-    name: 'Correctness & Logic',
-    focus: 'Edge cases, off-by-one errors, null/undefined handling, race conditions, data integrity, type safety, error propagation',
-  },
-  {
-    name: 'Testing & Coverage',
-    focus: 'Missing tests, test quality, edge case coverage, assertion strength, mock appropriateness, test maintainability',
-  },
-  {
-    name: 'Performance & Efficiency',
-    focus: 'Unnecessary allocations, N+1 queries, hot path optimization, caching opportunities, async/concurrency patterns, memory usage',
-  },
-  {
-    name: 'Maintainability & Readability',
-    focus: 'Naming clarity, code complexity, dead code, DRY violations, documentation gaps, cognitive load',
-  },
-  {
-    name: 'Dependencies & Integration',
-    focus: 'API contracts, breaking changes, dependency versions, compatibility, external service integration, error handling at boundaries',
-  },
-]);
-
-const CORE_AGENTS: readonly number[] = Object.freeze([0, 1, 2]);
-
-export const TRIVIAL_VERIFIER_AGENT: ReviewerAgent = Object.freeze({
-  name: 'Trivial Change Verifier',
-  focus: 'Review this trivial change on two fronts: (1) check the actual content for issues appropriate to the change type — typos, stale references, broken markdown/links, incomplete renames; (2) verify the change is actually trivial as classified and flag any hidden behavior change, security implication, broken invariant, or missing test that would contradict that assessment.',
-});
-
-export function buildAgentPool(customReviewers?: ReviewerAgent[]): ReviewerAgent[] {
-  const pool = [...AGENT_POOL];
-  for (const custom of (customReviewers ?? [])) {
-    if (!pool.some(p => p.name === custom.name)) pool.push(custom);
-  }
-  return pool;
+function accumulateAgentUsage(map: Map<string, LLMUsage>, name: string, usage: LLMUsage): void {
+  map.set(name, addUsage(map.get(name) ?? { ...ZERO_USAGE }, usage));
 }
 
-// Ensures all CORE_AGENTS are present in the resolved team. Returns the agents
-// reordered so that core agents come first in CORE_AGENTS order (injecting any
-// that the planner omitted), followed by non-core planner picks in their
-// original planner order. Core inviolability supersedes teamSizeOverride.
-// The final roster may exceed the planner-requested size.
-function injectMissingCoreAgents(
-  resolved: ReviewerAgent[],
-  pool: ReviewerAgent[],
-): ReviewerAgent[] {
-  const coreSet = new Set(CORE_AGENTS.map(i => pool[i].name));
-  const orderedCore: ReviewerAgent[] = CORE_AGENTS.map(i => {
-    const coreAgent = pool[i];
-    const plannerPicked = resolved.find(r => r.name === coreAgent.name);
-    if (plannerPicked) {
-      return plannerPicked;
-    }
-    core.info(`planner omitted core agent "${coreAgent.name}"; injecting`);
-    return coreAgent;
-  });
-  const nonCore = resolved.filter(r => !coreSet.has(r.name));
-  return [...orderedCore, ...nonCore];
+function accumulateAgentDuration(map: Map<string, number>, name: string, durationMs: number): void {
+  map.set(name, (map.get(name) ?? 0) + durationMs);
+}
+
+// Fixed fallback roster used when the planner LLM is unavailable. Indexes into
+// `AGENT_POOL`: Security & Safety, Architecture & Design, Correctness & Logic.
+// The planner is trusted to pick agents on the success path; these three are
+// only a conservative default when no planner judgment is available.
+const FALLBACK_AGENTS: readonly number[] = Object.freeze([0, 1, 2]);
+
+// Path segment prefixes that indicate security-sensitive files. Used as a code-level
+// backstop: if the planner omits Security & Safety but the diff touches one of
+// these paths, the agent is force-added regardless of planner output. This
+// guard is narrow by design: it only targets the Security agent and only fires
+// when a sensitive path is detected, so it cannot be silenced by prompt
+// injection in the PR content.
+const SECURITY_SENSITIVE_PREFIXES: readonly string[] = Object.freeze([
+  'auth', 'oauth', 'token', 'secret', 'credential', 'password', 'passwd',
+  'crypto', 'cipher', 'encrypt', 'decrypt', 'hmac', 'sign',
+  'jwt', 'session', 'cookie', 'permission', 'acl', 'rbac', 'privilege',
+  'key', 'cert', 'tls', 'ssl', 'https',
+]);
+
+function hasSensitivePaths(diff: ParsedDiff): boolean {
+  return diff.files.some(f =>
+    f.path.toLowerCase().split('/').some(segment => {
+      const base = segment.replace(/\.[^.]+$/, '');
+      return SECURITY_SENSITIVE_PREFIXES.some(prefix => base.startsWith(prefix));
+    }),
+  );
 }
 
 // Resolves prior-round agent names against the current pool. Names that no
@@ -171,21 +144,32 @@ export function selectTeam(
     if (resolved.length > 0) {
       // Pin prior-round agents first (preserving their order), then append
       // any new planner picks. Deduplication keeps the prior order stable.
-      const unioned: ReviewerAgent[] = [...priorAgents];
+      const final: ReviewerAgent[] = [...priorAgents];
       for (const agent of resolved) {
-        if (!unioned.some(u => u.name === agent.name)) unioned.push(agent);
+        if (!final.some(u => u.name === agent.name)) final.push(agent);
       }
-      // Core inviolability: CORE_AGENTS are always present regardless of
-      // teamSizeOverride, so the final roster may exceed that value.
-      const final = injectMissingCoreAgents(unioned, pool);
+
+      // Code-level security backstop: if the planner omitted Security & Safety
+      // but the diff touches security-sensitive paths, force-add it. The planner
+      // receives untrusted PR content and prompt injection in diff comments or
+      // string literals could suppress the security specialist on a sensitive
+      // change. This guard is path-based, not prompt-based, so it cannot be
+      // bypassed by injected instructions.
+      const coreAgentInjections: string[] = [];
+      const securityAgent = pool.find(a => a.name === 'Security & Safety');
+      if (securityAgent && !final.some(a => a.name === 'Security & Safety') && hasSensitivePaths(diff)) {
+        if (!silent) core.info('Security & Safety force-added: planner omitted it but diff touches security-sensitive paths');
+        final.push(securityAgent);
+        coreAgentInjections.push(securityAgent.name);
+      }
+
       logPinAudit(final, priorNames, silent);
 
       let level: 'trivial' | 'small' | 'medium' | 'large';
-      if (final.length === 1) level = 'small';
-      else if (final.length <= 3) level = 'small';
+      if (final.length <= 3) level = 'small';
       else if (final.length <= 5) level = 'medium';
       else level = 'large';
-      return { level, agents: final, lineCount };
+      return { level, agents: final, lineCount, coreAgentInjections };
     }
     // If resolution failed entirely, fall through to heuristic
   }
@@ -211,60 +195,33 @@ export function selectTeam(
     teamSize = level === 'small' ? 3 : level === 'medium' ? 5 : 7;
   }
 
-  // Core agents always included, then prior-round agents (so prior order matches
-  // the planner path: prior-first, new additions last), then custom reviewers.
-  const selected: ReviewerAgent[] = CORE_AGENTS.map(i => pool[i]);
+  // Heuristic / fallback roster: start from the fixed fallback specialists,
+  // then pin prior-round agents, then add explicitly configured custom
+  // reviewers. Any remaining slots up to `teamSize` are filled from the pool
+  // in declared order. No path-keyword scoring lives here: the planner is the
+  // only place where PR context drives agent selection. When the planner is
+  // unavailable, the fallback stays conservative and predictable.
+  const selected: ReviewerAgent[] = FALLBACK_AGENTS.map(i => pool[i]);
 
-  // Pin prior-round agents next so the heuristic path preserves the same
-  // "prior first, new last" insertion order as the planner path.
   for (const agent of priorAgents) {
     if (!selected.some(s => s.name === agent.name)) {
       selected.push(agent);
     }
   }
 
-  // Custom reviewers always included (they were explicitly configured)
   for (const custom of (customReviewers || [])) {
     if (!selected.some(s => s.name === custom.name)) {
       selected.push(custom);
     }
   }
 
-  // Custom reviewers may push count above teamSize (intentional — they were explicitly configured).
-  // Only fill remaining slots if we haven't already reached teamSize.
   if (selected.length < teamSize) {
-    const paths = diff.files.map(f => f.path.toLowerCase());
-    const selectedNames = new Set(selected.map(s => s.name));
-
-    const candidates = pool.filter(a => !selectedNames.has(a.name)).map(agent => {
-      let score = 0;
-      const focus = agent.focus.toLowerCase();
-
-      if (focus.includes('test') && paths.some(p => p.includes('test'))) score += 3;
-
-      if ((focus.includes('performance') || focus.includes('efficiency')) &&
-        paths.some(p =>
-          p === 'index.ts' || p === 'index.js' || p === 'main.ts' || p === 'main.rs' ||
-          p.endsWith('/index.ts') || p.endsWith('/index.js') ||
-          p.endsWith('/main.ts') || p.endsWith('/main.rs') ||
-          p.includes('/server')
-        )) score += 2;
-
-      if (focus.includes('maintainab') && diff.files.length > 5) score += 2;
-
-      if ((focus.includes('dependencies') || focus.includes('dependency')) && paths.some(p =>
-        p.includes('package.json') || p.includes('cargo.toml') || p.includes('requirements')
-      )) score += 3;
-
-      const isCustom = !AGENT_POOL.some(p => p.name === agent.name);
-      if (isCustom) score += 1;
-
-      return { agent, score };
-    });
-
-    candidates.sort((a, b) => b.score - a.score);
-    const additional = candidates.slice(0, teamSize - selected.length).map(c => c.agent);
-    selected.push(...additional);
+    for (const agent of pool) {
+      if (selected.length >= teamSize) break;
+      if (!selected.some(s => s.name === agent.name)) {
+        selected.push(agent);
+      }
+    }
   }
 
   logPinAudit(selected, priorNames, silent);
@@ -322,10 +279,20 @@ export function intersectFindings(passes: Finding[][], threshold: number): Findi
 }
 
 export interface ReviewClients {
-  reviewer: ClaudeClient;
-  judge: ClaudeClient;
-  planner?: ClaudeClient;
-  dedup?: ClaudeClient;
+  reviewer: LLMClient;
+  judge: LLMClient;
+  planner?: LLMClient;
+  dedup?: LLMClient;
+  /**
+   * Optional resolver returning the reviewer client for a specific agent. When
+   * present, it takes precedence over `reviewer`. Used to apply per-agent
+   * model overrides from `models.agents`.
+   */
+  reviewerForAgent?: (agentName: string) => LLMClient;
+}
+
+function pickReviewerClient(clients: ReviewClients, agentName: string): LLMClient {
+  return clients.reviewerForAgent?.(agentName) ?? clients.reviewer;
 }
 
 export interface ReviewProgress {
@@ -334,13 +301,17 @@ export interface ReviewProgress {
   agentFindingCount?: number;
   agentDurationMs?: number;
   agentStatus?: 'success' | 'failure' | 'retrying';
-  rawFindingCount: number;
+  rawFindingCount?: number;
   judgeInputCount?: number;
   completedAgents?: number;
   totalAgents?: number;
   plannerResult?: PlannerResult;
   plannerDurationMs?: number;
   retryCount?: number;
+  /** Names of agents resolved for this review. Emitted with a `planning` event on the heuristic-fallback path so the dashboard can seed per-agent entries even though no `plannerResult` is available. */
+  teamAgentNames?: string[];
+  /** True when team selection fell back to the heuristic because the planner failed or timed out. */
+  heuristicFallback?: boolean;
 }
 
 function buildPlannerSummary(diff: ParsedDiff, prContext?: PrContext): string {
@@ -378,7 +349,7 @@ const PLANNER_HINTS_ROUND_WINDOW = 2;
  * skipping entries that predate the `specialist` field. Returns an empty
  * array when no round carries specialist attribution.
  */
-export function buildPlannerHints(rounds: HandoverRound[] | undefined): PlannerRoundHint[] {
+export function buildPlannerHints(rounds: RoundContext[] | undefined): PlannerRoundHint[] {
   if (!rounds || rounds.length === 0) return [];
 
   const recent = rounds.slice(-PLANNER_HINTS_ROUND_WINDOW);
@@ -386,19 +357,19 @@ export function buildPlannerHints(rounds: HandoverRound[] | undefined): PlannerR
 
   for (const round of recent) {
     const bySpecialist = new Map<string, SpecialistOutcome>();
-    for (const f of round.findings) {
+    for (const f of round.findings.entries) {
       if (!f.specialist) continue;
       let entry = bySpecialist.get(f.specialist);
       if (!entry) {
         entry = { specialist: f.specialist, findingsKept: 0, findingsDismissed: 0 };
         bySpecialist.set(f.specialist, entry);
       }
-      if (f.authorReply === 'agree') entry.findingsDismissed++;
+      if (f.authorReplyClass === 'agree') entry.findingsDismissed++;
       else entry.findingsKept++;
     }
 
     if (bySpecialist.size === 0) continue;
-    hints.push({ round: round.round, specialistOutcomes: Array.from(bySpecialist.values()) });
+    hints.push({ round: round.meta.round, specialistOutcomes: Array.from(bySpecialist.values()) });
   }
 
   return hints;
@@ -422,16 +393,58 @@ Specialists whose recent findings were entirely dismissed warrant lower priority
 `;
 }
 
+/**
+ * Single-shot context for the current planner invocation. Distinct from
+ * `PlannerRoundHint` (which is per-prior-round). Only rendered when `round > 1`
+ * so round 1 prompts stay identical to the pre-follow-up baseline.
+ */
+export interface PlannerFollowUpContext {
+  /** 1-indexed round number for the current review. */
+  round: number;
+  /** Line count of the inter-round delta diff (0 when the delta is empty). */
+  deltaLines: number;
+  /**
+   * Agent names from prior rounds that will be unioned with the planner's
+   * picks before the team runs. Empty array is treated as no pinned team.
+   */
+  pinnedTeam: string[];
+}
+
+export function countChangedLines(diff: string): number {
+  if (!diff) return 0;
+  return diff.split('\n').filter(line => {
+    if (line.startsWith('+++') || line.startsWith('---')) return false;
+    return line.startsWith('+') || line.startsWith('-');
+  }).length;
+}
+
+function renderFollowUpContext(ctx: PlannerFollowUpContext): string {
+  const teamList = ctx.pinnedTeam.length > 0
+    ? ctx.pinnedTeam.map(n => `"${n}"`).join(', ')
+    : '(none)';
+  return `## Follow-Up Round Context
+
+This is round ${ctx.round}. The inter-round delta is ${ctx.deltaLines} lines. The pinned team from prior rounds is: ${teamList}.
+
+Your picks will be unioned with the pinned team before the review runs. Picking a subset of the pinned team keeps the team the same size. Picking names outside the pinned team grows the team. Default to the pinned team unless the delta introduces a concern outside its coverage, in which case add the missing specialist.
+
+`;
+}
+
 export function buildPlannerSystemPrompt(
   agents: Array<{ name: string; focus: string }>,
   hints?: PlannerRoundHint[],
+  followUpContext?: PlannerFollowUpContext,
 ): string {
   const agentList = agents.map(a => `  - "${a.name}" — ${a.focus}`).join('\n');
   const hintsBlock = hints && hints.length > 0 ? renderPlannerHints(hints) : '';
+  const followUpBlock = followUpContext && followUpContext.round > 1
+    ? renderFollowUpContext(followUpContext)
+    : '';
 
   return `You are a code review planning assistant. Analyze this PR and decide how to review it.
 
-${hintsBlock}Decide:
+${hintsBlock}${followUpBlock}Decide:
 1. teamSize: 1-7 reviewer agents.
    Default to 3. Use 2 when the change is small but non-trivial. Scale to 4-5 for broader changes. 7 is rare — reserve it for changes where missing a specialist would be dangerous. Diff size alone doesn't determine team size — a 50-line auth change needs more eyes than a 500-line rename.
    - 1: changes where a bug is unrealistic (docs, comments, renames)
@@ -441,6 +454,7 @@ ${hintsBlock}Decide:
    - 6-7: security/crypto-critical, architectural overhauls
 2. agents: pick exactly teamSize agents from the pool below, each with an effort level ("low", "medium", or "high"):
 ${agentList}
+   Your picks stand as-is, no agent is auto-added on top. Include "Security & Safety" whenever the change could plausibly affect a security surface (authentication, authorization, parsers, deserialization, network handlers, file or process operations, permission checks, token or secret handling, cryptography). Judge the change, not the filename: a small auth tweak warrants Security even when the diff is tiny.
    Effort controls thinking depth and cost. low = fast pass, no extended reasoning. medium = moderate reasoning (~5K thinking tokens). high = deep analysis (~10K thinking tokens). Higher effort catches subtle bugs but costs more. Match effort to the risk level of each agent's assignment — security on auth code needs high, maintainability on a rename needs low.
    - low: the agent's specialty is not very relevant to this PR
    - medium: standard relevance
@@ -449,7 +463,19 @@ ${agentList}
    - low: few expected findings, straightforward changes
    - medium: moderate findings expected
    - high: many findings expected, nuanced severity decisions
-4. prType: one of "feature", "bugfix", "refactor", "docs", "test", "chore", "rename"
+4. prType: one Conventional Commits type that best fits the PR. Pick from:
+   - "build": build system, packaging, or dependency changes
+   - "chore": maintenance with no user-visible behavior change
+   - "ci": CI/CD configuration changes
+   - "docs": documentation-only changes
+   - "feat": new user-visible functionality or capability
+   - "fix": bug fix correcting broken behavior
+   - "perf": performance improvement with no other observable change
+   - "refactor": restructuring code with no behavior change (renames go here)
+   - "revert": reverting a prior commit
+   - "style": formatting or whitespace with no structural change
+   - "test": adding or updating tests only
+   Pick the dominant intent. Prefer "feat" over "chore" when the change adds capability, "fix" over "refactor" when it corrects broken behavior, "build" over "ci" when it touches packaging or deps rather than workflow YAML, "refactor" over "style" when structure changes, not just formatting.
 5. language: the primary programming language of the changed code (e.g., "typescript", "rust", "python"). Omit if unclear.
 6. context: a short phrase describing the project domain (e.g., "blockchain consensus library", "REST API server"). Omit if unclear.
 
@@ -457,7 +483,7 @@ Respond with ONLY a JSON object (no markdown fences):
 {
   "teamSize": 3,
   "judgeEffort": "medium",
-  "prType": "feature",
+  "prType": "feat",
   "language": "typescript",
   "context": "GitHub Actions bot",
   "agents": [
@@ -470,7 +496,6 @@ Respond with ONLY a JSON object (no markdown fences):
 
 const VALID_TEAM_SIZES = new Set([1, 2, 3, 4, 5, 6, 7]);
 const VALID_EFFORTS = new Set(['low', 'medium', 'high']);
-const VALID_PR_TYPES = new Set(['feature', 'bugfix', 'refactor', 'docs', 'test', 'chore', 'rename']);
 
 /**
  * Sanitize a free-text field from the planner LLM to prevent prompt injection.
@@ -514,22 +539,35 @@ export function parseAgentPicks(
   return picks;
 }
 
+/**
+ * Optional sink that captures the short tag describing why the planner fell
+ * back, when it did. Mutated in place by `runPlanner` on the failure paths so
+ * callers can record it on `RoundPlanner.fallbackReason` without changing the
+ * public return type. Values: `'timeout'`, `'invalid_teamSize'`,
+ * `'invalid_judgeEffort'`, `'agents_teamSize_mismatch'`, `'exception'`.
+ */
+export interface PlannerOutcomeSink {
+  fallbackReason?: string;
+}
+
 export async function runPlanner(
-  client: ClaudeClient,
+  client: LLMClient,
   diff: ParsedDiff,
   prContext?: PrContext,
   customReviewers?: ReviewerAgent[],
   priorRoundHints?: PlannerRoundHint[],
+  outcome?: PlannerOutcomeSink,
+  followUpContext?: PlannerFollowUpContext,
 ): Promise<PlannerResult | null> {
   let timeoutId: ReturnType<typeof setTimeout>;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error('Planner timed out')), PLANNER_TIMEOUT_MS);
+    timeoutId = setTimeout(() => reject(new PlannerTimeoutError()), PLANNER_TIMEOUT_MS);
   });
 
   try {
     const pool = buildAgentPool(customReviewers);
     const availableNames = new Set(pool.map(a => a.name));
-    const systemPrompt = buildPlannerSystemPrompt(pool, priorRoundHints);
+    const systemPrompt = buildPlannerSystemPrompt(pool, priorRoundHints, followUpContext);
 
     const userMessage = buildPlannerSummary(diff, prContext);
     const response = await Promise.race([
@@ -544,12 +582,14 @@ export async function runPlanner(
     const teamSize = parsed.teamSize;
     if (!VALID_TEAM_SIZES.has(teamSize)) {
       core.warning(`Planner returned invalid teamSize ${teamSize} — falling back to heuristic`);
+      if (outcome) outcome.fallbackReason = 'invalid_teamSize';
       return null;
     }
 
     const judgeEffort = parsed.judgeEffort;
     if (!VALID_EFFORTS.has(judgeEffort)) {
       core.warning('Planner returned invalid judgeEffort — falling back to heuristic');
+      if (outcome) outcome.fallbackReason = 'invalid_judgeEffort';
       return null;
     }
 
@@ -560,13 +600,14 @@ export async function runPlanner(
       : 'medium';
 
     const prTypeRaw = typeof parsed.prType === 'string' ? parsed.prType : 'unknown';
-    const prType = VALID_PR_TYPES.has(prTypeRaw) ? prTypeRaw : 'unknown';
+    const prType: ValidPrType | 'unknown' = VALID_PR_TYPES.has(prTypeRaw) ? (prTypeRaw as ValidPrType) : 'unknown';
 
     // Parse agent picks
     const agents = parseAgentPicks(parsed.agents, availableNames);
     if (agents) {
       if (agents.length !== teamSize) {
         core.warning(`Planner agents.length (${agents.length}) differs from teamSize (${teamSize}) — falling back to heuristic`);
+        if (outcome) outcome.fallbackReason = 'agents_teamSize_mismatch';
         return null;
       }
     }
@@ -580,7 +621,15 @@ export async function runPlanner(
     return { teamSize, reviewerEffort, judgeEffort, prType, agents: agents ?? undefined, language, context };
   } catch (error) {
     clearTimeout(timeoutId!);
+    if (error instanceof PlannerTimeoutError) {
+      core.warning(
+        'Planner timed out, falling back to heuristic team selection. If your workflow does not pre-install the Claude Code CLI, see the "spawn claude ENOENT" row in SETUP.md.',
+      );
+      if (outcome) outcome.fallbackReason = 'timeout';
+      return null;
+    }
     core.warning(`Planner failed: ${error} — falling back to heuristic team selection`);
+    if (outcome) outcome.fallbackReason = 'exception';
     return null;
   }
 }
@@ -588,9 +637,23 @@ export async function runPlanner(
 function heuristicFallback(
   diff: ParsedDiff,
   config: ReviewConfig,
+  /**
+   * Agents from prior rounds to carry forward for continuity. Intentionally
+   * ignored when `forceFixedRoster=true`: the fixed failure roster must be
+   * exact, so prior-round pinning is suppressed on the planner-failure path.
+   */
   priorRoundAgents?: string[],
+  /**
+   * When `true`, ignore `review_level` and force the conservative fixed roster
+   * of {Security, Architecture, Correctness}. Used when the planner is
+   * unavailable so failures stay predictable. When `false`, honor the
+   * configured `review_level` (the user explicitly opted out of the planner).
+   */
+  forceFixedRoster?: boolean,
 ): TeamRoster {
-  const team = selectTeam(diff, config, config.reviewers, undefined, undefined, priorRoundAgents);
+  const team = forceFixedRoster
+    ? selectTeam(diff, config, undefined, FALLBACK_AGENTS.length as 1 | 2 | 3 | 4 | 5 | 6 | 7, undefined, undefined)
+    : selectTeam(diff, config, config.reviewers, undefined, undefined, priorRoundAgents);
   core.info(`Review team (${team.level}): ${team.agents.map(a => a.name).join(', ')}`);
   return team;
 }
@@ -598,12 +661,12 @@ function heuristicFallback(
 // Collects the union of agent names that participated in any prior round of
 // this PR. Used to pin the team across rounds so the roster grows
 // monotonically: an agent that flagged something earlier reviews later rounds.
-export function collectPriorRoundAgents(priorRounds?: HandoverRound[]): string[] {
+export function collectPriorRoundAgents(priorRounds?: RoundContext[]): string[] {
   if (!priorRounds || priorRounds.length === 0) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const round of priorRounds) {
-    for (const name of round.agents ?? []) {
+    for (const name of round.reviewers.agents ?? []) {
       if (!seen.has(name)) {
         seen.add(name);
         out.push(name);
@@ -622,11 +685,12 @@ const EFFORT_DOWNGRADE_MIN_SAMPLE = 2;
  * such picks to \`low\` and logs the change. Mutates picks in place for
  * simplicity. The planner result object is not shared across reviews.
  */
-function applyEffortDowngrade(picks: AgentPick[], hints: PlannerRoundHint[]): void {
-  if (hints.length === 0) return;
+function applyEffortDowngrade(picks: AgentPick[], hints: PlannerRoundHint[]): PriorRoundEffortDowngrade[] {
+  if (hints.length === 0) return [];
 
   const lastHint = hints[hints.length - 1];
   const byName = new Map(lastHint.specialistOutcomes.map(o => [o.specialist, o]));
+  const downgrades: PriorRoundEffortDowngrade[] = [];
 
   for (const pick of picks) {
     if (pick.effort !== 'high') continue;
@@ -637,8 +701,42 @@ function applyEffortDowngrade(picks: AgentPick[], hints: PlannerRoundHint[]): vo
     core.info(
       `Downgrading "${pick.name}" effort from high to low — round ${lastHint.round} dismissed all ${outcome.findingsDismissed} findings from this specialist`,
     );
+    downgrades.push({ agent: pick.name, from: pick.effort, to: 'low' });
     pick.effort = 'low';
   }
+
+  return downgrades;
+}
+
+function emitHeuristicFallbackPlanning(
+  onProgress: (progress: ReviewProgress) => void,
+  team: TeamRoster,
+  plannerDurationMs?: number,
+): void {
+  onProgress({
+    phase: 'planning',
+    teamAgentNames: team.agents.map(a => a.name),
+    heuristicFallback: true,
+    ...(plannerDurationMs !== undefined ? { plannerDurationMs } : {}),
+  });
+}
+
+export function buildProvenanceFields(
+  plannerSource: RoundPlannerSource,
+  plannerFallbackReason: string | undefined,
+  team: TeamRoster,
+  priorRoundEffortDowngrades: PriorRoundEffortDowngrade[],
+  agentMultiPassConsistency: Map<string, { consistent: number; totalRaw: number }>,
+  agentRunEffort: Map<string, EffortLevel>,
+): Pick<ReviewResult, 'plannerSource' | 'plannerFallbackReason' | 'coreAgentInjections' | 'priorRoundEffortDowngrades' | 'agentMultiPassConsistency' | 'agentEffortMap'> {
+  return {
+    plannerSource,
+    ...(plannerFallbackReason && { plannerFallbackReason }),
+    coreAgentInjections: team.coreAgentInjections ?? [],
+    priorRoundEffortDowngrades,
+    ...(agentMultiPassConsistency.size > 0 && { agentMultiPassConsistency }),
+    agentEffortMap: agentRunEffort,
+  };
 }
 
 export async function runReview(
@@ -655,7 +753,7 @@ export async function runReview(
   isFollowUp?: boolean,
   openThreads?: OpenThread[],
   previousFindings?: PreviousFinding[],
-  priorRounds?: HandoverRound[],
+  priorRounds?: RoundContext[],
   prAuthorLogin?: string,
   interRoundDiff?: string,
 ): Promise<ReviewResult> {
@@ -664,32 +762,61 @@ export async function runReview(
   const priorRoundAgents = collectPriorRoundAgents(priorRounds);
   let team: TeamRoster;
   let plannerResult: PlannerResult | null = null;
+  let plannerUsage: LLMUsage | undefined;
+  let plannerDurationMs: number | undefined;
+  let plannerSource: RoundPlannerSource;
+  let plannerFallbackReason: string | undefined;
+  let priorRoundEffortDowngrades: PriorRoundEffortDowngrade[] = [];
 
   if (clients.planner && config.review_level === 'auto') {
     if (onProgress) {
-      onProgress({ phase: 'planning', rawFindingCount: 0 });
+      onProgress({ phase: 'planning' });
     }
     const plannerStart = Date.now();
-    plannerResult = await runPlanner(clients.planner, diff, prContext, config.reviewers, priorRoundHints);
-    const plannerDurationMs = Date.now() - plannerStart;
+    const plannerWrap = wrapClientForUsage(clients.planner);
+    const outcome: PlannerOutcomeSink = {};
+    const currentRound = (priorRounds?.length ?? 0) + 1;
+    const followUpContext: PlannerFollowUpContext | undefined = currentRound > 1
+      ? {
+          round: currentRound,
+          deltaLines: countChangedLines(interRoundDiff ?? ''),
+          pinnedTeam: priorRoundAgents,
+        }
+      : undefined;
+    plannerResult = await runPlanner(plannerWrap.client, diff, prContext, config.reviewers, priorRoundHints, outcome, followUpContext);
+    plannerUsage = plannerWrap.getTotals().usage;
+    plannerDurationMs = Date.now() - plannerStart;
     if (plannerResult) {
       if (plannerResult.agents && priorRoundHints.length > 0) {
-        applyEffortDowngrade(plannerResult.agents, priorRoundHints);
+        priorRoundEffortDowngrades = applyEffortDowngrade(plannerResult.agents, priorRoundHints);
       }
       team = selectTeam(diff, config, config.reviewers, plannerResult.teamSize, plannerResult.agents, priorRoundAgents);
+      plannerSource = 'planner';
       core.info(`Planner: ${plannerResult.teamSize} agents, reviewer: ${plannerResult.reviewerEffort}, judge: ${plannerResult.judgeEffort} (${plannerResult.prType})`);
       if (plannerResult.teamSize === 1) {
         const totalLines = diff.totalAdditions + diff.totalDeletions;
         core.info(`teamSize=1 decision: prType=${plannerResult.prType}, lines=${totalLines}, files=${diff.files.length}`);
       }
       if (onProgress) {
-        onProgress({ phase: 'planning', rawFindingCount: 0, plannerResult, plannerDurationMs });
+        onProgress({ phase: 'planning', plannerResult, plannerDurationMs });
       }
     } else {
-      team = heuristicFallback(diff, config, priorRoundAgents);
+      // Planner was attempted and failed. Force the fixed three-core roster.
+      team = heuristicFallback(diff, config, undefined, true);
+      plannerSource = 'heuristic_fallback';
+      plannerFallbackReason = outcome.fallbackReason;
+      if (onProgress) {
+        emitHeuristicFallbackPlanning(onProgress, team, plannerDurationMs);
+      }
     }
   } else {
-    team = heuristicFallback(diff, config, priorRoundAgents);
+    // Planner is disabled (either no client or user pinned `review_level`).
+    // Honor the configured `review_level` so explicit user choice is preserved.
+    team = heuristicFallback(diff, config, priorRoundAgents, false);
+    plannerSource = clients.planner ? 'heuristic' : 'disabled';
+    if (onProgress) {
+      emitHeuristicFallbackPlanning(onProgress, team);
+    }
   }
 
   const memoryContext = memory ? buildMemoryContext(memory) : '';
@@ -702,12 +829,26 @@ export async function runReview(
   const defaultReviewerEffort = plannerResult?.reviewerEffort;
   const judgeEffort = plannerResult?.judgeEffort ?? 'high';
 
+  // Record the effort each agent actually runs with: the planner pick (post
+  // downgrade) when present, otherwise the planner's reviewerEffort default,
+  // otherwise `'medium'` (matching `runReviewerAgent`'s implicit default when
+  // `effort` is `undefined` in the reviewer prompt).
+  const agentRunEffort = new Map<string, EffortLevel>();
+  for (const agent of team.agents) {
+    agentRunEffort.set(agent.name, agentEffortMap.get(agent.name) ?? defaultReviewerEffort ?? 'medium');
+  }
+
   const passes = config.review_passes ?? 1;
   const multiPass = passes > 1;
 
   const allFindings: Finding[] = [];
   const failedAgents: string[] = [];
   const agentResponseLengths = new Map<string, number>();
+  const agentUsage = new Map<string, LLMUsage>();
+  const agentDurationMs = new Map<string, number>();
+  const agentRetryCount = new Map<string, number>();
+  const agentFailureReasons = new Map<string, string>();
+  const agentMultiPassConsistency = new Map<string, { consistent: number; totalRaw: number }>();
 
   let completedCount = 0;
   let progressFindingCount = 0;
@@ -721,17 +862,21 @@ export async function runReview(
         Array.from({ length: passes }, () => {
           const shuffledDiff = shuffleDiffFiles(diff);
           const shuffledRawDiff = rebuildRawDiff(shuffledDiff);
-          return runReviewerAgent(clients.reviewer, config, agent, shuffledRawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: agentEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap });
+          return runReviewerAgent(pickReviewerClient(clients, agent.name), config, agent, shuffledRawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: agentEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap, interRoundDiff });
         })
       );
 
       const passFindings: Finding[][] = [];
       let totalResponseLength = 0;
+      let lastPassError: unknown;
       for (const result of passResults) {
         if (result.status === 'fulfilled') {
           passFindings.push(result.value.findings);
           totalResponseLength += result.value.responseLength;
+          accumulateAgentUsage(agentUsage, agent.name, result.value.usage);
+          accumulateAgentDuration(agentDurationMs, agent.name, result.value.latencyMs);
         } else {
+          lastPassError = result.reason;
           core.warning(`${agent.name} pass failed: ${result.reason}`);
         }
       }
@@ -744,6 +889,7 @@ export async function runReview(
         const consistent = intersectFindings(passFindings, threshold);
         const totalRaw = passFindings.reduce((sum, p) => sum + p.length, 0);
         core.info(`Multi-pass: ${agent.name} — ${passFindings.length} passes, ${consistent.length} consistent findings (from ${totalRaw} raw)`);
+        agentMultiPassConsistency.set(agent.name, { consistent: consistent.length, totalRaw });
         allFindings.push(...consistent);
 
         const durationMs = Date.now() - startTime;
@@ -765,6 +911,7 @@ export async function runReview(
         }
       } else {
         failedAgents.push(agent.name);
+        agentFailureReasons.set(agent.name, sanitizeLogOutput(String(((lastPassError as Error)?.message ?? lastPassError) || 'unknown failure')).slice(0, 500));
         core.warning(`${agent.name}: all passes failed`);
 
         if (onProgress) {
@@ -791,6 +938,7 @@ export async function runReview(
       const stillFailed: string[] = [];
       for (const agent of agentsToRetry) {
         retryCountMap[agent.name] = (retryCountMap[agent.name] ?? 0) + 1;
+        agentRetryCount.set(agent.name, retryCountMap[agent.name]);
 
         if (onProgress) {
           onProgress({
@@ -811,17 +959,21 @@ export async function runReview(
             const shuffledDiff = shuffleDiffFiles(diff);
             const shuffledRawDiff = rebuildRawDiff(shuffledDiff);
             const retryEffort = agentEffortMap.get(agent.name) ?? defaultReviewerEffort;
-            return runReviewerAgent(clients.reviewer, config, agent, shuffledRawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: retryEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap });
+            return runReviewerAgent(pickReviewerClient(clients, agent.name), config, agent, shuffledRawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: retryEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap, interRoundDiff });
           })
         );
 
         const retryPassFindings: Finding[][] = [];
         let retryTotalResponseLength = 0;
+        let retryLastError: unknown;
         for (const result of retryPassResults) {
           if (result.status === 'fulfilled') {
             retryPassFindings.push(result.value.findings);
             retryTotalResponseLength += result.value.responseLength;
+            accumulateAgentUsage(agentUsage, agent.name, result.value.usage);
+            accumulateAgentDuration(agentDurationMs, agent.name, result.value.latencyMs);
           } else {
+            retryLastError = result.reason;
             core.warning(`${agent.name} retry pass failed: ${result.reason}`);
           }
         }
@@ -829,9 +981,12 @@ export async function runReview(
         if (retryPassFindings.length > 0) {
           const threshold = Math.ceil(passes / 2);
           const consistent = intersectFindings(retryPassFindings, threshold);
+          const retryTotalRaw = retryPassFindings.reduce((sum, p) => sum + p.length, 0);
           core.info(`Multi-pass retry: ${agent.name} — ${retryPassFindings.length} passes, ${consistent.length} consistent findings`);
+          agentMultiPassConsistency.set(agent.name, { consistent: consistent.length, totalRaw: retryTotalRaw });
           allFindings.push(...consistent);
           agentResponseLengths.set(agent.name, retryTotalResponseLength);
+          agentFailureReasons.delete(agent.name);
           completedCount++;
 
           if (onProgress) {
@@ -848,6 +1003,7 @@ export async function runReview(
           }
         } else {
           stillFailed.push(agent.name);
+          agentFailureReasons.set(agent.name, sanitizeLogOutput(String(((retryLastError as Error)?.message ?? retryLastError) || 'unknown failure')).slice(0, 500));
           core.warning(`${agent.name}: retry ${retryCountMap[agent.name]} failed (all passes)`);
           if (onProgress) {
             onProgress({
@@ -873,10 +1029,12 @@ export async function runReview(
     const agentPromises = team.agents.map(agent => {
       const startTime = Date.now();
       const agentEffort = agentEffortMap.get(agent.name) ?? defaultReviewerEffort;
-      return runReviewerAgent(clients.reviewer, config, agent, rawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: agentEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap })
+      return runReviewerAgent(pickReviewerClient(clients, agent.name), config, agent, rawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: agentEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap, interRoundDiff })
         .then(agentResult => {
           completedCount++;
           agentResponseLengths.set(agent.name, agentResult.responseLength);
+          accumulateAgentUsage(agentUsage, agent.name, agentResult.usage);
+          accumulateAgentDuration(agentDurationMs, agent.name, agentResult.latencyMs);
           progressFindingCount += agentResult.findings.length;
           const durationMs = Date.now() - startTime;
 
@@ -925,6 +1083,7 @@ export async function runReview(
         core.info(`${team.agents[i].name}: ${result.value.length} findings`);
       } else {
         failedAgents.push(team.agents[i].name);
+        agentFailureReasons.set(team.agents[i].name, sanitizeLogOutput(String(((result.reason as Error)?.message ?? result.reason) || 'unknown failure')).slice(0, 500));
         core.warning(`${team.agents[i].name} failed: ${result.reason}`);
       }
     }
@@ -937,6 +1096,7 @@ export async function runReview(
 
       for (const agent of agentsToRetry) {
         retryCount[agent.name] = (retryCount[agent.name] ?? 0) + 1;
+        agentRetryCount.set(agent.name, retryCount[agent.name]);
         if (onProgress) {
           onProgress({
             phase: 'agent-complete',
@@ -954,20 +1114,23 @@ export async function runReview(
       const retryPromises = agentsToRetry.map(agent => {
         const startTime = Date.now();
         const retryEffort = agentEffortMap.get(agent.name) ?? defaultReviewerEffort;
-        return runReviewerAgent(clients.reviewer, config, agent, rawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: retryEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap })
-          .then(agentResult => ({ agent, agentResult, durationMs: Date.now() - startTime }))
-          .catch(() => ({ agent, agentResult: null as AgentResult | null, durationMs: Date.now() - startTime }));
+        return runReviewerAgent(pickReviewerClient(clients, agent.name), config, agent, rawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, { effort: retryEffort, language: plannerResult?.language, context: plannerResult?.context, provenanceMap, interRoundDiff })
+          .then(agentResult => ({ agent, agentResult, durationMs: Date.now() - startTime, error: null as unknown }))
+          .catch(error => ({ agent, agentResult: null as AgentResult | null, durationMs: Date.now() - startTime, error: error as unknown }));
       });
 
       const retryResults = await Promise.allSettled(retryPromises);
 
       const stillFailed: string[] = [];
       for (const settled of retryResults) {
-        const { agent, agentResult, durationMs } = (settled as PromiseFulfilledResult<{ agent: ReviewerAgent; agentResult: AgentResult | null; durationMs: number }>).value;
+        const { agent, agentResult, durationMs, error } = (settled as PromiseFulfilledResult<{ agent: ReviewerAgent; agentResult: AgentResult | null; durationMs: number; error: unknown }>).value;
         if (agentResult !== null) {
           // Remove from failed list, add findings
           allFindings.push(...agentResult.findings);
           agentResponseLengths.set(agent.name, agentResult.responseLength);
+          accumulateAgentUsage(agentUsage, agent.name, agentResult.usage);
+          accumulateAgentDuration(agentDurationMs, agent.name, agentResult.latencyMs);
+          agentFailureReasons.delete(agent.name);
           progressFindingCount += agentResult.findings.length;
           completedCount++;
           core.info(`${agent.name}: retry ${retryCount[agent.name]} succeeded — ${agentResult.findings.length} findings`);
@@ -985,6 +1148,7 @@ export async function runReview(
           }
         } else {
           stillFailed.push(agent.name);
+          agentFailureReasons.set(agent.name, sanitizeLogOutput(String(((error as Error)?.message ?? error) || 'unknown failure')).slice(0, 500));
           core.warning(`${agent.name}: retry ${retryCount[agent.name]} failed`);
           if (onProgress) {
             onProgress({
@@ -1026,6 +1190,8 @@ export async function runReview(
         reviewComplete: false,
         agentNames: team.agents.map(a => a.name),
         failedAgents,
+        ...(agentFailureReasons.size > 0 && { agentFailureReasons: Object.fromEntries(agentFailureReasons) }),
+        ...buildProvenanceFields(plannerSource, plannerFallbackReason, team, priorRoundEffortDowngrades, agentMultiPassConsistency, agentRunEffort),
       };
     }
 
@@ -1051,6 +1217,9 @@ export async function runReview(
 
   let staticDedupCount = 0;
   let llmDedupCount = 0;
+  let dedupUsage: LLMUsage | undefined;
+  let dedupDurationMs: number | undefined;
+  const duplicateMatches: RoundDedupDuplicateMatch[] = [];
   if (previousFindings && previousFindings.length > 0 && findingsForJudge.length > 0) {
     const { unique, duplicates } = deduplicateFindings(findingsForJudge, previousFindings, memory?.suppressions);
     if (duplicates.length > 0) {
@@ -1058,14 +1227,24 @@ export async function runReview(
     }
     findingsForJudge = unique;
     staticDedupCount = duplicates.length;
+    for (const d of duplicates) {
+      duplicateMatches.push({ droppedTitle: d.finding.title, matchedTitle: d.matchedTitle, matchType: d.matchType });
+    }
 
     if (clients.dedup && findingsForJudge.length > 0) {
-      const llmResult = await llmDeduplicateFindings(findingsForJudge, previousFindings, clients.dedup);
+      const dedupStart = Date.now();
+      const dedupWrap = wrapClientForUsage(clients.dedup);
+      const llmResult = await llmDeduplicateFindings(findingsForJudge, previousFindings, dedupWrap.client);
       if (llmResult.duplicates.length > 0) {
         core.info(`LLM dedup removed ${llmResult.duplicates.length} findings matching dismissed ones before judge`);
       }
       findingsForJudge = llmResult.unique;
       llmDedupCount = llmResult.duplicates.length;
+      for (const d of llmResult.duplicates) {
+        duplicateMatches.push({ droppedTitle: d.finding.title, matchedTitle: d.matchedTitle, matchType: d.matchType });
+      }
+      dedupUsage = dedupWrap.getTotals().usage;
+      dedupDurationMs = Date.now() - dedupStart;
     }
   }
 
@@ -1089,9 +1268,7 @@ export async function runReview(
   // Derive the set of currently-resolved thread IDs from the recap state. Used
   // by `applyCrossRoundSuppression` (mechanism C) to ratchet down findings
   // matching prior-round threads that have since been resolved.
-  const resolvedThreadIds = previousFindings
-    ? new Set(previousFindings.filter(f => f.status === 'resolved' && f.threadId).map(f => f.threadId!))
-    : new Set<string>();
+  const resolvedThreadIds = collectResolvedThreadIds(previousFindings);
   const suppressResolvedThreads = config.convergence?.suppress_resolved_threads !== false;
 
   let finalFindings: Finding[];
@@ -1100,7 +1277,11 @@ export async function runReview(
   let judgeThreadEvaluations: ThreadEvaluation[] | undefined;
   let judgeCrossRoundSuppressed: number | undefined;
   let judgeCrossRoundDemoted: number | undefined;
+  let judgeInterRoundDiffEmptyOverride: { applied: boolean; affectedThreadCount: number } | undefined;
   let inPrSuppressedCount = 0;
+  let judgeUsage: LLMUsage | undefined;
+  let judgeDurationMs: number | undefined;
+  let judgeRetryCount = 0;
   try {
     core.info(`Running judge on ${findingsForJudge.length} findings...`);
     const judgeInput: JudgeInput = {
@@ -1122,12 +1303,19 @@ export async function runReview(
       resolvedThreadIds,
       suppressResolvedThreads,
     };
-    const judgeResult = await runJudgeAgent(clients.judge, config, judgeInput);
+    const judgeStart = Date.now();
+    const judgeWrap = wrapClientForUsage(clients.judge);
+    const judgeResult = await runJudgeAgent(judgeWrap.client, config, judgeInput);
+    judgeDurationMs = Date.now() - judgeStart;
+    const judgeTotals = judgeWrap.getTotals();
+    judgeUsage = judgeTotals.usage;
+    judgeRetryCount = Math.max(0, judgeTotals.calls - 1);
     judgeSummary = judgeResult.summary;
     allJudgedFindings = judgeResult.findings;
     judgeThreadEvaluations = judgeResult.threadEvaluations;
     judgeCrossRoundSuppressed = judgeResult.crossRoundSuppressed;
     judgeCrossRoundDemoted = judgeResult.crossRoundDemoted;
+    judgeInterRoundDiffEmptyOverride = judgeResult.interRoundDiffEmptyOverride;
     inPrSuppressedCount = judgeResult.inPrSuppressedCount ?? 0;
     finalFindings = judgeResult.findings.filter(f => f.severity !== 'ignore');
     core.info(`Judge complete: ${finalFindings.length} findings survived (${judgeResult.findings.length - finalFindings.length} ignored)`);
@@ -1140,6 +1328,7 @@ export async function runReview(
       highlights: [],
       reviewComplete: false,
       agentNames: team.agents.map(a => a.name),
+      ...buildProvenanceFields(plannerSource, plannerFallbackReason, team, priorRoundEffortDowngrades, agentMultiPassConsistency, agentRunEffort),
     };
   }
 
@@ -1164,10 +1353,10 @@ export async function runReview(
       testNitSuppressedCount = before - finalFindings.length;
     }
   }
-  const priorFindingsFlat: HandoverFinding[] = [...(priorRounds ?? [])]
-    .sort((a, b) => a.round - b.round)
-    .flatMap(r => r.findings);
-  const { verdict, verdictReason } = determineVerdict(finalFindings, priorFindingsFlat, openThreads);
+  const sortedPriorRounds = [...(priorRounds ?? [])].sort((a, b) => a.meta.round - b.meta.round);
+  const priorFindingsFlat: FindingFingerprintEntry[] = sortedPriorRounds.flatMap(r => r.findings.entries);
+  const priorRoundLookup = buildPriorRoundLookup(sortedPriorRounds);
+  const { verdict, verdictReason, verdictTrace } = determineVerdict(finalFindings, priorFindingsFlat, openThreads, resolvedThreadIds, judgeThreadEvaluations, priorRoundLookup);
 
   const summary = judgeSummary;
 
@@ -1186,6 +1375,7 @@ export async function runReview(
   return {
     verdict,
     verdictReason,
+    verdictTrace,
     summary,
     findings: finalFindings,
     highlights: [],
@@ -1201,29 +1391,64 @@ export async function runReview(
     partialNote,
     staticDedupCount,
     llmDedupCount,
+    ...(duplicateMatches.length > 0 && { duplicateMatches }),
     suppressionCount,
     ...(inPrSuppressedCount > 0 && { inPrSuppressedCount }),
     agentResponseLengths,
+    agentUsage,
+    agentDurationMs,
+    agentRetryCount,
+    ...(agentFailureReasons.size > 0 && { agentFailureReasons: Object.fromEntries(agentFailureReasons) }),
+    ...(plannerUsage && { plannerUsage }),
+    ...(plannerDurationMs != null && { plannerDurationMs }),
+    ...(judgeUsage && { judgeUsage }),
+    ...(judgeDurationMs != null && { judgeDurationMs }),
+    judgeRetryCount,
+    ...(dedupUsage && { dedupUsage }),
+    ...(dedupDurationMs != null && { dedupDurationMs }),
     crossRoundSuppressed: judgeCrossRoundSuppressed,
     crossRoundDemoted: judgeCrossRoundDemoted,
+    ...(judgeInterRoundDiffEmptyOverride && { interRoundDiffEmptyOverride: judgeInterRoundDiffEmptyOverride }),
     ...(testNitSuppressedCount > 0 && { testNitSuppressedCount }),
+    ...buildProvenanceFields(plannerSource, plannerFallbackReason, team, priorRoundEffortDowngrades, agentMultiPassConsistency, agentRunEffort),
   };
 }
 
 interface AgentResult {
   findings: Finding[];
   responseLength: number;
+  usage: LLMUsage;
+  latencyMs: number;
 }
 
-interface RunReviewerAgentOptions {
+export interface BuildReviewerUserMessageOptions {
+  fileContents?: Map<string, string>;
+  prContext?: PrContext;
+  memoryContext?: string;
+  linkedIssues?: LinkedIssue[];
+  provenanceMap?: ProvenanceEntry[];
+  // On follow-up rounds, when non-empty, this delta replaces the full PR diff
+  // in the `## Pull Request Diff` block so reviewers focus on what changed
+  // since the prior round. Empty or undefined falls through to the full PR
+  // diff (first-round and "no new commits" semantics).
+  interRoundDiff?: string;
+}
+
+export interface RunReviewerAgentOptions {
   effort?: EffortLevel;
   language?: string;
   context?: string;
   provenanceMap?: ProvenanceEntry[];
+  // On follow-up rounds, when non-empty, this delta replaces the full PR diff
+  // in the `## Pull Request Diff` block so reviewers focus on what changed
+  // since the prior round. The `## Changed Files` block still ships full-PR
+  // files so the surrounding code is visible. Empty or undefined falls through
+  // to the full PR diff (first-round and "no new commits" semantics).
+  interRoundDiff?: string;
 }
 
-async function runReviewerAgent(
-  client: ClaudeClient,
+export async function runReviewerAgent(
+  client: LLMClient,
   config: ReviewConfig,
   reviewer: ReviewerAgent,
   rawDiff: string,
@@ -1234,14 +1459,19 @@ async function runReviewerAgent(
   linkedIssues?: LinkedIssue[],
   options: RunReviewerAgentOptions = {},
 ): Promise<AgentResult> {
-  const { effort, language, context, provenanceMap } = options;
-  const systemPrompt = buildReviewerSystemPrompt(reviewer, config, language, context);
-  const userMessage = buildReviewerUserMessage(rawDiff, repoContext, fileContents, prContext, memoryContext, linkedIssues, provenanceMap);
+  const { effort, language, context, provenanceMap, interRoundDiff } = options;
+  const systemPrompt = buildReviewerSystemPrompt(reviewer, config, language, context, config.noise_level);
+  const userMessage = buildReviewerUserMessage(rawDiff, repoContext, { fileContents, prContext, memoryContext, linkedIssues, provenanceMap, interRoundDiff });
 
   const sendOptions = effort ? { effort } : undefined;
   const response = await client.sendMessage(systemPrompt, userMessage, sendOptions);
   const findings = parseFindings(response.content, reviewer.name);
-  return { findings, responseLength: response.content.length };
+  return {
+    findings,
+    responseLength: response.content.length,
+    usage: response.usage ?? { ...ZERO_USAGE },
+    latencyMs: response.latencyMs ?? 0,
+  };
 }
 
 export function buildReviewerSystemPrompt(
@@ -1249,6 +1479,7 @@ export function buildReviewerSystemPrompt(
   config: ReviewConfig,
   language?: string,
   context?: string,
+  noiseLevel: NoiseLevel = 'low',
 ): string {
   let prompt = `You are a code reviewer specializing in: ${reviewer.focus}
 
@@ -1319,6 +1550,36 @@ When you include a \`suggestedFix\`, list any known caveats of the proposed shap
 - When review memory is provided, respect its learnings and suppressions. Do not flag patterns that are listed as intentionally suppressed.
 - If you notice changes in the diff that appear unrelated to the PR's stated purpose (title and description), flag them as a "suggestion" severity finding titled "Unrelated change: [brief description]". Recommend splitting into a separate PR. Only flag changes that are clearly out of scope — don't flag shared config, imports, or test files that naturally accompany the main changes.`;
 
+  if (noiseLevel === 'low') {
+    prompt += `
+
+## Noise Level: low
+
+Frame every potential finding through this lens: would a senior engineer mention this in a review where their time is the bottleneck? If the answer is no, do not include it.
+
+### Categories that are NEVER findings at this noise level
+
+Do not flag any of the following, regardless of severity:
+
+- Whitespace, indentation, blank-line placement, line length
+- Import ordering, grouping, or sort order
+- Trailing commas, semicolons, quote style, brace placement
+- Comment formatting, doc-comment presence or absence on individual symbols
+- Naming conventions already covered by the project's style guide (casing, prefixes, suffixes)
+- Anything a formatter (Prettier, gofmt, rustfmt, black, etc.) or default-config linter (ESLint recommended, clippy default, etc.) would catch automatically
+- Restating type information that a reader can see from the signature
+
+If a potential finding falls into any of these categories, omit it from your response entirely. Do not downgrade it to \`nitpick\` or \`ignore\`. Just drop it.`;
+  }
+  // 'medium' intentionally adds no extra section so the prompt matches the pre-noise_level body verbatim.
+  if (noiseLevel === 'high') {
+    prompt += `
+
+## Noise Level: high
+
+Surface marginal suggestions: in addition to substantive findings, actively include borderline observations that you would normally consider too minor to mention. Wording polish, micro-refactors, stylistic alternatives, and speculative improvements are all welcome at this level. Use \`suggestion\` or \`nitpick\` severity for these. The goal is breadth: prefer including a marginal observation over omitting it.`;
+  }
+
   if (config.instructions) {
     prompt += `\n\n## Additional Instructions\n\n${config.instructions}`;
   }
@@ -1360,12 +1621,9 @@ function annotateFileContentWithProvenance(
 export function buildReviewerUserMessage(
   rawDiff: string,
   repoContext: string,
-  fileContents?: Map<string, string>,
-  prContext?: PrContext,
-  memoryContext?: string,
-  linkedIssues?: LinkedIssue[],
-  provenanceMap?: ProvenanceEntry[],
+  options: BuildReviewerUserMessageOptions = {},
 ): string {
+  const { fileContents, prContext, memoryContext, linkedIssues, provenanceMap, interRoundDiff } = options;
   let message = '';
 
   if (prContext) {
@@ -1420,7 +1678,18 @@ export function buildReviewerUserMessage(
     }
   }
 
-  message += `## Pull Request Diff\n\n\`\`\`diff\n${truncateDiff(rawDiff)}\n\`\`\``;
+  const useDelta = interRoundDiff !== undefined && interRoundDiff.trim().length > 0;
+  const hasFileContents = fileContents !== undefined && fileContents.size > 0;
+  if (useDelta) {
+    message += `## Pull Request Diff (delta since prior review round)\n\n`;
+    const groundingNote = hasFileContents
+      ? `The \`## Changed Files\` block above still contains the full content of every file touched by the whole PR, so you can ground your review in the surrounding code. `
+      : '';
+    message += `Only the changes since the previous review round are shown below. ${groundingNote}Focus your findings on this delta — earlier changes were already reviewed in prior rounds.\n\n`;
+    message += `\`\`\`diff\n${truncateDiff(interRoundDiff)}\n\`\`\``;
+  } else {
+    message += `## Pull Request Diff\n\n\`\`\`diff\n${truncateDiff(rawDiff)}\n\`\`\``;
+  }
 
   return message;
 }
@@ -1469,12 +1738,12 @@ export function validateSeverity(severity: unknown): Finding['severity'] {
 }
 
 /**
- * Check whether a current finding matches a prior-round `HandoverFinding`.
+ * Check whether a current finding matches a prior-round fingerprint entry.
  * Uses file + title-slug with a line-window tolerance so small drift between
  * rounds does not break the match. Thread-resolved status is not consulted
- * (not in the handover today).
+ * here, only the cached author-reply class.
  */
-function matchesDismissedPrior(finding: Finding, prior: HandoverFinding): boolean {
+function matchesDismissedPrior(finding: Finding, prior: FindingFingerprintEntry): boolean {
   if (finding.line === 0) return false;
   if (finding.file !== prior.fingerprint.file) return false;
   if (titleToSlug(finding.title) !== prior.fingerprint.slug) return false;
@@ -1484,8 +1753,8 @@ function matchesDismissedPrior(finding: Finding, prior: HandoverFinding): boolea
   return line >= lo && line <= hi;
 }
 
-function wasDismissedInPriorRound(finding: Finding, priorRounds: HandoverFinding[]): boolean {
-  return priorRounds.some(p => p.authorReply === 'agree' && matchesDismissedPrior(finding, p));
+function wasDismissedInPriorRound(finding: Finding, priorRounds: FindingFingerprintEntry[]): boolean {
+  return priorRounds.some(p => p.authorReplyClass === 'agree' && matchesDismissedPrior(finding, p));
 }
 
 /**
@@ -1501,13 +1770,60 @@ function wasDismissedInPriorRound(finding: Finding, priorRounds: HandoverFinding
  * collapses to the round 2 entry, so the agreement is honored rather than the
  * stale round 1 state.
  */
-function dedupePriorFindings(priorRounds: HandoverFinding[]): HandoverFinding[] {
-  const byKey = new Map<string, HandoverFinding>();
+function isPriorLikelyUnresolved(
+  p: FindingFingerprintEntry,
+  openThreadIds: Set<string>,
+  openThreadsUnknown: boolean,
+  resolvedThreadIds: Set<string> | undefined,
+  threadEvaluationsByThreadId: Map<string, ThreadEvaluation>,
+): boolean {
+  if (p.severity !== 'warning' && p.severity !== 'blocker') return false;
+  if (p.authorReplyClass === 'agree') return false;
+  // Order matters. `openThreadsUnknown` must short-circuit before
+  // `resolvedThreadIds` because both signals come from the same recap scan,
+  // so a failed live fetch cannot fall back to cached "resolved" state.
+  // Judge-addressed acts as an override for warning priors when the GitHub
+  // thread is still open: the author landed the fix in the inter-round diff
+  // without explicitly resolving the thread. The judge's `addressed` verdict
+  // is accepted because `buildJudgeUserMessage` sanitizes untrusted PR/issue
+  // prose before it reaches the judge, and the adversarial fixture corpus
+  // (05_injection_attempt_unfixed) gates regressions in the judge's resistance
+  // to injected text. Blocker priors are never retired by LLM signal alone;
+  // they require GitHub thread resolution or explicit author agreement.
+  if (p.threadId && openThreadIds.has(p.threadId)) {
+    if (p.severity !== 'blocker' && isPriorAddressedByJudge(p, threadEvaluationsByThreadId)) return false;
+    return true;
+  }
+  if (openThreadsUnknown) return true;
+  if (p.threadId && resolvedThreadIds?.has(p.threadId)) return false;
+  // A prior with no `threadId` originates from a pre-`threadId` handover
+  // format. When GitHub confirms zero open review threads on the PR, no prior
+  // can still be blocking regardless of how the fingerprint was stored, so the
+  // missing-id case is allowed to retire alongside the id-bearing ones. When
+  // open threads do exist, the absent id leaves no way to match this prior
+  // against them, so the conservative block stands.
+  if (!p.threadId) return (openThreadIds?.size ?? 0) > 0;
+  return false;
+}
+
+function dedupePriorFindings(priorRounds: FindingFingerprintEntry[]): FindingFingerprintEntry[] {
+  const byKey = new Map<string, FindingFingerprintEntry>();
   for (const p of priorRounds) {
     const key = `f:${p.fingerprint.file}:${p.fingerprint.lineStart}:${p.fingerprint.lineEnd}:${p.fingerprint.slug}`;
     byKey.set(key, p);
   }
   return Array.from(byKey.values());
+}
+
+/** Build a fingerprint-string → round-number lookup from a sorted array of prior rounds. */
+export function buildPriorRoundLookup(sortedPriorRounds: RoundContext[]): Map<string, number> {
+  const lookup = new Map<string, number>();
+  for (const r of sortedPriorRounds) {
+    for (const e of (r.findings.entries ?? [])) {
+      lookup.set(stringifyFindingFingerprint(e.fingerprint), r.meta.round);
+    }
+  }
+  return lookup;
 }
 
 /**
@@ -1521,15 +1837,23 @@ function dedupePriorFindings(priorRounds: HandoverFinding[]): HandoverFinding[] 
  *
  * A prior `warning`/`blocker` is "unresolved" when the author has not agreed to
  * dismiss it (`authorReply !== 'agree'`) and the underlying GitHub thread is
- * still in `openThreads`. A prior finding without a `threadId` is treated as
- * unresolved, which conservatively blocks APPROVE for older handover formats.
+ * still in `openThreads`. A prior finding without a `threadId` (older handover
+ * format) is treated as unresolved while open threads remain on the PR, but
+ * retires once GitHub reports zero open threads, since no prior can still be
+ * blocking when nothing is open.
  *
- * The judge's `threadEvaluations.status === 'addressed'` is intentionally not
- * consulted here. That signal is LLM-derived and could be flipped by prompt
- * injection in prior-round source or comments, allowing an attacker to
- * unblock APPROVE on an unaddressed warning. Resolution must come from the
- * GitHub thread state (`openThreads`) or from an explicit author agreement
- * captured in `authorReply`.
+ * The judge's `threadEvaluations.status === 'addressed'` resolves a prior
+ * thread. `uncertain` and missing entries collapse to "not addressed" so the
+ * default outcome stays conservative when the judge could not produce a
+ * confident verdict. Defense-in-depth against prompt injection lives at three
+ * other layers: (a) `buildJudgeUserMessage` routes untrusted PR/issue prose
+ * through `sanitizeForPromptEmbed` and tags each section as evidence-not-
+ * directive; (b) the adversarial `05_injection_attempt_unfixed` fixture in
+ * the corpus gates regressions in the judge's resistance to injected text;
+ * (c) `applyCrossRoundSuppression` only lets `addressed` ratchet prior
+ * `suggestion`/`nitpick` findings, never `blocker`/`warning`, so a flipped
+ * judge verdict on a higher-severity prior still requires GitHub thread
+ * resolution or an explicit `authorReply: 'agree'` to retire.
  *
  * Multi-round priors are collapsed to one entry per fingerprint, keeping the
  * most recent round's `authorReply` and `threadId`. Callers must pass
@@ -1537,46 +1861,120 @@ function dedupePriorFindings(priorRounds: HandoverFinding[]): HandoverFinding[] 
  * `authorReply: 'none'` would still match `.some(...)` even if round 2
  * captured an `agree` for the same thread.
  *
- * Contract for `openThreads`: callers must pass the result of a successful
- * GitHub thread fetch. Both `undefined` and `[]` are interpreted the same way
- * (no thread is open on GitHub), so any prior finding with a `threadId` that
- * does not appear in the set is treated as resolved. Callers that fail to
- * fetch thread state must abort before reaching this function rather than
- * pass a partial or empty list, otherwise unaddressed warnings could be
- * silently approved.
+ * Contract for `openThreads`: three states with distinct meaning.
+ *   - `null` / omitted → "unknown": caller did not (or could not) fetch open
+ *     threads. Treated conservatively: any prior `warning`/`blocker` with a
+ *     non-`agree` `authorReply` blocks APPROVE with `prior_unaddressed`,
+ *     unconditionally. `resolvedThreadIds` is NOT honored in this branch,
+ *     since both signals come from the same recap scan and could be stale
+ *     together. Use the unknown state when the GitHub fetch failed, or at
+ *     call sites that intentionally bypass the open-thread check, so
+ *     unresolved priors can never be silently approved.
+ *   - `[]` → "fetched, none open": GitHub confirmed no review threads are
+ *     open on the PR. Prior findings with a `threadId` that does not appear
+ *     here are treated as resolved.
+ *   - `OpenThread[]` (non-empty) → "fetched, here they are": only priors
+ *     whose `threadId` appears in the set are treated as still open.
+ *
+ * `resolvedThreadIds` is an explicit allowlist of thread ids that GitHub
+ * reports as `isResolved: true` (derived from `previousFindings[i].status ===
+ * 'resolved'`). It is consulted only when `openThreads` is a fetched array
+ * (empty or non-empty) and the thread is not present in it. The precedence
+ * is: live `openThreads` > unknown-fallback (conservative block) >
+ * `resolvedThreadIds` (cached "resolved via fix") > implicit resolution
+ * (absent from both, with a `threadId`). This covers the common "author
+ * pushed a fix and clicked Resolve conversation" case, where the thread is
+ * no longer open on GitHub but the prior's `authorReplyClass` stays `none`,
+ * while still blocking when the live state cannot be trusted.
  *
  * Nitpicks and suggestions are non-blocking, and prior-round dismissed warnings
  * have already been acknowledged by the author. All these cases approve the PR.
  */
 export function determineVerdict(
   findings: Finding[],
-  priorRounds?: HandoverFinding[],
-  openThreads?: OpenThread[],
-): { verdict: ReviewVerdict; verdictReason: VerdictReason } {
-  if (findings.some(f => f.severity === 'blocker')) {
-    return { verdict: 'REQUEST_CHANGES', verdictReason: 'required_present' };
+  priorRounds?: FindingFingerprintEntry[],
+  openThreads?: OpenThread[] | null,
+  resolvedThreadIds?: Set<string>,
+  threadEvaluations?: ThreadEvaluation[],
+  priorRoundLookup?: Map<string, number>,
+): { verdict: ReviewVerdict; verdictReason: VerdictReason; verdictTrace: VerdictTrace } {
+  const emptyTrace = (): VerdictTrace => ({
+    survivingBlockers: [],
+    novelWarnings: [],
+    unresolvedPriors: [],
+  });
+
+  const blockers = findings.filter(f => f.severity === 'blocker');
+  if (blockers.length > 0) {
+    const trace = emptyTrace();
+    trace.survivingBlockers = blockers.map(findingToTraceEntry);
+    return { verdict: 'REQUEST_CHANGES', verdictReason: 'required_present', verdictTrace: trace };
   }
 
   const prior = dedupePriorFindings(priorRounds ?? []);
-  const hasNovelWarning = findings.some(
+  const novelWarnings = findings.filter(
     f => f.severity === 'warning' && !wasDismissedInPriorRound(f, prior),
   );
-  if (hasNovelWarning) {
-    return { verdict: 'REQUEST_CHANGES', verdictReason: 'novel_suggestion' };
+  if (novelWarnings.length > 0) {
+    const trace = emptyTrace();
+    trace.novelWarnings = novelWarnings.map(findingToTraceEntry);
+    return { verdict: 'REQUEST_CHANGES', verdictReason: 'novel_suggestion', verdictTrace: trace };
   }
 
+  const openThreadsUnknown = openThreads == null;
   const openThreadIds = new Set((openThreads ?? []).map(t => t.threadId));
-  const hasUnresolvedPrior = prior.some(p => {
-    if (p.severity !== 'warning' && p.severity !== 'blocker') return false;
-    if (p.authorReply === 'agree') return false;
-    if (!p.threadId) return true;
-    return openThreadIds.has(p.threadId);
-  });
-  if (hasUnresolvedPrior) {
-    return { verdict: 'REQUEST_CHANGES', verdictReason: 'prior_unaddressed' };
+  const threadEvaluationsByThreadId = indexThreadEvaluations(threadEvaluations);
+  const unresolvedPriors = prior.filter(p =>
+    isPriorLikelyUnresolved(p, openThreadIds, openThreadsUnknown, resolvedThreadIds, threadEvaluationsByThreadId),
+  );
+  if (unresolvedPriors.length > 0) {
+    const trace = emptyTrace();
+    const openThreadIndex = new Map((openThreads ?? []).map(t => [t.threadId, t]));
+    trace.unresolvedPriors = unresolvedPriors.map(p => priorToTraceEntry(p, priorRoundLookup, openThreadIndex));
+    return { verdict: 'REQUEST_CHANGES', verdictReason: 'prior_unaddressed', verdictTrace: trace };
   }
 
-  return { verdict: 'APPROVE', verdictReason: 'only_nit_or_suggestion' };
+  return { verdict: 'APPROVE', verdictReason: 'only_nit_or_suggestion', verdictTrace: emptyTrace() };
+}
+
+function findingToTraceEntry(f: Finding): VerdictTraceEntry {
+  return {
+    file: f.file,
+    title: f.title,
+    fingerprint: stringifyFindingFingerprint({
+      file: f.file,
+      lineStart: f.line,
+      lineEnd: f.line,
+      slug: titleToSlug(f.title),
+    }),
+  };
+}
+
+function priorToTraceEntry(
+  p: FindingFingerprintEntry,
+  priorRoundLookup: Map<string, number> | undefined,
+  openThreadIndex?: Map<string, OpenThread>,
+): VerdictTraceEntry {
+  const round = priorRoundLookup?.get(stringifyFindingFingerprint(p.fingerprint));
+  const openThread = p.threadId ? openThreadIndex?.get(p.threadId) : undefined;
+  const line = openThread?.line ?? p.fingerprint.lineStart;
+  const severity = p.originalSeverity ?? p.severity;
+  const threadUrl = openThread?.threadUrl;
+  return {
+    file: p.fingerprint.file,
+    title: p.title ?? '',
+    fingerprint: stringifyFindingFingerprint(p.fingerprint),
+    ...(p.threadId && { threadId: p.threadId }),
+    ...(round != null && { round }),
+    ...(line != null && { line }),
+    ...(severity && { severity }),
+    ...(threadUrl && { threadUrl }),
+  };
+}
+
+/** Stable composite-string identity matching the `dedupePriorFindings` key format. */
+export function stringifyFindingFingerprint(fp: FindingFingerprint): string {
+  return `${fp.file}:${fp.lineStart}:${fp.lineEnd}:${fp.slug}`;
 }
 
 export function truncateDiff(rawDiff: string, maxLength: number = 50000): string {

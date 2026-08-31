@@ -1,5 +1,5 @@
 name: 'Manki Review'
-description: 'Multi-agent AI code review for GitHub — a planner picks the team, agents review in parallel, dedup removes repeats, and a judge filters the noise.'
+description: 'Multi-agent AI code review for GitHub. Planner picks the team, agents review in parallel, judge filters the noise.'
 author: 'xdustinface'
 
 inputs:
@@ -9,6 +9,18 @@ inputs:
   anthropic_api_key:
     description: 'Anthropic API key (alternative to OAuth token)'
     required: false
+  openai_oauth_token:
+    description: 'Base64-encoded contents of `~/.codex/auth.json` (Codex CLI OAuth credentials, including `tokens.access_token` and `tokens.refresh_token`). Bootstrap with `cat ~/.codex/auth.json | base64 | gh secret set OPENAI_OAUTH_TOKEN`. Re-run when the refresh_token expires.'
+    required: false
+  openai_api_key:
+    description: 'OpenAI API key (alternative to OAuth token)'
+    required: false
+  gemini_oauth_token:
+    description: 'Base64-encoded contents of `~/.gemini/oauth_creds.json` (Gemini CLI OAuth credentials, including `access_token` and `refresh_token`). Bootstrap with `cat ~/.gemini/oauth_creds.json | base64 | gh secret set GEMINI_OAUTH_TOKEN`. Re-run when the refresh_token expires.'
+    required: false
+  gemini_api_key:
+    description: 'Google Generative AI API key (alternative to Gemini OAuth token)'
+    required: false
   github_token:
     description: 'GitHub token for posting reviews and comments (not required when using GitHub App auth)'
     required: false
@@ -17,7 +29,7 @@ inputs:
     required: false
     default: '.manki.yml'
   memory_repo_token:
-    description: 'GitHub token with access to the review memory repository'
+    description: 'GitHub token with write access to the review memory repository (patterns, learnings, suppressions)'
     required: false
   github_app_id:
     description: 'GitHub App ID for custom bot identity (reviews show as the app name)'
@@ -29,6 +41,10 @@ inputs:
     description: 'Token service URL for GitHub App identity (default: https://manki-api.dustinface.me/token)'
     required: false
     default: 'https://manki-api.dustinface.me/token'
+  concurrency_lock_ttl_seconds:
+    description: 'TTL (in seconds) for the in-app concurrent-submission lock. If another `manki-review[bot]` run has posted an "in progress" marker comment within this window, the current run bails before any LLM call. Acts as defense in depth on top of the workflow-level concurrency group. Default: 600 (10 minutes).'
+    required: false
+    default: '600'
 
 outputs:
   review_id:
@@ -45,7 +61,7 @@ outputs:
     description: 'Model used for the judge agent'
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
   post: 'dist/index.js'
   post-if: cancelled() || failure()

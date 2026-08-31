@@ -1,13 +1,16 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import { ClaudeClient } from './claude';
+import { LLMClient } from './providers';
 import { ACTIONS_BOT_LOGIN, BOT_LOGIN, titleToSlug } from './github';
 import { matchesSuppression, Suppression } from './memory';
-import { AuthorReplyClass, Finding, FindingFingerprint, FindingSeverity, InPrSuppression, InPrSuppressionReason, migrateLegacySeverity, SEVERITY_TOKEN_PATTERN } from './types';
+import { AuthorReplyClass, DuplicateMatchType, Finding, FindingFingerprint, FindingMetadata, FindingSeverity, InPrSuppression, InPrSuppressionReason, ReclassifiedPrior, migrateLegacyPrType, migrateLegacySeverity, OpenThreadsState, RoundContext, SEVERITY_TOKEN_PATTERN } from './types';
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
 const BOT_MARKER = '<!-- manki';
+
+/** Shared prefix that identifies a severity title line in a manki comment body. */
+const FINDING_TITLE_RE = /\*\*(?:Blocker|Warning|Suggestion|Nitpick|Ignore)\*\*(?:\s*<sub>\[[^\]]*\]<\/sub>)?\s*:\s*/;
 
 /** Escape double quotes and strip triple-backtick sequences from untrusted text before LLM interpolation. */
 export function sanitize(s: string, maxLength = 200): string {
@@ -98,7 +101,7 @@ function classifyAuthorReply(text: string | undefined): AuthorReplyClass {
   return 'none';
 }
 
-interface PreviousFinding {
+interface PreviousFinding extends FindingMetadata {
   title: string;
   file: string;
   line: number;
@@ -167,6 +170,135 @@ function inPrSuppressionReasonFor(
 interface RecapState {
   previousFindings: PreviousFinding[];
   recapContext: string;
+  priorRounds: RoundContext[];
+  /** Three-way state of the open-thread fetch. Optional so legacy callers and test mocks omitting the field still typecheck; treated as `'fetched'` downstream. */
+  openThreadsState?: OpenThreadsState;
+  /** Count of fingerprints whose `authorReplyClass` flipped during `refreshAuthorReplyClass`. Optional so test mocks omitting the field still typecheck; defaults to 0. */
+  reclassifiedPriorCount?: number;
+  /** Attribution for the flips. Only includes flips where the prior entry had a `threadId`. */
+  reclassifiedPriors?: ReclassifiedPrior[];
+}
+
+const CONTEXT_BLOCK_DETAILS_RE = /<details>\s*<summary>Manki context<\/summary>\s*```json\s*([\s\S]*?)```\s*<\/details>/g;
+const CONTEXT_BLOCK_HTML_COMMENT_RE = /<!-- manki-context: (.+?) -->/g;
+const REQUIRED_ROUND_CONTEXT_KEYS = ['meta', 'config', 'diff', 'models', 'planner', 'reviewers', 'judge', 'dedup', 'memory', 'findings', 'usage', 'verdict'] as const;
+
+/**
+ * Parse Manki context blocks from PR-level review bodies. Supports both the
+ * `<details>` wrapper (visible aggregate review) and the `<!-- manki-context: ... -->`
+ * wrapper (hidden per-round review). Unknown future fields on `RoundContext`
+ * are preserved opaquely. Duplicates on `meta.round` are deduped by keeping
+ * the entry with the highest review id (latest-posted). Result is sorted
+ * ascending by `meta.round`.
+ */
+function parseContextBlocks(
+  reviews: Array<{ body: string; id: number }>,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): RoundContext[] {
+  const byRound = new Map<number, { ctx: RoundContext; reviewId: number }>();
+  const duplicateRounds = new Set<number>();
+
+  for (const review of reviews) {
+    const reviewUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}#pullrequestreview-${review.id}`;
+    const candidates: string[] = [];
+
+    for (const m of review.body.matchAll(CONTEXT_BLOCK_DETAILS_RE)) {
+      candidates.push(m[1]);
+    }
+    if (candidates.length === 0) {
+      for (const m of review.body.matchAll(CONTEXT_BLOCK_HTML_COMMENT_RE)) {
+        candidates.push(m[1]);
+      }
+    }
+
+    for (const raw of candidates) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        core.warning(`Skipping malformed Manki context block at ${reviewUrl}: ${msg}`);
+        continue;
+      }
+
+      if (!parsed || typeof parsed !== 'object') {
+        core.warning(`Skipping Manki context block at ${reviewUrl}: not an object`);
+        continue;
+      }
+      const meta = (parsed as { meta?: unknown }).meta;
+      if (!meta || typeof meta !== 'object') {
+        core.warning(`Skipping Manki context block at ${reviewUrl}: missing meta`);
+        continue;
+      }
+      const round = (meta as { round?: unknown }).round;
+      const mankiVersion = (meta as { mankiVersion?: unknown }).mankiVersion;
+      if (typeof round !== 'number') {
+        core.warning(`Skipping Manki context block at ${reviewUrl}: missing or non-numeric meta.round`);
+        continue;
+      }
+      if (typeof mankiVersion !== 'string') {
+        core.warning(`Skipping Manki context block at ${reviewUrl}: missing meta.mankiVersion`);
+        continue;
+      }
+      const missingKey = REQUIRED_ROUND_CONTEXT_KEYS.find(k => !(k in (parsed as object)));
+      if (missingKey) {
+        core.warning(`Skipping Manki context block at ${reviewUrl}: missing required field '${missingKey}'`);
+        continue;
+      }
+
+      const ctx = parsed as RoundContext;
+      if (ctx.planner && typeof ctx.planner.prType === 'string') {
+        ctx.planner.prType = migrateLegacyPrType(ctx.planner.prType);
+      }
+      if (ctx.planner) {
+        // Back-compat: pre-5.2.0 context blocks predate the structured planner
+        // provenance fields. Project the old `used: boolean` onto the new
+        // `source` enum so consumers reading `ctx.planner.source` get a defined
+        // value, and seed empty arrays for the new list fields.
+        if (typeof ctx.planner.source !== 'string') {
+          // `fallbackReason` was not persisted before 5.2.0, so the
+          // `heuristic_fallback` branch below is unreachable for old context
+          // blocks. Pre-5.2.0 rounds where the planner was attempted but
+          // failed will map to `heuristic`. The attempted-but-failed
+          // distinction is unrecoverable because the data was never recorded.
+          if (ctx.planner.used) {
+            ctx.planner.source = 'planner';
+          } else if (ctx.planner.fallbackReason) {
+            ctx.planner.source = 'heuristic_fallback';
+          } else {
+            ctx.planner.source = 'heuristic';
+          }
+          (ctx.planner as { used: boolean }).used = ctx.planner.source === 'planner';
+        }
+        if (!Array.isArray(ctx.planner.coreAgentInjections)) {
+          ctx.planner.coreAgentInjections = [];
+        }
+        if (!Array.isArray(ctx.planner.priorRoundEffortDowngrades)) {
+          ctx.planner.priorRoundEffortDowngrades = [];
+        }
+      }
+      const existing = byRound.get(round);
+      if (existing) {
+        duplicateRounds.add(round);
+        if (review.id > existing.reviewId) {
+          byRound.set(round, { ctx, reviewId: review.id });
+        }
+      } else {
+        byRound.set(round, { ctx, reviewId: review.id });
+      }
+    }
+  }
+
+  for (const round of duplicateRounds) {
+    const winner = byRound.get(round);
+    core.warning(`Duplicate Manki context blocks for round ${round}, keeping review id ${winner?.reviewId}`);
+  }
+
+  return Array.from(byRound.values())
+    .map(v => v.ctx)
+    .sort((a, b) => a.meta.round - b.meta.round);
 }
 
 /**
@@ -179,7 +311,11 @@ async function fetchRecapState(
   prNumber: number,
   prAuthorLogin?: string,
 ): Promise<RecapState> {
-  const threads = await fetchReviewThreads(octokit, owner, repo, prNumber);
+  const [threadsResult, priorRounds] = await Promise.all([
+    fetchReviewThreads(octokit, owner, repo, prNumber),
+    fetchPriorRoundContexts(octokit, owner, repo, prNumber),
+  ]);
+  const { threads, state: openThreadsState } = threadsResult;
 
   const previousFindings = threads
     .filter(t => t.isBotThread)
@@ -194,6 +330,8 @@ async function fetchRecapState(
       threadUrl: t.threadUrl,
       authorReplyText: t.authorReplyText,
       authorReplyLogin: t.authorReplyLogin,
+      description: t.description,
+      suggestedFix: t.suggestedFix,
     }));
 
   // Mirror the `prAuthorLogin` gate from inPrSuppressionReasonFor: only the
@@ -239,10 +377,110 @@ async function fetchRecapState(
 
   core.info(`Recap: ${resolved.length} resolved, ${open.length} open, ${previousFindings.length} total previous findings`);
 
-  return { previousFindings, recapContext };
+  const { rounds: enrichedPriorRounds, reclassifiedPriorCount, reclassifiedPriors } =
+    refreshAuthorReplyClass(priorRounds, previousFindings);
+
+  return {
+    previousFindings,
+    recapContext,
+    priorRounds: enrichedPriorRounds,
+    openThreadsState,
+    reclassifiedPriorCount,
+    reclassifiedPriors,
+  };
 }
 
-interface ReviewThread {
+/** Cap on `reclassifiedPriors[]` to bound context-block size. */
+const RECLASSIFIED_PRIORS_CAP = 50;
+
+/**
+ * Re-derive `authorReplyClass` on each prior-round fingerprint from the live
+ * `previousFindings` thread state. The value cached at emit time is always
+ * `'none'` (the round just completed, no reply existed yet) and would otherwise
+ * stay frozen across later rounds, breaking cross-round suppression, planner
+ * hints, and the prior-unaddressed verdict gate. Matching is by `threadId`
+ * when present, then falls back to fingerprint slug + file so older context
+ * blocks written before threadId stabilisation still re-classify correctly.
+ *
+ * Also returns the count and (capped) attribution of every flip so the recap
+ * stage can surface re-classification provenance in `RoundContext.recap`.
+ * Slug-file fallback flips contribute to the count but cannot be attributed
+ * by `threadId`, so they are omitted from the entries list.
+ */
+function refreshAuthorReplyClass(
+  rounds: RoundContext[],
+  previousFindings: PreviousFinding[],
+): { rounds: RoundContext[]; reclassifiedPriorCount: number; reclassifiedPriors: ReclassifiedPrior[] } {
+  if (rounds.length === 0) {
+    return { rounds, reclassifiedPriorCount: 0, reclassifiedPriors: [] };
+  }
+  const byThread = new Map<string, PreviousFinding>();
+  const bySlugFile = new Map<string, PreviousFinding>();
+  for (const pf of previousFindings) {
+    if (pf.threadId) {
+      byThread.set(pf.threadId, pf);
+    } else {
+      bySlugFile.set(`${pf.file}:${titleToSlug(pf.title)}`, pf);
+    }
+  }
+  let reclassifiedPriorCount = 0;
+  const reclassifiedPriors: ReclassifiedPrior[] = [];
+  const refreshed = rounds.map(r => ({
+    ...r,
+    findings: {
+      ...r.findings,
+      entries: r.findings.entries.map(entry => {
+        const pf = entry.threadId
+          ? byThread.get(entry.threadId)
+          : bySlugFile.get(`${entry.fingerprint.file}:${entry.fingerprint.slug}`);
+        if (!pf) return entry;
+        const next = classifyAuthorReply(pf.authorReplyText);
+        const prev = entry.authorReplyClass ?? 'none';
+        if (next !== prev) {
+          reclassifiedPriorCount++;
+          if (entry.threadId && reclassifiedPriors.length < RECLASSIFIED_PRIORS_CAP) {
+            reclassifiedPriors.push({ threadId: entry.threadId, from: prev, to: next });
+          }
+        }
+        return { ...entry, authorReplyClass: next };
+      }),
+    },
+  }));
+  return { rounds: refreshed, reclassifiedPriorCount, reclassifiedPriors };
+}
+
+async function fetchPriorRoundContexts(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<RoundContext[]> {
+  try {
+    const { data: reviews } = await octokit.rest.pulls.listReviews({
+      owner,
+      repo,
+      pull_number: prNumber,
+      per_page: 100,
+    });
+    if (reviews.length === 100) {
+      core.warning(`fetchPriorRoundContexts: received exactly 100 reviews for PR #${prNumber}; earlier rounds may be missing (pagination not implemented).`);
+    }
+    const candidates = reviews
+      .filter((r): r is typeof r & { body: string; id: number } => {
+        const body = r.body;
+        if (!body) return false;
+        if (r.user?.login !== BOT_LOGIN) return false;
+        return body.includes('<summary>Manki context</summary>') || body.includes('<!-- manki-context:');
+      })
+      .map(r => ({ body: r.body, id: r.id }));
+    return parseContextBlocks(candidates, owner, repo, prNumber);
+  } catch (error) {
+    core.warning(`Failed to fetch prior round contexts: ${error}`);
+    return [];
+  }
+}
+
+interface ReviewThread extends FindingMetadata {
   threadId: string;
   threadUrl: string;
   isBotThread: boolean;
@@ -257,12 +495,69 @@ interface ReviewThread {
   authorReplyLogin?: string;
 }
 
+/**
+ * Parse the prose description and suggested-fix excerpt from a manki-authored
+ * thread's first comment body. Returns `undefined` for either field when the
+ * comment doesn't match the expected layout. The judge tolerates missing
+ * fields. Pure string scan, no markdown parser, intentionally conservative so
+ * unexpected layouts skip extraction rather than emit garbage.
+ */
+function parseFindingFromComment(body: string): FindingMetadata {
+  const titleMatch = body.match(new RegExp(FINDING_TITLE_RE.source + '.+(?:\\n|$)'));
+  if (!titleMatch || titleMatch.index === undefined) return {};
+  const afterTitle = body.slice(titleMatch.index + titleMatch[0].length);
+
+  let descSlice = afterTitle;
+  const stopMarkers = [
+    '\n```',
+    '\n<details>',
+    '\n<!-- manki:',
+  ];
+  let earliest = descSlice.length;
+  let truncatingStop = false;
+  for (const marker of stopMarkers) {
+    const idx = descSlice.indexOf(marker);
+    if (idx >= 0 && idx < earliest) {
+      earliest = idx;
+      truncatingStop = marker === '\n```';
+    }
+  }
+  descSlice = descSlice.slice(0, earliest).replace(/^[\s\n]+|[\s\n]+$/g, '');
+  const remainingSubs = descSlice.match(/^(?:<sub>[^\n]*<\/sub>\s*\n?)+/);
+  if (remainingSubs) descSlice = descSlice.slice(remainingSubs[0].length).replace(/^\s+/, '');
+  if (descSlice.length > 500) descSlice = descSlice.slice(0, 500) + '...';
+  else if (truncatingStop && descSlice.length > 0) descSlice += '…(truncated)';
+  const description: string | undefined = descSlice.length > 0 ? descSlice : undefined;
+
+  let suggestedFix: string | undefined;
+  const aiContextMatch = body.match(/<summary>AI context<\/summary>[\s\S]*?```json\s*([\s\S]*?)```/);
+  if (aiContextMatch) {
+    try {
+      const parsed: unknown = JSON.parse(aiContextMatch[1]);
+      if (parsed && typeof parsed === 'object' && 'fix' in parsed) {
+        const fix = (parsed as { fix?: unknown }).fix;
+        if (typeof fix === 'string' && fix.length > 0) suggestedFix = fix;
+      }
+    } catch {
+      // Malformed AI context JSON — skip suggestedFix, keep description.
+    }
+  }
+  if (suggestedFix && suggestedFix.length > 300) suggestedFix = suggestedFix.slice(0, 300) + '...';
+
+  return { description, suggestedFix };
+}
+
+interface FetchReviewThreadsResult {
+  threads: ReviewThread[];
+  state: OpenThreadsState;
+}
+
 async function fetchReviewThreads(
   octokit: Octokit,
   owner: string,
   repo: string,
   prNumber: number,
-): Promise<ReviewThread[]> {
+): Promise<FetchReviewThreadsResult> {
   // Note: `comments(first: 10)` caps at 10 comments per thread — sufficient for
   // fingerprinting and reply extraction, but longer discussions are truncated.
   const query = `
@@ -316,7 +611,7 @@ async function fetchReviewThreads(
       };
     } = await octokit.graphql(query, { owner, repo, prNumber });
 
-    return result.repository.pullRequest.reviewThreads.nodes.map(thread => {
+    const threads = result.repository.pullRequest.reviewThreads.nodes.map(thread => {
       const firstComment = thread.comments.nodes[0];
       const isBotThread = firstComment?.body?.includes(BOT_MARKER) ?? false;
 
@@ -338,8 +633,12 @@ async function fetchReviewThreads(
         ? migrateLegacySeverity(severityMatch[1])
         : 'unknown') as FindingSeverity | 'unknown';
 
-      const titleMatch = firstComment?.body?.match(/\*\*(?:Blocker|Warning|Suggestion|Nitpick|Ignore)\*\*(?:\s*<sub>\[[^\]]*\]<\/sub>)?\s*:\s*(.+?)(?:\n|$)/);
+      const titleMatch = firstComment?.body?.match(new RegExp(FINDING_TITLE_RE.source + '(.+?)(?:\\n|$)'));
       const findingTitle = titleMatch?.[1]?.trim() ?? '';
+
+      const { description, suggestedFix } = isBotThread && firstComment?.body
+        ? parseFindingFromComment(firstComment.body)
+        : {};
 
       const line = thread.line ?? 0;
       const lineStart = thread.startLine ?? line;
@@ -351,6 +650,8 @@ async function fetchReviewThreads(
         isResolved: thread.isResolved,
         hasHumanReply,
         findingTitle,
+        description,
+        suggestedFix,
         file: thread.path ?? '',
         line,
         lineStart,
@@ -359,9 +660,10 @@ async function fetchReviewThreads(
         authorReplyLogin,
       };
     });
+    return { threads, state: threads.length === 0 ? 'empty' : 'fetched' };
   } catch (error) {
     core.warning(`Failed to fetch review threads: ${error}`);
-    return [];
+    return { threads: [], state: 'fetch_failed' };
   }
 }
 
@@ -372,6 +674,8 @@ async function fetchReviewThreads(
 interface DuplicateMatch {
   finding: Finding;
   matchedTitle: string;
+  /** Which matcher branch fired. `'llm'` only used by `llmDeduplicateFindings`. */
+  matchType: DuplicateMatchType;
 }
 
 function deduplicateFindings(
@@ -392,12 +696,17 @@ function deduplicateFindings(
   const engaged = previousFindings.filter(f => f.status === 'resolved');
 
   for (const finding of newFindings) {
-    const matched = engaged.find(prev =>
-      matchesPrevious(finding, prev)
-    );
+    let matched: { prev: PreviousFinding; matchType: DuplicateMatchType } | undefined;
+    for (const prev of engaged) {
+      const matchType = matchPreviousType(finding, prev);
+      if (matchType) {
+        matched = { prev, matchType };
+        break;
+      }
+    }
 
     if (matched) {
-      duplicates.push({ finding, matchedTitle: matched.title });
+      duplicates.push({ finding, matchedTitle: matched.prev.title, matchType: matched.matchType });
     } else {
       unique.push(finding);
     }
@@ -406,19 +715,27 @@ function deduplicateFindings(
   return { unique, duplicates };
 }
 
-function titlesOverlap(a: string, b: string): boolean {
+/**
+ * Title-overlap classifier. Returns the branch that fired or `null` when
+ * none did. `titlesOverlap` is the boolean wrapper kept for tests and
+ * external callers; new code prefers this typed variant.
+ */
+function titleOverlapType(a: string, b: string): DuplicateMatchType | null {
   const aLower = a.toLowerCase();
   const bLower = b.toLowerCase();
 
-  if (aLower === bLower) return true;
+  if (aLower === bLower) return 'exact';
 
-  // Substring match (keep for exact matches)
   const shorter = aLower.length <= bLower.length ? aLower : bLower;
   const longer = aLower.length > bLower.length ? aLower : bLower;
-  if (shorter.length >= 5 && longer.includes(shorter)) return true;
+  if (shorter.length >= 5 && longer.includes(shorter)) return 'substring';
 
-  // Word overlap — 50% of words in the shorter title must appear in the longer
-  return wordOverlapRatio(a, b) >= 0.5;
+  if (wordOverlapRatio(a, b) >= 0.5) return 'word_overlap';
+  return null;
+}
+
+function titlesOverlap(a: string, b: string): boolean {
+  return titleOverlapType(a, b) !== null;
 }
 
 function wordOverlapRatio(a: string, b: string): number {
@@ -434,27 +751,26 @@ function wordOverlapRatio(a: string, b: string): number {
   return overlap / Math.min(aWords.size, bWords.size);
 }
 
-function matchesPrevious(finding: Finding, previous: PreviousFinding): boolean {
-  if (!previous.title || previous.title.length < 3) return false;
-  if (!finding.title || finding.title.length < 3) return false;
+function matchPreviousType(finding: Finding, previous: PreviousFinding): DuplicateMatchType | null {
+  if (!previous.title || previous.title.length < 3) return null;
+  if (!finding.title || finding.title.length < 3) return null;
 
-  const titleMatch = titlesOverlap(finding.title, previous.title);
+  const matchType = titleOverlapType(finding.title, previous.title);
+  if (!matchType) return null;
 
-  if (!titleMatch) return false;
-
-  if (finding.file !== previous.file) return false;
+  if (finding.file !== previous.file) return null;
 
   // Relax line proximity when word overlap is strong (>= 70%)
   const maxLineDelta = wordOverlapRatio(finding.title, previous.title) >= 0.7 ? 20 : 5;
-  if (Math.abs(finding.line - previous.line) > maxLineDelta) return false;
+  if (Math.abs(finding.line - previous.line) > maxLineDelta) return null;
 
-  return true;
+  return matchType;
 }
 
 async function llmDeduplicateFindings(
   findings: Finding[],
   previousFindings: PreviousFinding[],
-  client: ClaudeClient,
+  client: LLMClient,
 ): Promise<{ unique: Finding[]; duplicates: DuplicateMatch[] }> {
   const dismissed = previousFindings.filter(f => f.status === 'resolved');
   if (findings.length === 0 || dismissed.length === 0) {
@@ -497,9 +813,9 @@ async function llmDeduplicateFindings(
       if (matchedIndices.has(i)) {
         const match = matches.find(m => m.index - 1 === i);
         const dismissedIdx = match ? match.matchedDismissed - 1 : -1;
-        const dismissedTitle = dismissedIdx >= 0 && dismissedIdx < dismissed.length ? dismissed[dismissedIdx].title : 'unknown';
+        const dismissedTitle = dismissedIdx >= 0 && dismissedIdx < dismissed.length ? (dismissed[dismissedIdx].title ?? 'unknown') : 'unknown';
         core.info(`LLM dedup: "${findings[i].title}" matches dismissed "${dismissedTitle}"`);
-        duplicates.push({ finding: findings[i], matchedTitle: dismissedTitle });
+        duplicates.push({ finding: findings[i], matchedTitle: dismissedTitle, matchType: 'llm' });
       } else {
         unique.push(findings[i]);
       }
@@ -516,4 +832,13 @@ async function llmDeduplicateFindings(
   }
 }
 
-export { DuplicateMatch, PreviousFinding, RecapState, classifyAuthorReply, collectInPrSuppressions, fingerprintFinding, fetchRecapState, deduplicateFindings, titlesOverlap, llmDeduplicateFindings };
+export function collectResolvedThreadIds(previousFindings?: PreviousFinding[]): Set<string> {
+  return new Set(
+    (previousFindings ?? [])
+      .filter((f): f is PreviousFinding & { threadId: string } =>
+        f.status === 'resolved' && f.threadId != null)
+      .map(f => f.threadId),
+  );
+}
+
+export { DuplicateMatch, PreviousFinding, RecapState, OpenThreadsState, classifyAuthorReply, collectInPrSuppressions, fingerprintFinding, fetchRecapState, deduplicateFindings, titlesOverlap, titleOverlapType, refreshAuthorReplyClass, llmDeduplicateFindings, parseFindingFromComment };

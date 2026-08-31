@@ -1,7 +1,8 @@
 import * as core from '@actions/core';
 
-import { buildDashboard, formatFindingComment, formatStatsJson, formatStatsOneLiner, mapVerdictToEvent, BOT_LOGIN, BOT_MARKER, REVIEW_COMPLETE_MARKER, FORCE_REVIEW_MARKER, CANCELLED_MARKER, VERSION_MARKER_PREFIX, MANKI_VERSION, buildNitIssueBody, getSeverityLabel, postReview, resolveReferences, sanitizeMarkdown, sanitizeFilePath, truncateBody, dynamicFence, safeTruncate, fetchFileContents, fetchLinkedIssues, fetchSubdirClaudeMd, updateProgressComment, postProgressComment, updateProgressDashboard, dismissPreviousReviews, reactToIssueComment, reactToReviewComment, createNitIssue, fetchPRDiff, fetchInterRoundDiff, fetchConfigFile, fetchRepoContext, getSeverityEmoji, isReviewInProgress, isApprovedOnCommit, markOwnProgressCommentCancelled, cancelActiveReviewRun, extractRunIdFromBody, extractVersionFromBody, INDENT, APP_WARNING_MARKER, postAppWarningIfNeeded } from './github';
-import { DashboardData, Finding, ParsedDiff, ReviewMetadata, ReviewResult, ReviewStats } from './types';
+import { buildDashboard, formatBlockingPriorThreads, formatContextBlock, formatFindingComment, formatStatsOneLiner, mapVerdictToEvent, BOT_LOGIN, BOT_MARKER, REVIEW_COMPLETE_MARKER, FORCE_REVIEW_MARKER, FORCE_CAP_MARKER, CANCELLED_MARKER, VERSION_MARKER_PREFIX, MANKI_VERSION, getSeverityLabel, postReview, resolveReferences, sanitizeMarkdown, sanitizeFilePath, truncateBody, truncateContextToFitBody, dynamicFence, fetchFileContents, fetchLinkedIssues, fetchSubdirClaudeMd, updateProgressComment, postProgressComment, updateProgressDashboard, dismissPreviousReviews, reactToIssueComment, reactToReviewComment, fetchPRDiff, fetchInterRoundDiff, fetchConfigFile, fetchRepoContext, getSeverityEmoji, isReviewInProgress, isApprovedOnCommit, hasBotReviewOnCommit, findBotReviewOnCommit, markOwnProgressCommentCancelled, cancelActiveReviewRun, extractRunIdFromBody, extractVersionFromBody, fetchPRComments, findInProgressLock, isLockExpired, INDENT, APP_WARNING_MARKER, postAppWarningIfNeeded } from './github';
+import { DashboardData, Finding, FindingFingerprintEntry, ParsedDiff, ReviewMetadata, ReviewResult, RoundContext, roundContextToFlatAliases } from './types';
+import { DEFAULT_CONFIG } from './config';
 
 describe('formatFindingComment', () => {
   const baseFinding: Finding = {
@@ -308,123 +309,6 @@ describe('BOT_MARKER', () => {
   });
 });
 
-describe('buildNitIssueBody', () => {
-  const nit: Finding = {
-    severity: 'nitpick',
-    title: 'Use const instead of let',
-    file: 'src/utils.ts',
-    line: 10,
-    description: 'Variable is never reassigned.',
-    reviewers: ['Style'],
-  };
-
-  const suggestion: Finding = {
-    severity: 'suggestion',
-    title: 'Is this timeout intentional?',
-    file: 'src/client.ts',
-    line: 55,
-    description: 'The timeout of 60s seems high for this endpoint.',
-    reviewers: ['Performance'],
-  };
-
-  const required: Finding = {
-    severity: 'blocker',
-    title: 'Null dereference',
-    file: 'src/main.ts',
-    line: 1,
-    description: 'Will crash at runtime.',
-    reviewers: ['Security'],
-  };
-
-  const warning: Finding = {
-    severity: 'warning',
-    title: 'Race condition in cache',
-    file: 'src/cache.ts',
-    line: 5,
-    description: 'Concurrent reads may observe stale state.',
-    reviewers: ['Concurrency'],
-  };
-
-  it('filters to only nit findings', () => {
-    const body = buildNitIssueBody(42, [required, warning, nit, suggestion], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('Use const instead of let');
-    expect(body).not.toContain('Null dereference');
-    expect(body).not.toContain('Race condition in cache');
-    expect(body).not.toContain('Is this timeout intentional?');
-  });
-
-  it('formats checklist items with file and line in details summary', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('- [ ] <details><summary>');
-    expect(body).toContain('<code>src/utils.ts:10</code>');
-    expect(body).toContain('Variable is never reassigned.');
-  });
-
-  it('includes suggested fix when present', () => {
-    const withFix: Finding = { ...nit, suggestedFix: 'const x = 1;' };
-    const body = buildNitIssueBody(42, [withFix], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('**Suggested fix:**');
-    expect(body).toContain('const x = 1;');
-  });
-
-  it('omits suggested fix when not present', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).not.toContain('**Suggested fix:**');
-  });
-
-  it('uses nit emoji for nit findings', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('\u{1F4DD} **Use const instead of let**');
-  });
-
-  it('includes GitHub permalink for code context', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('https://github.com/testowner/testrepo/blob/abc123/src/utils.ts#L5-L20');
-  });
-
-  it('clamps permalink start line to 1 for low line numbers', () => {
-    const lowLine: Finding = { ...nit, line: 2 };
-    const body = buildNitIssueBody(42, [lowLine], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('#L1-L12');
-  });
-
-  it('wraps each finding in a details block', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('<details><summary>');
-    expect(body).toContain('</summary>');
-    expect(body).toContain('</details>');
-  });
-
-  it('includes triage instructions mentioning learning preferences', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('`/manki triage`');
-    expect(body).toContain('**Check the box** for findings worth fixing');
-    expect(body).toContain('**Leave unchecked** for findings to dismiss');
-    expect(body).toContain('learn your preferences');
-  });
-
-  it('does not include the old heading format', () => {
-    const body = buildNitIssueBody(42, [nit], 'testowner', 'testrepo', 'abc123');
-    expect(body).not.toContain('## Review Nits from PR');
-  });
-
-  it('renders multiple findings each in their own details block', () => {
-    const nit2: Finding = { ...nit, title: 'Rename variable', file: 'src/other.ts', line: 20 };
-    const body = buildNitIssueBody(42, [nit, nit2], 'testowner', 'testrepo', 'abc123');
-    const detailsCount = (body.match(/<details><summary>/g) || []).length;
-    expect(detailsCount).toBe(2);
-    const closingCount = (body.match(/<\/details>/g) || []).length;
-    expect(closingCount).toBe(2);
-  });
-
-  it('wraps suggested fix in a code fence', () => {
-    const withFix: Finding = { ...nit, suggestedFix: 'use `const` instead' };
-    const body = buildNitIssueBody(42, [withFix], 'testowner', 'testrepo', 'abc123');
-    expect(body).toContain('```');
-    expect(body).toContain('use `const` instead');
-  });
-});
-
 describe('postReview generalFindings', () => {
   const mockCreateReview = jest.fn().mockResolvedValue({ data: { id: 1 } });
   const mockOctokit = {
@@ -608,7 +492,7 @@ describe('postReview generalFindings', () => {
 
     await postReview(mockOctokit, 'owner', 'repo', 1, 'sha', result);
     const body = mockCreateReview.mock.calls[0][0].body as string;
-    expect(body.length).toBeLessThanOrEqual(60000 + 50); // cap + truncation message
+    expect(body.length).toBeLessThanOrEqual(60000 + 200); // cap + truncation notice + footer appended after truncation
     expect(body).toContain('*(Review body truncated)*');
   });
 
@@ -637,88 +521,7 @@ describe('postReview generalFindings', () => {
   });
 });
 
-describe('formatStatsOneLiner', () => {
-  const baseStats: ReviewStats = {
-    model: 'claude-sonnet-4-20250514',
-    reviewTimeMs: 45000,
-    diffLines: 120,
-    diffAdditions: 80,
-    diffDeletions: 40,
-    filesReviewed: 5,
-    agents: ['Security & Safety', 'Correctness'],
-    findingsRaw: 10,
-    findingsKept: 4,
-    findingsDropped: 6,
-    severity: { blocker: 1, warning: 0, suggestion: 2, nitpick: 1 },
-    verdict: 'REQUEST_CHANGES',
-    prNumber: 42,
-    commitSha: 'abc123',
-  };
-
-  it('formats a one-liner with severity breakdown', () => {
-    const result = formatStatsOneLiner(baseStats);
-    expect(result).toBe('\u{1F4CA} 4 findings (1 blocker, 2 suggestion, 1 nitpick) \u00B7 120 lines \u00B7 45s');
-  });
-
-  it('omits zero-count severities', () => {
-    const stats = { ...baseStats, severity: { blocker: 0, warning: 0, suggestion: 3, nitpick: 0 }, findingsKept: 3 };
-    const result = formatStatsOneLiner(stats);
-    expect(result).toContain('(3 suggestion)');
-    expect(result).not.toContain('blocker');
-    expect(result).not.toContain('nitpick');
-  });
-
-  it('shows none when all severities are zero', () => {
-    const stats = { ...baseStats, severity: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, findingsKept: 0 };
-    const result = formatStatsOneLiner(stats);
-    expect(result).toContain('(none)');
-  });
-
-  it('includes non-zero warning count in output', () => {
-    const stats = { ...baseStats, severity: { blocker: 0, warning: 2, suggestion: 1, nitpick: 0 }, findingsKept: 3 };
-    const result = formatStatsOneLiner(stats);
-    expect(result).toContain('2 warning');
-    expect(result).toContain('1 suggestion');
-    expect(result).not.toContain('blocker');
-    expect(result).not.toContain('nitpick');
-  });
-
-  it('rounds review time to nearest second', () => {
-    const stats = { ...baseStats, reviewTimeMs: 1500 };
-    const result = formatStatsOneLiner(stats);
-    expect(result).toContain('2s');
-  });
-});
-
-describe('formatStatsJson', () => {
-  it('wraps stats in a collapsed details block with JSON', () => {
-    const stats: ReviewStats = {
-      model: 'claude-sonnet-4-20250514',
-      reviewTimeMs: 30000,
-      diffLines: 50,
-      diffAdditions: 30,
-      diffDeletions: 20,
-      filesReviewed: 3,
-      agents: ['Security'],
-      findingsRaw: 5,
-      findingsKept: 2,
-      findingsDropped: 3,
-      severity: { blocker: 1, warning: 0, suggestion: 1, nitpick: 0 },
-      verdict: 'APPROVE',
-      prNumber: 10,
-      commitSha: 'def456',
-    };
-    const result = formatStatsJson(stats);
-    expect(result).toContain('<details>');
-    expect(result).toContain('<summary>Review stats</summary>');
-    expect(result).toContain('```json');
-    expect(result).toContain('"model": "claude-sonnet-4-20250514"');
-    expect(result).toContain('"findingsKept": 2');
-    expect(result).toContain('</details>');
-  });
-});
-
-describe('postReview with stats', () => {
+describe('postReview reviewed-commit footer', () => {
   const mockCreateReview = jest.fn().mockResolvedValue({ data: { id: 1 } });
   const mockOctokit = {
     rest: {
@@ -728,11 +531,651 @@ describe('postReview with stats', () => {
     },
   } as unknown as Parameters<typeof postReview>[0];
 
+  const fullSha = 'ede627f1234567890abcdef0123456789abcdef0';
+  const shortSha = fullSha.slice(0, 7);
+  const expectedFooter = `Reviewed commit [\`${shortSha}\`](https://github.com/acme/widgets/commit/${fullSha})`;
+
   beforeEach(() => {
     mockCreateReview.mockClear();
   });
 
-  it('includes stats one-liner and collapsed JSON in review body', async () => {
+  function buildResult(verdict: ReviewResult['verdict']): ReviewResult {
+    return {
+      verdict,
+      summary: 'Summary text.',
+      findings: [],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+  }
+
+  it.each(['APPROVE', 'COMMENT', 'REQUEST_CHANGES'] as const)(
+    'ends the review body with the reviewed-commit footer for verdict %s',
+    async verdict => {
+      await postReview(mockOctokit, 'acme', 'widgets', 1, fullSha, buildResult(verdict));
+      const body = mockCreateReview.mock.calls[0][0].body as string;
+      expect(body.endsWith(expectedFooter)).toBe(true);
+    },
+  );
+
+  it('renders the footer as a markdown link to the commit URL with a 7-char short SHA', async () => {
+    await postReview(mockOctokit, 'acme', 'widgets', 1, fullSha, buildResult('APPROVE'));
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body).toContain(expectedFooter);
+    expect(shortSha).toBe(fullSha.slice(0, 7));
+    expect(body).toMatch(/Reviewed commit \[`[0-9a-f]{7}`\]\(https:\/\/github\.com\/acme\/widgets\/commit\/[0-9a-f]+\)$/);
+  });
+
+  it('uses a custom serverUrl for GHE and strips trailing slashes', async () => {
+    const gheServerUrl = 'https://github.example.com/';
+    const gheShortSha = fullSha.slice(0, 7);
+    const expectedGheFooter = `Reviewed commit [\`${gheShortSha}\`](https://github.example.com/acme/widgets/commit/${fullSha})`;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ghCtx = require('@actions/github').context;
+    const originalServerUrl = ghCtx.serverUrl;
+    Object.defineProperty(ghCtx, 'serverUrl', { value: gheServerUrl, configurable: true, writable: true });
+    try {
+      await postReview(mockOctokit, 'acme', 'widgets', 1, fullSha, buildResult('APPROVE'));
+      const body = mockCreateReview.mock.calls[0][0].body as string;
+      expect(body).toContain(expectedGheFooter);
+      expect(body).not.toContain('//acme');
+    } finally {
+      Object.defineProperty(ghCtx, 'serverUrl', { value: originalServerUrl, configurable: true, writable: true });
+    }
+  });
+
+  it('keeps the footer at the bottom even when the line-error fallback appends extra sections', async () => {
+    const createReviewMock = jest.fn()
+      .mockRejectedValueOnce(new Error('pull_request_review_thread.line must be part of the diff'))
+      .mockResolvedValueOnce({ data: { id: 9 } });
+    const octokit = {
+      rest: { pulls: { createReview: createReviewMock } },
+    } as unknown as Parameters<typeof postReview>[0];
+
+    const result: ReviewResult = {
+      verdict: 'COMMENT',
+      summary: 'Summary.',
+      findings: [{
+        severity: 'suggestion',
+        title: 'Issue',
+        file: 'src/a.ts',
+        line: 10,
+        description: 'Desc.',
+        reviewers: [],
+      }],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+
+    await postReview(octokit, 'acme', 'widgets', 1, fullSha, result);
+    const fallbackBody = createReviewMock.mock.calls[1][0].body as string;
+    expect(fallbackBody.endsWith(expectedFooter)).toBe(true);
+    expect(fallbackBody).toContain('**Inline comments could not be posted:**');
+  });
+
+  it('keeps the footer at the bottom when APPROVE falls back to COMMENT due to permissions', async () => {
+    const createReviewMock = jest.fn()
+      .mockRejectedValueOnce(new Error('Resource not accessible by integration'))
+      .mockResolvedValueOnce({ data: { id: 10 } });
+    const octokit = {
+      rest: { pulls: { createReview: createReviewMock } },
+    } as unknown as Parameters<typeof postReview>[0];
+
+    const result: ReviewResult = {
+      verdict: 'APPROVE',
+      summary: 'All good.',
+      findings: [{
+        severity: 'suggestion',
+        title: 'Minor',
+        file: 'src/a.ts',
+        line: 10,
+        description: 'Desc.',
+        reviewers: [],
+      }],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+
+    await postReview(octokit, 'acme', 'widgets', 1, fullSha, result);
+    const fallbackBody = createReviewMock.mock.calls[1][0].body as string;
+    expect(fallbackBody.endsWith(expectedFooter)).toBe(true);
+    expect(fallbackBody).toContain('**Findings (could not post inline):**');
+  });
+
+  it('preserves the footer even when the review body exceeds the truncation limit', async () => {
+    const hugeSummary = 'x'.repeat(65000);
+    const result: ReviewResult = {
+      verdict: 'COMMENT',
+      summary: hugeSummary,
+      findings: [],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+
+    await postReview(mockOctokit, 'acme', 'widgets', 1, fullSha, result);
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body.endsWith(expectedFooter)).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(60000 + expectedFooter.length + 4);
+  });
+});
+
+function makeContext(overrides: Partial<RoundContext> = {}): RoundContext {
+  const base: RoundContext = {
+    meta: {
+      prNumber: 42,
+      commitSha: 'abc123',
+      round: 1,
+      timestamp: '2026-01-01T00:00:00.000Z',
+      mankiVersion: '4.7.0',
+    },
+    config: { reviewLevel: 'medium', memoryEnabled: false },
+    diff: { lines: 120, additions: 80, deletions: 40, filesReviewed: 5, fileTypes: { '.ts': 5 } },
+    models: { reviewer: 'claude-sonnet-4-20250514', judge: 'claude-opus-4-20250514' },
+    planner: { source: 'disabled', used: false, coreAgentInjections: [], priorRoundEffortDowngrades: [] },
+    reviewers: { agents: ['Security & Safety', 'Correctness'] },
+    judge: { summary: 'All checks done.' },
+    dedup: {},
+    memory: {},
+    findings: { count: 4, severityCounts: { blocker: 1, warning: 0, suggestion: 2, nitpick: 1 }, entries: [] },
+    usage: {},
+    verdict: 'REQUEST_CHANGES',
+  };
+  return { ...base, ...overrides };
+}
+
+describe('formatBlockingPriorThreads', () => {
+  const makeResult = (overrides: Partial<ReviewResult> = {}): ReviewResult => ({
+    verdict: 'REQUEST_CHANGES',
+    verdictReason: 'prior_unaddressed',
+    summary: 'Prior concerns still open.',
+    findings: [],
+    highlights: [],
+    reviewComplete: true,
+    agentNames: [],
+    ...overrides,
+  });
+
+  it('returns null when verdict reason is not `prior_unaddressed`', () => {
+    const result = makeResult({
+      verdictReason: 'novel_suggestion',
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [{ file: 'a.ts', title: 'x', fingerprint: 'a.ts:1:1:x' }],
+      },
+    });
+    expect(formatBlockingPriorThreads(result)).toBeNull();
+  });
+
+  it('returns null when there are no unresolved priors on the trace', () => {
+    const result = makeResult({
+      verdictTrace: { survivingBlockers: [], novelWarnings: [], unresolvedPriors: [] },
+    });
+    expect(formatBlockingPriorThreads(result)).toBeNull();
+  });
+
+  it('renders file, line, severity, title and a thread link when present', () => {
+    const result = makeResult({
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          {
+            file: 'src/handler.ts',
+            title: 'Stdout-tail sanitization test passes trivially',
+            fingerprint: 'src/handler.ts:42:42:stdout-tail',
+            threadId: 'PRRT_xyz',
+            severity: 'warning',
+            line: 42,
+            threadUrl: 'https://github.com/o/r/pull/805#discussion_r1',
+          },
+        ],
+      },
+    });
+    const rendered = formatBlockingPriorThreads(result);
+    expect(rendered).toContain('Blocking unresolved review threads');
+    expect(rendered).toContain('Stdout-tail sanitization test passes trivially');
+    expect(rendered).toContain('`src/handler.ts:42`');
+    expect(rendered).toContain('[Warning]');
+    expect(rendered).toContain('(https://github.com/o/r/pull/805#discussion_r1)');
+  });
+
+  it('renders multiple blocking threads', () => {
+    const result = makeResult({
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          { file: 'a.ts', title: 'A', fingerprint: 'a.ts:1:1:a', severity: 'blocker', line: 1 },
+          { file: 'b.ts', title: 'B', fingerprint: 'b.ts:2:2:b', severity: 'warning', line: 2 },
+        ],
+      },
+    });
+    const rendered = formatBlockingPriorThreads(result);
+    expect(rendered).toContain('[Blocker] A');
+    expect(rendered).toContain('[Warning] B');
+    expect(rendered).toContain('`a.ts:1`');
+    expect(rendered).toContain('`b.ts:2`');
+  });
+
+  it('omits the link when no `threadUrl` is provided', () => {
+    const result = makeResult({
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          { file: 'a.ts', title: 'A', fingerprint: 'a.ts:1:1:a', severity: 'warning', line: 1 },
+        ],
+      },
+    });
+    const rendered = formatBlockingPriorThreads(result);
+    expect(rendered).not.toContain('[view thread](');
+  });
+
+  it('omits the link when `threadUrl` contains a `)` that would break the markdown link', () => {
+    const result = makeResult({
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          { file: 'a.ts', title: 'A', fingerprint: 'a.ts:1:1:a', severity: 'warning', line: 1, threadUrl: 'https://example.com/path)injected' },
+        ],
+      },
+    });
+    const rendered = formatBlockingPriorThreads(result);
+    expect(rendered).not.toContain('[view thread](');
+  });
+
+  it('omits the link when `threadUrl` uses a non-http scheme', () => {
+    const result = makeResult({
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          { file: 'a.ts', title: 'A', fingerprint: 'a.ts:1:1:a', severity: 'warning', line: 1, threadUrl: 'javascript:alert(1)' },
+        ],
+      },
+    });
+    const rendered = formatBlockingPriorThreads(result);
+    expect(rendered).not.toContain('[view thread](');
+  });
+
+  it('is included in the `postReview` body when verdict reason is `prior_unaddressed`', async () => {
+    const mockCreateReview = jest.fn().mockResolvedValue({ data: { id: 1 } });
+    const mockOctokit = {
+      rest: { pulls: { createReview: mockCreateReview } },
+    } as unknown as Parameters<typeof postReview>[0];
+
+    const result = makeResult({
+      summary: 'Nothing blocking and prior concerns appear addressed.',
+      verdictTrace: {
+        survivingBlockers: [],
+        novelWarnings: [],
+        unresolvedPriors: [
+          {
+            file: 'src/handler.ts',
+            title: 'Stdout-tail sanitization test passes trivially',
+            fingerprint: 'src/handler.ts:42:42:stdout-tail',
+            threadId: 'PRRT_xyz',
+            severity: 'warning',
+            line: 42,
+            threadUrl: 'https://github.com/o/r/pull/805#discussion_r1',
+          },
+        ],
+      },
+    });
+
+    await postReview(mockOctokit, 'o', 'r', 805, 'sha', result);
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body).toContain('Blocking unresolved review threads');
+    expect(body).toContain('Stdout-tail sanitization test passes trivially');
+    expect(body).toContain('https://github.com/o/r/pull/805#discussion_r1');
+  });
+});
+
+describe('formatStatsOneLiner', () => {
+  it('formats a one-liner with severity breakdown', () => {
+    const result = formatStatsOneLiner(makeContext(), 45000);
+    expect(result).toBe('\u{1F4CA} 4 findings (1 blocker, 2 suggestion, 1 nitpick) \u00B7 120 lines \u00B7 45s');
+  });
+
+  it('omits zero-count severities', () => {
+    const ctx = makeContext({
+      findings: { count: 3, severityCounts: { blocker: 0, warning: 0, suggestion: 3, nitpick: 0 }, entries: [] },
+    });
+    const result = formatStatsOneLiner(ctx, 45000);
+    expect(result).toContain('(3 suggestion)');
+    expect(result).not.toContain('blocker');
+    expect(result).not.toContain('nitpick');
+  });
+
+  it('shows none when all severities are zero', () => {
+    const ctx = makeContext({
+      findings: { count: 0, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, entries: [] },
+    });
+    const result = formatStatsOneLiner(ctx, 45000);
+    expect(result).toContain('(none)');
+  });
+
+  it('includes non-zero warning count in output', () => {
+    const ctx = makeContext({
+      findings: { count: 3, severityCounts: { blocker: 0, warning: 2, suggestion: 1, nitpick: 0 }, entries: [] },
+    });
+    const result = formatStatsOneLiner(ctx, 45000);
+    expect(result).toContain('2 warning');
+    expect(result).toContain('1 suggestion');
+    expect(result).not.toContain('blocker');
+    expect(result).not.toContain('nitpick');
+  });
+
+  it('rounds review time to nearest second', () => {
+    const result = formatStatsOneLiner(makeContext(), 1500);
+    expect(result).toContain('2s');
+  });
+});
+
+describe('formatContextBlock', () => {
+  it('wraps the round context in a collapsed details block with JSON', () => {
+    const ctx = makeContext({
+      meta: {
+        prNumber: 10, commitSha: 'def456', round: 2, timestamp: '2026-01-01T00:00:00.000Z',
+        mankiVersion: '4.7.0',
+      },
+      findings: { count: 2, severityCounts: { blocker: 1, warning: 0, suggestion: 1, nitpick: 0 }, entries: [] },
+      verdict: 'APPROVE',
+    });
+    const result = formatContextBlock(ctx);
+    expect(result).toContain('<details>');
+    expect(result).toContain('<summary>Manki context</summary>');
+    expect(result).toContain('```json');
+    expect(result).toContain('"reviewer": "claude-sonnet-4-20250514"');
+    expect(result).toContain('"count": 2');
+    expect(result).toContain('"verdict": "APPROVE"');
+    expect(result).toContain('</details>');
+    expect(result).not.toContain('Review stats');
+  });
+
+  it('escapes triple-backtick runs in the serialized JSON to avoid breaking the code fence', () => {
+    const ctx = makeContext({ judge: { summary: 'Use ```json``` fences in examples.' } });
+    const result = formatContextBlock(ctx);
+    // The JSON blob between the opening ```json fence and closing ``` must not
+    // contain a raw triple-backtick sequence that would close the fence early.
+    const fenceOpen = result.indexOf('```json\n');
+    const fenceClose = result.indexOf('\n```\n', fenceOpen + 8);
+    const jsonBlob = result.slice(fenceOpen + 8, fenceClose);
+    expect(jsonBlob).not.toContain('```');
+    expect(result).toContain('\\u0060\\u0060\\u0060');
+  });
+
+  it('escapes a single backtick in a string value to \\u0060', () => {
+    const ctx = makeContext({ judge: { summary: 'call `foo()` here' } });
+    const result = formatContextBlock(ctx);
+    expect(result).toContain('\\u0060foo()\\u0060');
+    expect(result).not.toContain('`foo()`');
+  });
+
+  it('surfaces threadEvaluations from the judge block in the hidden metadata payload', () => {
+    const ctx = makeContext({
+      judge: {
+        summary: 'Done.',
+        threadEvaluations: [
+          { threadId: 'PRRT_abc', status: 'addressed', reason: 'Fix landed in diff.' },
+          { threadId: 'PRRT_def', status: 'not_addressed', reason: 'Code still flags.' },
+        ],
+      },
+    });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    const parsed = JSON.parse(inner) as RoundContext;
+    expect(parsed.judge.threadEvaluations).toEqual([
+      { threadId: 'PRRT_abc', status: 'addressed', reason: 'Fix landed in diff.' },
+      { threadId: 'PRRT_def', status: 'not_addressed', reason: 'Code still flags.' },
+    ]);
+  });
+
+  it('omits threadEvaluations from the hidden metadata payload when the array is absent', () => {
+    const ctx = makeContext({ judge: { summary: 'Done.' } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    const parsed = JSON.parse(inner) as RoundContext;
+    expect(parsed.judge.threadEvaluations).toBeUndefined();
+  });
+
+  it('omits threadEvaluations from the hidden metadata payload when the array is empty', () => {
+    const ctx = makeContext({ judge: { summary: 'Done.', threadEvaluations: [] } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    const parsed = JSON.parse(inner) as RoundContext;
+    expect(parsed.judge.threadEvaluations).toBeUndefined();
+  });
+
+});
+
+describe('roundContextToFlatAliases', () => {
+  it('round-trips the flat-alias projection for a representative round', () => {
+    const ctx = makeContext({
+      dedup: { staticDropped: 1, llmDropped: 2 },
+      judge: { summary: 'sum', mergedDuplicates: 3 },
+      findings: { count: 4, severityCounts: { blocker: 1, warning: 0, suggestion: 2, nitpick: 1 }, entries: [] },
+      diff: { lines: 120, additions: 80, deletions: 40, filesReviewed: 5, fileTypes: { '.ts': 5 } },
+    });
+    const aliases = roundContextToFlatAliases(ctx);
+    expect(aliases).toEqual({
+      prNumber: 42,
+      commitSha: 'abc123',
+      verdict: 'REQUEST_CHANGES',
+      diffLines: 120,
+      diffAdditions: 80,
+      diffDeletions: 40,
+      filesReviewed: 5,
+      agents: ['Security & Safety', 'Correctness'],
+      findingsRaw: 10,
+      findingsKept: 4,
+      findingsDropped: 6,
+      severity: { blocker: 1, warning: 0, suggestion: 2, nitpick: 1 },
+      model: 'claude-sonnet-4-20250514',
+      reviewerModel: 'claude-sonnet-4-20250514',
+      judgeModel: 'claude-opus-4-20250514',
+    });
+  });
+
+  it('uses zero defaults when optional dedup/judge counts are absent', () => {
+    const ctx = makeContext();
+    const aliases = roundContextToFlatAliases(ctx);
+    expect(aliases.findingsRaw).toBe(4);
+    expect(aliases.findingsDropped).toBe(0);
+  });
+
+  it('hidden mode emits a single HTML comment with no details/code-fence', () => {
+    const ctx = makeContext();
+    const result = formatContextBlock(ctx, true);
+    expect(result.startsWith('<!-- manki-context: ')).toBe(true);
+    expect(result.endsWith(' -->')).toBe(true);
+    expect(result).not.toContain('<details>');
+    expect(result).not.toContain('<summary>');
+    expect(result).not.toContain('```');
+    expect(result.split('\n')).toHaveLength(1);
+  });
+
+  it('hidden mode neutralises `-->` inside the JSON payload', () => {
+    const ctx = makeContext({ judge: { summary: 'closes html comment with --> here' } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    expect(inner).not.toContain('-->');
+    expect(inner).toContain('--\\u003E');
+  });
+
+  it('hidden mode neutralises `--!>` inside the JSON payload', () => {
+    const ctx = makeContext({ judge: { summary: 'bang close --!> here' } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    expect(inner).not.toContain('--!>');
+    expect(inner).toContain('--!\\u003E');
+  });
+
+  it('hidden mode JSON round-trips back to the original context after un-escaping', () => {
+    const ctx = makeContext({ judge: { summary: 'arrow --> token preserved' } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    const parsed = JSON.parse(inner) as RoundContext;
+    expect(parsed).toEqual(ctx);
+    expect(parsed.judge.summary).toBe('arrow --> token preserved');
+  });
+
+  it('hidden mode --!> round-trips back to original value', () => {
+    const ctx = makeContext({ judge: { summary: 'bang close --!> here' } });
+    const result = formatContextBlock(ctx, true);
+    const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+    const parsed = JSON.parse(inner) as RoundContext;
+    expect(parsed.judge.summary).toBe('bang close --!> here');
+  });
+
+  describe('sanitizeHtmlCommentJson (via formatContextBlock hidden path)', () => {
+    it('replaces all --> occurrences', () => {
+      const ctx = makeContext({ judge: { summary: '--> first --> second' } });
+      const result = formatContextBlock(ctx, true);
+      const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+      expect(inner).not.toContain('-->');
+      expect((inner.match(/--\\u003E/g) ?? []).length).toBe(2);
+    });
+
+    it('is a no-op when no --> is present', () => {
+      const ctx = makeContext({ judge: { summary: 'clean summary' } });
+      const result = formatContextBlock(ctx, true);
+      const inner = result.slice('<!-- manki-context: '.length, -' -->'.length);
+      expect(JSON.parse(inner).judge.summary).toBe('clean summary');
+    });
+  });
+});
+
+describe('truncateContextToFitBody', () => {
+  it('returns original context unchanged when body is already within budget', () => {
+    const ctx = makeContext();
+    const render = (c: RoundContext) => JSON.stringify(c);
+    const { context: out, droppedCount, summaryCapped } = truncateContextToFitBody(ctx, render, 1_000_000);
+    expect(droppedCount).toBe(0);
+    expect(summaryCapped).toBe(false);
+    expect(out).toBe(ctx);
+  });
+
+  it('is idempotent — calling twice on an already-truncated context is a no-op', () => {
+    const entries: FindingFingerprintEntry[] = Array.from({ length: 50 }, (_, i) => ({
+      fingerprint: { file: `src/f-${i}.ts`, lineStart: i, lineEnd: i, slug: 'slug-'.repeat(20) + i },
+      severity: 'nitpick' as const,
+    }));
+    const ctx = makeContext({
+      findings: { count: entries.length, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: entries.length }, entries },
+    });
+    const render = (c: RoundContext) => JSON.stringify(c);
+    const budget = render(ctx).length - 100;
+    const { context: once } = truncateContextToFitBody(ctx, render, budget);
+    expect(once.findings.entries.length).toBeLessThan(entries.length);
+    const { context: twice, droppedCount } = truncateContextToFitBody(once, render, budget);
+    expect(droppedCount).toBe(0);
+    expect(twice.findings.entries).toEqual(once.findings.entries);
+  });
+
+  it('returns over-budget context without truncated flag when no entries were dropped', () => {
+    const ctx = makeContext({
+      judge: { summary: 'x'.repeat(200) },
+      findings: { count: 0, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, entries: [] },
+    });
+    const render = (c: RoundContext) => JSON.stringify(c);
+    const { context: out, droppedCount } = truncateContextToFitBody(ctx, render, 1);
+    expect(droppedCount).toBe(0);
+    expect(out.findings.entries).toEqual([]);
+    expect(out.findings.truncated).toBeUndefined();
+    expect(render(out).length).toBeGreaterThan(1);
+  });
+
+  it('truncates judge.summary when it alone exceeds budget after entries are exhausted', () => {
+    const longSummary = 'a'.repeat(3000);
+    const ctx = makeContext({
+      judge: { summary: longSummary },
+      findings: { count: 0, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, entries: [] },
+    });
+    const render = (c: RoundContext) => JSON.stringify(c);
+    // Set budget just below the size of the bare context with the long summary so
+    // summary truncation is what pulls it under.
+    const fullSize = render(ctx).length;
+    const budget = fullSize - 500;
+    const { context: out, droppedCount, summaryCapped } = truncateContextToFitBody(ctx, render, budget);
+    expect(droppedCount).toBe(0);
+    expect(summaryCapped).toBe(true);
+    expect(out.judge.summary.length).toBeLessThan(longSummary.length);
+    // safeTruncate(summary, 2000) yields at most 2003 chars (2000 + ellipsis)
+    expect(out.judge.summary.length).toBeLessThanOrEqual(2003);
+    expect(render(out).length).toBeLessThanOrEqual(budget);
+  });
+
+  it('drops ignore entries before nitpick entries', () => {
+    const entries: FindingFingerprintEntry[] = [
+      { fingerprint: { file: 'f.ts', lineStart: 1, lineEnd: 1, slug: 'a' }, severity: 'ignore' },
+      { fingerprint: { file: 'f.ts', lineStart: 2, lineEnd: 2, slug: 'b' }, severity: 'nitpick' },
+    ];
+    const ctx = makeContext({ findings: { count: 2, severityCounts: {}, entries } });
+    const render = (c: RoundContext) => JSON.stringify(c);
+    // Budget must fit one entry with `truncated: true` but not two entries.
+    const oneEntryTruncated = makeContext({ findings: { count: 1, severityCounts: {}, entries: [entries[1]], truncated: true } });
+    const budget = render(oneEntryTruncated).length;
+    const { context: out } = truncateContextToFitBody(ctx, render, budget);
+    expect(out.findings.entries.map(e => e.severity)).toEqual(['nitpick']);
+  });
+
+  it('drops unknown entries before blocker entries', () => {
+    const entries: FindingFingerprintEntry[] = [
+      { fingerprint: { file: 'f.ts', lineStart: 1, lineEnd: 1, slug: 'a' }, severity: 'unknown' },
+      { fingerprint: { file: 'f.ts', lineStart: 2, lineEnd: 2, slug: 'b' }, severity: 'blocker' },
+    ];
+    const ctx = makeContext({ findings: { count: 2, severityCounts: {}, entries } });
+    const render = (c: RoundContext) => JSON.stringify(c);
+    // Budget must fit one entry with `truncated: true` but not two entries.
+    const oneEntryTruncated = makeContext({ findings: { count: 1, severityCounts: {}, entries: [entries[1]], truncated: true } });
+    const budget = render(oneEntryTruncated).length;
+    const { context: out } = truncateContextToFitBody(ctx, render, budget);
+    expect(out.findings.entries.map(e => e.severity)).toEqual(['blocker']);
+  });
+
+  it('does not set summaryCapped when judge.summary is already within 2000 chars', () => {
+    const shortSummary = 'short summary';
+    const ctx = makeContext({
+      judge: { summary: shortSummary },
+      findings: { count: 0, severityCounts: {}, entries: [] },
+    });
+    const render = (c: RoundContext) => JSON.stringify(c) + 'x'.repeat(1000);
+    const { summaryCapped, context: out } = truncateContextToFitBody(ctx, render, 1);
+    expect(summaryCapped).toBe(false);
+    expect(out.judge.summary).toBe(shortSummary);
+  });
+});
+
+describe('postReview with context', () => {
+  const mockCreateReview = jest.fn().mockResolvedValue({ data: { id: 1 } });
+  const mockOctokit = {
+    rest: {
+      pulls: {
+        createReview: mockCreateReview,
+      },
+    },
+  } as unknown as Parameters<typeof postReview>[0];
+
+  let warningSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    mockCreateReview.mockClear();
+    warningSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    warningSpy.mockClear();
+  });
+
+  afterEach(() => {
+    warningSpy.mockRestore();
+  });
+
+  it('includes stats one-liner and Manki context block in review body', async () => {
     const result: ReviewResult = {
       verdict: 'APPROVE',
       summary: 'All good.',
@@ -741,33 +1184,23 @@ describe('postReview with stats', () => {
       reviewComplete: true,
       agentNames: [],
     };
-    const stats: ReviewStats = {
-      model: 'claude-sonnet-4-20250514',
-      reviewTimeMs: 60000,
-      diffLines: 200,
-      diffAdditions: 150,
-      diffDeletions: 50,
-      filesReviewed: 8,
-      agents: ['Security', 'Correctness'],
-      findingsRaw: 6,
-      findingsKept: 3,
-      findingsDropped: 3,
-      severity: { blocker: 0, warning: 0, suggestion: 2, nitpick: 1 },
+    const ctx = makeContext({
+      diff: { lines: 200, additions: 150, deletions: 50, filesReviewed: 8, fileTypes: { '.ts': 8 } },
+      reviewers: { agents: ['Security', 'Correctness'] },
+      findings: { count: 3, severityCounts: { blocker: 0, warning: 0, suggestion: 2, nitpick: 1 }, entries: [] },
       verdict: 'APPROVE',
-      prNumber: 99,
-      commitSha: 'abc',
-    };
+    });
 
-    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, stats);
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, ctx, 60000);
     const body = mockCreateReview.mock.calls[0][0].body as string;
     expect(body).toContain('\u{1F4CA} 3 findings');
     expect(body).toContain('200 lines');
     expect(body).toContain('60s');
-    expect(body).toContain('<details>');
-    expect(body).toContain('"model": "claude-sonnet-4-20250514"');
+    expect(body).toContain('<summary>Manki context</summary>');
+    expect(body).toContain('"reviewer": "claude-sonnet-4-20250514"');
   });
 
-  it('omits stats section when stats not provided', async () => {
+  it('omits stats section when context not provided', async () => {
     const result: ReviewResult = {
       verdict: 'APPROVE',
       summary: 'All good.',
@@ -780,7 +1213,151 @@ describe('postReview with stats', () => {
     await postReview(mockOctokit, 'owner', 'repo', 1, 'sha', result);
     const body = mockCreateReview.mock.calls[0][0].body as string;
     expect(body).not.toContain('\u{1F4CA}');
+    expect(body).not.toContain('Manki context');
     expect(body).not.toContain('Review stats');
+  });
+
+  it('truncates findings.entries in priority order when body exceeds 60k chars', async () => {
+    const result: ReviewResult = {
+      verdict: 'COMMENT',
+      summary: 'Many findings.',
+      findings: [],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+    // Each fingerprint slug is ~120 chars; 1000 entries with mixed severities push the
+    // serialized JSON over the 60k budget so truncation must drop the lowest-priority
+    // entries first.
+    const longSlug = 'long-slug-token-'.repeat(8);
+    const entries: FindingFingerprintEntry[] = [];
+    for (let i = 0; i < 250; i++) {
+      entries.push({ fingerprint: { file: `src/file-${i}.ts`, lineStart: i, lineEnd: i, slug: `nit-${longSlug}${i}` }, severity: 'nitpick' });
+      entries.push({ fingerprint: { file: `src/file-${i}.ts`, lineStart: i, lineEnd: i, slug: `sug-${longSlug}${i}` }, severity: 'suggestion' });
+      entries.push({ fingerprint: { file: `src/file-${i}.ts`, lineStart: i, lineEnd: i, slug: `warn-${longSlug}${i}` }, severity: 'warning' });
+      entries.push({ fingerprint: { file: `src/file-${i}.ts`, lineStart: i, lineEnd: i, slug: `block-${longSlug}${i}` }, severity: 'blocker' });
+    }
+    const ctx = makeContext({
+      findings: { count: entries.length, severityCounts: { blocker: 250, warning: 250, suggestion: 250, nitpick: 250 }, entries },
+    });
+
+    const preTruncationBody = JSON.stringify(ctx);
+    expect(preTruncationBody.length).toBeGreaterThan(60_000);
+
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, ctx, 1000);
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body.length).toBeLessThanOrEqual(60000);
+
+    const match = body.match(/```json\n([\s\S]*?)\n```/);
+    expect(match).not.toBeNull();
+    const parsed = JSON.parse(match![1]) as RoundContext;
+    expect(parsed.findings.truncated).toBe(true);
+    expect(parsed.findings.entries.length).toBeLessThan(entries.length);
+    // Nitpicks are dropped first, so any survivor must be a higher-priority severity
+    // unless every nitpick was preserved (which would mean no truncation).
+    const bySev = (s: string) => parsed.findings.entries.filter(e => e.severity === s).length;
+    // At least some nitpicks must have been dropped — the budget is tight enough to require it.
+    expect(bySev('nitpick')).toBeLessThan(250);
+    // Nitpicks are always dropped before suggestions. With 1000 entries and 4 tiers the budget
+    // is designed so that suggestions must also be dropped, so we can assert this unconditionally.
+    expect(bySev('nitpick')).toBe(0);
+    const droppedSuggestion = 250 - bySev('suggestion');
+    const droppedWarning = 250 - bySev('warning');
+    const droppedBlocker = 250 - bySev('blocker');
+    // Nitpicks are dropped first: any dropped suggestion implies all nitpicks gone.
+    if (droppedSuggestion > 0) expect(bySev('nitpick')).toBe(0);
+    // Suggestions are dropped before warnings: any dropped warning implies all suggestions gone.
+    if (droppedWarning > 0) expect(bySev('suggestion')).toBe(0);
+    // Warnings are dropped before blockers: any dropped blocker implies all warnings gone.
+    if (droppedBlocker > 0) expect(bySev('warning')).toBe(0);
+
+    expect(warningSpy).toHaveBeenCalledWith(expect.stringMatching(/Manki context truncated: dropped \d+ finding entries/));
+  });
+
+  it('hidden mode renders HTML-comment block instead of `<details>` while preserving the stats one-liner', async () => {
+    const result: ReviewResult = {
+      verdict: 'APPROVE',
+      summary: 'All good.',
+      findings: [],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+    const ctx = makeContext({
+      diff: { lines: 200, additions: 150, deletions: 50, filesReviewed: 8, fileTypes: { '.ts': 8 } },
+      reviewers: { agents: ['Security', 'Correctness'] },
+      findings: { count: 3, severityCounts: { blocker: 0, warning: 0, suggestion: 2, nitpick: 1 }, entries: [] },
+      verdict: 'APPROVE',
+    });
+    const config = { ...DEFAULT_CONFIG, stats: { hidden: true } };
+
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, ctx, 60000, config);
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body).toContain('\u{1F4CA} 3 findings');
+    expect(body).toContain('200 lines');
+    expect(body).toContain('60s');
+    expect(body).toContain('<!-- manki-context: ');
+    expect(body).not.toContain('<details>');
+    expect(body).not.toContain('<summary>Manki context</summary>');
+    expect(body).not.toContain('```json');
+    const match = body.match(/<!-- manki-context: ([\s\S]*?) -->/);
+    expect(match).not.toBeNull();
+    const parsed = JSON.parse(match![1]) as RoundContext;
+    expect(parsed.findings.count).toBe(3);
+    expect(parsed.verdict).toBe('APPROVE');
+  });
+
+  it('does not truncate when rendered body is under the 60k budget', async () => {
+    const result: ReviewResult = {
+      verdict: 'APPROVE',
+      summary: 'Small review.',
+      findings: [],
+      highlights: [],
+      reviewComplete: true,
+      agentNames: [],
+    };
+    const ctx = makeContext({
+      findings: {
+        count: 1,
+        severityCounts: { blocker: 0, warning: 0, suggestion: 1, nitpick: 0 },
+        entries: [{ fingerprint: { file: 'src/a.ts', lineStart: 1, lineEnd: 1, slug: 'tiny' }, severity: 'suggestion' }],
+      },
+    });
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, ctx, 1000);
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    const match = body.match(/```json\n([\s\S]*?)\n```/);
+    const parsed = JSON.parse(match![1]) as RoundContext;
+    expect(parsed.findings.truncated).toBeUndefined();
+    expect(parsed.findings.entries).toHaveLength(1);
+    expect(warningSpy).not.toHaveBeenCalledWith(expect.stringMatching(/Manki context truncated/));
+  });
+
+  it('shows 0s for review time when reviewTimeMs is omitted', async () => {
+    const result: ReviewResult = {
+      verdict: 'APPROVE', summary: '', findings: [],
+      highlights: [], reviewComplete: true, agentNames: [],
+    };
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, makeContext());
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    expect(body).toContain('0s');
+  });
+
+  it('fires core.warning and caps summary when only judge.summary exceeds budget', async () => {
+    const result: ReviewResult = {
+      verdict: 'APPROVE', summary: '', findings: [],
+      highlights: [], reviewComplete: true, agentNames: [],
+    };
+    const ctx = makeContext({
+      judge: { summary: 'a'.repeat(65000) },
+      findings: { count: 0, severityCounts: {}, entries: [] },
+    });
+    await postReview(mockOctokit, 'owner', 'repo', 99, 'abc', result, undefined, ctx, 0);
+    expect(warningSpy).toHaveBeenCalledWith(expect.stringMatching(/judge summary capped/));
+    const body = mockCreateReview.mock.calls[0][0].body as string;
+    const match = body.match(/```json\n([\s\S]*?)\n```/);
+    const parsed = JSON.parse(match![1]) as RoundContext;
+    expect(parsed.findings.truncated).toBeUndefined();
+    expect(parsed.judge.summary.length).toBeLessThanOrEqual(2003);
   });
 });
 
@@ -1019,24 +1596,6 @@ describe('dynamicFence', () => {
 
   it('handles content with long backtick runs', () => {
     expect(dynamicFence('`````')).toBe('``````');
-  });
-});
-
-describe('safeTruncate', () => {
-  it('returns text unchanged when shorter than max', () => {
-    expect(safeTruncate('hello', 10)).toBe('hello');
-  });
-
-  it('truncates normal text at boundary', () => {
-    expect(safeTruncate('hello world', 5)).toBe('hello...');
-  });
-
-  it('avoids splitting a surrogate pair at the boundary', () => {
-    // U+1F600 (grinning face) is a surrogate pair: \uD83D\uDE00
-    const text = 'ab\u{1F600}cd';
-    // maxLen=3 would land between the high and low surrogate; safeTruncate backs up
-    const result = safeTruncate(text, 3);
-    expect(result).toBe('ab...');
   });
 });
 
@@ -1684,23 +2243,59 @@ describe('buildDashboard', () => {
   it('renders plannerInfo with structured details', () => {
     const data: DashboardData = {
       phase: 'started', lineCount: 200, agentCount: 5,
-      plannerInfo: { teamSize: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feature' },
+      plannerInfo: { agentCount: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feat' },
     };
     const md = buildDashboard(data);
     expect(md).toContain('**Planner**');
-    expect(md).toContain(`${INDENT}feature · 200 lines · 5 agents`);
+    expect(md).toContain(`${INDENT}feat · 200 lines · 5 agents`);
     expect(md).toContain(`${INDENT}review effort: medium · judge effort: high`);
   });
 
-  it('sanitizes unknown prType values in plannerInfo', () => {
+  it('renders the resolved roster size on the Planner line, not the planner-requested teamSize', () => {
+    // The dashboard must show the actual resolved roster count, not the planner-requested
+    // teamSize, which can diverge when prior-round pinning grows the roster.
     const data: DashboardData = {
-      phase: 'started', lineCount: 100, agentCount: 3,
-      plannerInfo: { teamSize: 3, reviewerEffort: 'low', judgeEffort: 'low', prType: '<script>alert(1)</script>' },
+      phase: 'started', lineCount: 120, agentCount: 5,
+      plannerInfo: { agentCount: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'fix' },
     };
     const md = buildDashboard(data);
-    expect(md).toContain('unknown');
+    expect(md).toContain(`${INDENT}fix · 120 lines · 5 agents`);
+    expect(md).not.toContain('3 agents');
+  });
+
+  it('omits the prType chip when the value is off-vocab and never leaks the raw value', () => {
+    const data: DashboardData = {
+      phase: 'started', lineCount: 100, agentCount: 3,
+      plannerInfo: { agentCount: 3, reviewerEffort: 'low', judgeEffort: 'low', prType: '<script>alert(1)</script>' },
+    };
+    const md = buildDashboard(data);
+    expect(md).toContain(`${INDENT}100 lines · 3 agents`);
+    expect(md).not.toContain('unknown');
     expect(md).not.toContain('<script>');
   });
+
+  it('omits the prType chip when the value is the `unknown` sentinel', () => {
+    const data: DashboardData = {
+      phase: 'started', lineCount: 100, agentCount: 3,
+      plannerInfo: { agentCount: 3, reviewerEffort: 'low', judgeEffort: 'low', prType: 'unknown' },
+    };
+    const md = buildDashboard(data);
+    expect(md).toContain(`${INDENT}100 lines · 3 agents`);
+    expect(md).not.toContain('unknown ·');
+    expect(md).not.toContain('· unknown');
+  });
+
+  it.each(['build', 'chore', 'ci', 'docs', 'feat', 'fix', 'perf', 'refactor', 'revert', 'style', 'test'])(
+    'renders the prType chip for canonical type `%s`',
+    prType => {
+      const data: DashboardData = {
+        phase: 'started', lineCount: 50, agentCount: 2,
+        plannerInfo: { agentCount: 2, reviewerEffort: 'low', judgeEffort: 'low', prType },
+      };
+      const md = buildDashboard(data);
+      expect(md).toContain(`${INDENT}${prType} · 50 lines · 2 agents`);
+    },
+  );
 
   it('renders severity breakdown in judge section when provided', () => {
     const data: DashboardData = {
@@ -1731,18 +2326,18 @@ describe('buildDashboard', () => {
     const data: DashboardData = {
       phase: 'complete', lineCount: 400, agentCount: 5,
       keptCount: 3, droppedCount: 5, rawFindingCount: 8,
-      plannerInfo: { teamSize: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'bugfix' },
+      plannerInfo: { agentCount: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'fix' },
     };
     const md = buildDashboard(data);
     expect(md).toContain('**Planner**');
-    expect(md).toContain(`${INDENT}bugfix · 400 lines · 5 agents`);
+    expect(md).toContain(`${INDENT}fix · 400 lines · 5 agents`);
     expect(md).toContain(`${INDENT}review effort: medium · judge effort: high`);
   });
 
   it('sanitizes unknown effort values in plannerInfo', () => {
     const data: DashboardData = {
       phase: 'started', lineCount: 100, agentCount: 3,
-      plannerInfo: { teamSize: 3, reviewerEffort: 'injected' as unknown as 'low', judgeEffort: 'high', prType: 'feature' },
+      plannerInfo: { agentCount: 3, reviewerEffort: 'injected' as unknown as 'low', judgeEffort: 'high', prType: 'feat' },
     };
     const md = buildDashboard(data);
     expect(md).toContain('review effort: unknown');
@@ -1761,10 +2356,29 @@ describe('buildDashboard', () => {
     expect(md).not.toContain(`${INDENT}dropped:`);
   });
 
+  it('renders test-nit suppression count in judge section when provided', () => {
+    const data: DashboardData = {
+      phase: 'complete', lineCount: 400, agentCount: 3,
+      rawFindingCount: 10, keptCount: 0, droppedCount: 3,
+      testNitSuppressedCount: 7,
+    };
+    const md = buildDashboard(data);
+    expect(md).toContain('suppressed: 7 test-only nits (round ≥2 throttle)');
+  });
+
+  it('omits test-nit suppression line when testNitSuppressedCount is not set', () => {
+    const data: DashboardData = {
+      phase: 'complete', lineCount: 400, agentCount: 3,
+      rawFindingCount: 10, keptCount: 3, droppedCount: 7,
+    };
+    const md = buildDashboard(data);
+    expect(md).not.toMatch(/suppressed/i);
+  });
+
   it('renders planner duration when plannerInfo and plannerDurationMs are provided', () => {
     const data: DashboardData = {
       phase: 'started', lineCount: 200, agentCount: 5,
-      plannerInfo: { teamSize: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feature' },
+      plannerInfo: { agentCount: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feat' },
       plannerDurationMs: 1200,
     };
     const md = buildDashboard(data);
@@ -1783,11 +2397,60 @@ describe('buildDashboard', () => {
   it('omits planner duration when plannerDurationMs is not set', () => {
     const data: DashboardData = {
       phase: 'started', lineCount: 200, agentCount: 5,
-      plannerInfo: { teamSize: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feature' },
+      plannerInfo: { agentCount: 5, reviewerEffort: 'medium', judgeEffort: 'high', prType: 'feat' },
     };
     const md = buildDashboard(data);
     expect(md).toContain('**Planner**');
     expect(md).not.toContain('**Planner** (');
+  });
+
+  it('renders per-team counts and durations from agentProgress when planner metadata is empty (heuristic-fallback path)', () => {
+    const data: DashboardData = {
+      phase: 'complete', lineCount: 600, agentCount: 5,
+      rawFindingCount: 18, keptCount: 12, droppedCount: 6,
+      heuristicFallback: true,
+      plannerDurationMs: 60000,
+      agentProgress: [
+        { name: 'Security & Safety', status: 'done', findingCount: 4, durationMs: 41000 },
+        { name: 'Architecture & Design', status: 'done', findingCount: 3, durationMs: 38000 },
+        { name: 'Correctness & Logic', status: 'done', findingCount: 5, durationMs: 45000 },
+        { name: 'Testing & Coverage', status: 'done', findingCount: 4, durationMs: 36000 },
+        { name: 'Performance & Efficiency', status: 'done', findingCount: 2, durationMs: 39000 },
+      ],
+    };
+    const md = buildDashboard(data);
+    expect(md).toContain('**Review** — 18 findings');
+    expect(md).toContain(`${INDENT}✅ Security & Safety — 4 (41s)`);
+    expect(md).toContain(`${INDENT}✅ Architecture & Design — 3 (38s)`);
+    expect(md).toContain(`${INDENT}✅ Correctness & Logic — 5 (45s)`);
+    expect(md).toContain(`${INDENT}✅ Testing & Coverage — 4 (36s)`);
+    expect(md).toContain(`${INDENT}✅ Performance & Efficiency — 2 (39s)`);
+    expect(md).not.toContain('0 (0ms)');
+  });
+
+  it('renders heuristic-fallback marker under the planner header when set', () => {
+    const data: DashboardData = {
+      phase: 'complete', lineCount: 200, agentCount: 5,
+      rawFindingCount: 0, keptCount: 0, droppedCount: 0,
+      heuristicFallback: true,
+      plannerDurationMs: 60000,
+    };
+    const md = buildDashboard(data);
+    const plannerIdx = md.indexOf('**Planner**');
+    const reviewIdx = md.indexOf('**Review**');
+    const markerIdx = md.indexOf(`${INDENT}_(planner heuristic fallback used)_`);
+    expect(markerIdx).toBeGreaterThan(plannerIdx);
+    expect(markerIdx).toBeLessThan(reviewIdx);
+  });
+
+  it('omits heuristic-fallback marker when not set', () => {
+    const data: DashboardData = {
+      phase: 'complete', lineCount: 200, agentCount: 5,
+      rawFindingCount: 0, keptCount: 0, droppedCount: 0,
+      plannerDurationMs: 850,
+    };
+    const md = buildDashboard(data);
+    expect(md).not.toContain('planner heuristic fallback used');
   });
 
   it('renders judge duration in complete phase', () => {
@@ -1814,7 +2477,7 @@ describe('buildDashboard', () => {
     const data: DashboardData = {
       phase: 'complete', lineCount: 400, agentCount: 5,
       rawFindingCount: 10, keptCount: 6, droppedCount: 4,
-      plannerInfo: { teamSize: 5, reviewerEffort: 'low', judgeEffort: 'medium', prType: 'bugfix' },
+      plannerInfo: { agentCount: 5, reviewerEffort: 'low', judgeEffort: 'medium', prType: 'fix' },
       plannerDurationMs: 2500,
       judgeDurationMs: 65000,
     };
@@ -1834,9 +2497,20 @@ describe('buildDashboard', () => {
     };
     const md = buildDashboard(data);
     expect(md).toContain('2/3 agents complete');
-    expect(md).toContain(`${INDENT}⟳ Security & Safety — retrying (2/2)...`);
+    expect(md).toContain(`${INDENT}🔄 Security & Safety — retrying (2/2)...`);
     expect(md).toContain(`${INDENT}✅ Architecture & Design — 2 (3s)`);
     expect(md).toContain(`${INDENT}⏳ Correctness & Logic`);
+  });
+
+  it('renders retrying agent status without retry count', () => {
+    const data: DashboardData = {
+      phase: 'started', lineCount: 100, agentCount: 1,
+      agentProgress: [
+        { name: 'Security & Safety', status: 'retrying' },
+      ],
+    };
+    const md = buildDashboard(data);
+    expect(md).toContain(`${INDENT}🔄 Security & Safety — retrying...`);
   });
 
   it('renders failed agent with retry count showing total attempts', () => {
@@ -1914,7 +2588,6 @@ describe('updateProgressComment', () => {
       teamAgents: ['Security & Safety', 'Correctness & Logic', 'Architecture & Design'],
       memoryEnabled: true,
       memoryRepo: 'owner/review-memory',
-      nitHandling: 'issues',
     },
     judgeDecisions: [
       { title: 'Null dereference', severity: 'blocker', reasoning: 'Valid bug', confidence: 'high', kept: true },
@@ -1952,7 +2625,6 @@ describe('updateProgressComment', () => {
     expect(body).toContain('Review level: medium (auto, 200 lines)');
     expect(body).toContain('Security & Safety, Correctness & Logic, Architecture & Design');
     expect(body).toContain('enabled (owner/review-memory)');
-    expect(body).toContain('Nit handling: issues');
   });
 
   it('renders judge decisions with kept/dropped icons', async () => {
@@ -2341,86 +3013,6 @@ describe('reactToReviewComment', () => {
   });
 });
 
-describe('createNitIssue', () => {
-  it('returns null when no nit findings exist', async () => {
-    const mockOctokit = {} as unknown as Parameters<typeof createNitIssue>[0];
-    const findings: Finding[] = [
-      { severity: 'blocker', title: 'Bug', file: 'a.ts', line: 1, description: 'Desc', reviewers: [] },
-    ];
-
-    const result = await createNitIssue(mockOctokit, 'owner', 'repo', 1, findings, 'sha');
-    expect(result).toBeNull();
-  });
-
-  it('returns existing issue number if nit issue already exists', async () => {
-    const mockOctokit = {
-      rest: {
-        search: {
-          issuesAndPullRequests: jest.fn().mockResolvedValue({
-            data: { total_count: 1, items: [{ number: 99 }] },
-          }),
-        },
-      },
-    } as unknown as Parameters<typeof createNitIssue>[0];
-
-    const findings: Finding[] = [
-      { severity: 'nitpick', title: 'Style', file: 'a.ts', line: 1, description: 'Desc', reviewers: [] },
-    ];
-
-    const result = await createNitIssue(mockOctokit, 'owner', 'repo', 1, findings, 'sha');
-    expect(result).toBe(99);
-  });
-
-  it('creates a new nit issue with label', async () => {
-    const createIssueMock = jest.fn().mockResolvedValue({ data: { number: 200 } });
-    const mockOctokit = {
-      rest: {
-        search: {
-          issuesAndPullRequests: jest.fn().mockResolvedValue({ data: { total_count: 0, items: [] } }),
-        },
-        issues: {
-          getLabel: jest.fn().mockResolvedValue({}),
-          create: createIssueMock,
-        },
-      },
-    } as unknown as Parameters<typeof createNitIssue>[0];
-
-    const findings: Finding[] = [
-      { severity: 'nitpick', title: 'Style issue', file: 'a.ts', line: 5, description: 'Minor style.', reviewers: [] },
-    ];
-
-    const result = await createNitIssue(mockOctokit, 'owner', 'repo', 42, findings, 'abc123');
-    expect(result).toBe(200);
-    expect(createIssueMock).toHaveBeenCalledWith(expect.objectContaining({
-      title: 'triage: findings from PR #42',
-      labels: ['needs-human'],
-    }));
-  });
-
-  it('creates the needs-human label if it does not exist', async () => {
-    const createLabelMock = jest.fn().mockResolvedValue({});
-    const mockOctokit = {
-      rest: {
-        search: {
-          issuesAndPullRequests: jest.fn().mockResolvedValue({ data: { total_count: 0, items: [] } }),
-        },
-        issues: {
-          getLabel: jest.fn().mockRejectedValue(new Error('Not found')),
-          createLabel: createLabelMock,
-          create: jest.fn().mockResolvedValue({ data: { number: 201 } }),
-        },
-      },
-    } as unknown as Parameters<typeof createNitIssue>[0];
-
-    const findings: Finding[] = [
-      { severity: 'nitpick', title: 'Nit', file: 'a.ts', line: 1, description: 'Desc', reviewers: [] },
-    ];
-
-    await createNitIssue(mockOctokit, 'owner', 'repo', 1, findings, 'sha');
-    expect(createLabelMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'needs-human' }));
-  });
-});
-
 describe('postReview fallback paths', () => {
   it('retries without inline comments when line validation error occurs', async () => {
     const createReviewMock = jest.fn()
@@ -2753,6 +3345,16 @@ describe('isReviewInProgress', () => {
     expect(result).toBe(false);
   });
 
+  it('returns false when comment is a cap-notice comment containing FORCE_CAP_MARKER', async () => {
+    const { octokit } = makeMockOctokit({
+      comments: [{ body: `${BOT_MARKER}\nAutomatic review is paused.\n\n- [ ] Force review\n\n${FORCE_CAP_MARKER}`, user: { type: 'Bot' } }],
+    });
+
+    const result = await isReviewInProgress(octokit, 'owner', 'repo', 1);
+
+    expect(result).toBe(false);
+  });
+
   it('returns false when the listComments API call fails', async () => {
     const octokit = {
       rest: {
@@ -2980,9 +3582,10 @@ describe('isApprovedOnCommit', () => {
 
   function makeMockOctokit(reviews: Array<{ body?: string | null; state: string; commit_id?: string; user?: { login?: string; type: string } }>) {
     return {
+      paginate: jest.fn().mockResolvedValue(reviews),
       rest: {
         pulls: {
-          listReviews: jest.fn().mockResolvedValue({ data: reviews }),
+          listReviews: {},
         },
       },
     } as unknown as Octokit;
@@ -3020,11 +3623,8 @@ describe('isApprovedOnCommit', () => {
 
   it('returns false when the API call fails', async () => {
     const octokit = {
-      rest: {
-        pulls: {
-          listReviews: jest.fn().mockRejectedValue(new Error('API error')),
-        },
-      },
+      paginate: jest.fn().mockRejectedValue(new Error('API error')),
+      rest: { pulls: { listReviews: {} } },
     } as unknown as Octokit;
 
     expect(await isApprovedOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
@@ -3054,6 +3654,126 @@ describe('isApprovedOnCommit', () => {
     ]);
 
     expect(await isApprovedOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
+  });
+});
+
+describe('hasBotReviewOnCommit', () => {
+  type Octokit = ReturnType<typeof import('@actions/github').getOctokit>;
+
+  function makeMockOctokit(reviews: Array<{ body?: string | null; state: string; commit_id?: string; user?: { login?: string; type: string } }>) {
+    return {
+      paginate: jest.fn().mockResolvedValue(reviews),
+      rest: {
+        pulls: {
+          listReviews: {},
+        },
+      },
+    } as unknown as Octokit;
+  }
+
+  it.each([
+    ['APPROVED'],
+    ['COMMENTED'],
+    ['CHANGES_REQUESTED'],
+  ])('returns true when a non-DISMISSED bot review (%s) exists on the head SHA', async (state) => {
+    const octokit = makeMockOctokit([
+      { body: `${BOT_MARKER}\nReview`, state, commit_id: 'sha-123', user: { login: BOT_LOGIN, type: 'Bot' } },
+    ]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(true);
+  });
+
+  it('returns false when the only bot review on the SHA is DISMISSED', async () => {
+    const octokit = makeMockOctokit([
+      { body: `${BOT_MARKER}\nReview`, state: 'DISMISSED', commit_id: 'sha-123', user: { login: BOT_LOGIN, type: 'Bot' } },
+    ]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
+  });
+
+  it('returns false when the only bot review is on a different commit', async () => {
+    const octokit = makeMockOctokit([
+      { body: `${BOT_MARKER}\nReview`, state: 'COMMENTED', commit_id: 'sha-old', user: { login: BOT_LOGIN, type: 'Bot' } },
+    ]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-new')).toBe(false);
+  });
+
+  it('returns false when there are no bot reviews', async () => {
+    const octokit = makeMockOctokit([]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
+  });
+
+  it('returns false on API error (fail-open)', async () => {
+    const octokit = {
+      paginate: jest.fn().mockRejectedValue(new Error('API error')),
+      rest: { pulls: { listReviews: {} } },
+    } as unknown as Octokit;
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
+  });
+
+  it('ignores non-bot reviewers', async () => {
+    const octokit = makeMockOctokit([
+      { state: 'APPROVED', commit_id: 'sha-123', user: { login: 'human', type: 'User' } },
+    ]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(false);
+  });
+
+  it('returns true when a prior bot review is on the SHA and a later DISMISSED one is too', async () => {
+    const octokit = makeMockOctokit([
+      { state: 'COMMENTED', commit_id: 'sha-123', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } },
+      { state: 'DISMISSED', commit_id: 'sha-123', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } },
+    ]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-123')).toBe(true);
+  });
+
+  it('returns true when the matching review is the 501st (beyond the 500-cap), not among the first 500', async () => {
+    const old = Array.from({ length: 500 }, (_, i) => ({
+      state: 'COMMENTED',
+      commit_id: `sha-old-${i}`,
+      body: `${BOT_MARKER}\nreview body`,
+      user: { login: BOT_LOGIN, type: 'Bot' },
+    }));
+    const newest = { state: 'COMMENTED', commit_id: 'sha-new', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } };
+    const octokit = makeMockOctokit([...old, newest]);
+
+    expect(await hasBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-new')).toBe(true);
+  });
+});
+
+describe('findBotReviewOnCommit', () => {
+  type Octokit = ReturnType<typeof import('@actions/github').getOctokit>;
+
+  function makeMockOctokit(reviews: Array<{ id?: number; body?: string | null; state: string; commit_id?: string; user?: { login?: string; type: string } }>) {
+    return {
+      paginate: jest.fn().mockResolvedValue(reviews),
+      rest: {
+        pulls: {
+          listReviews: {},
+        },
+      },
+    } as unknown as Octokit;
+  }
+
+  it('returns the last review for the target commit when reviews for multiple commits are interleaved', async () => {
+    const reviewA1 = { id: 1, state: 'COMMENTED', commit_id: 'sha-a', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } };
+    const reviewB = { id: 2, state: 'COMMENTED', commit_id: 'sha-b', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } };
+    const reviewA2 = { id: 3, state: 'CHANGES_REQUESTED', commit_id: 'sha-a', body: `${BOT_MARKER}\nreview body`, user: { login: BOT_LOGIN, type: 'Bot' } };
+    const octokit = makeMockOctokit([reviewA1, reviewB, reviewA2]);
+
+    const result = await findBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-a');
+    expect(result?.id).toBe(3);
+  });
+
+  it('returns undefined when only reviews for other commits exist', async () => {
+    const reviewB = { id: 2, state: 'APPROVED', commit_id: 'sha-b', user: { login: BOT_LOGIN, type: 'Bot' } };
+    const octokit = makeMockOctokit([reviewB]);
+
+    expect(await findBotReviewOnCommit(octokit, 'owner', 'repo', 1, 'sha-a')).toBeUndefined();
   });
 });
 
@@ -3330,5 +4050,177 @@ describe('cancelActiveReviewRun', () => {
     expect(result).toBe(true);
     expect(cancelWorkflowRun).toHaveBeenCalled();
     expect(updateComment).toHaveBeenCalled();
+  });
+});
+
+describe('findInProgressLock', () => {
+  function makeInProgressBody(runId: number): string {
+    return `${BOT_MARKER}\n<!-- manki-run-id:${runId} -->\n**Manki** — Review in progress`;
+  }
+
+  function makeComment(
+    id: number, body: string, login: string, type: string, updated_at: string,
+  ) {
+    return { id, body, user: { login, type }, updated_at };
+  }
+
+  function botComment(id: number, body: string, updated_at = '2026-01-01T00:00:00Z') {
+    return makeComment(id, body, BOT_LOGIN, 'Bot', updated_at);
+  }
+
+  it('returns null when no in-progress bot comment exists (lock acquisition)', () => {
+    const comments = [makeComment(1, 'Some user comment', 'someone', 'User', '2026-01-01T00:00:00Z')];
+
+    expect(findInProgressLock(comments, 42)).toBeNull();
+  });
+
+  it('returns the lock when a different run posted an in-progress marker (contention)', () => {
+    const comments = [botComment(7, makeInProgressBody(999), '2026-05-22T12:00:00Z')];
+
+    expect(findInProgressLock(comments, 42)).toEqual({ runId: 999, updatedAt: '2026-05-22T12:00:00Z', commentId: 7 });
+  });
+
+  it('ignores the current run\'s own in-progress marker (self re-entry)', () => {
+    const comments = [botComment(7, makeInProgressBody(42))];
+
+    expect(findInProgressLock(comments, 42)).toBeNull();
+  });
+
+  it('skips comments bearing terminal markers (complete, cancelled, force-review, force-cap)', () => {
+    const comments = [
+      botComment(1, `${makeInProgressBody(101)}\n${REVIEW_COMPLETE_MARKER}`),
+      botComment(2, `${makeInProgressBody(102)}\n${CANCELLED_MARKER}`),
+      botComment(3, `${makeInProgressBody(103)}\n${FORCE_REVIEW_MARKER}`),
+      botComment(4, `${makeInProgressBody(104)}\n${FORCE_CAP_MARKER}`),
+    ];
+
+    expect(findInProgressLock(comments, 42)).toBeNull();
+  });
+
+  it('skips comments without a parseable run-id marker (legacy)', () => {
+    const comments = [botComment(1, `${BOT_MARKER}\n**Manki** — Review in progress`)];
+
+    expect(findInProgressLock(comments, 42)).toBeNull();
+  });
+
+  it('skips comments that are not from the bot login', () => {
+    const comments = [
+      makeComment(1, makeInProgressBody(999), 'github-actions[bot]', 'Bot', '2026-01-01T00:00:00Z'),
+      makeComment(2, makeInProgressBody(888), 'human', 'User', '2026-01-01T00:00:00Z'),
+    ];
+
+    expect(findInProgressLock(comments, 42)).toBeNull();
+  });
+
+  it('returns the first (most recent) lock when multiple in-progress markers exist', () => {
+    const comments = [
+      botComment(20, makeInProgressBody(200), '2026-05-22T12:05:00Z'),
+      botComment(10, makeInProgressBody(100), '2026-05-22T11:55:00Z'),
+    ];
+
+    expect(findInProgressLock(comments, 42)).toEqual({ runId: 200, updatedAt: '2026-05-22T12:05:00Z', commentId: 20 });
+  });
+});
+
+describe('isLockExpired', () => {
+  const now = new Date('2026-05-22T12:00:00Z');
+
+  it('returns false when the comment was updated within the TTL window', () => {
+    expect(isLockExpired('2026-05-22T11:55:00Z', 600, now)).toBe(false);
+  });
+
+  it('returns true when the comment was updated more than TTL seconds ago (TTL expiry)', () => {
+    expect(isLockExpired('2026-05-22T11:40:00Z', 600, now)).toBe(true);
+  });
+
+  it('treats an unparseable timestamp as expired', () => {
+    expect(isLockExpired('not-a-date', 600, now)).toBe(true);
+  });
+
+  it('returns false for a fresh comment when TTL is zero only when ages match exactly', () => {
+    expect(isLockExpired('2026-05-22T12:00:00Z', 0, now)).toBe(false);
+    expect(isLockExpired('2026-05-22T11:59:59Z', 0, now)).toBe(true);
+  });
+});
+
+describe('fetchPRComments', () => {
+  type Octokit = ReturnType<typeof import('@actions/github').getOctokit>;
+
+  function makeMockOctokit(comments: Array<{ id: number; body: string; updated_at: string }>) {
+    const octokit = {
+      rest: {
+        issues: {
+          listComments: jest.fn().mockResolvedValue({ data: comments }),
+        },
+      },
+    } as unknown as Octokit;
+    return octokit;
+  }
+
+  it('returns an empty array when there are no comments', async () => {
+    const octokit = makeMockOctokit([]);
+
+    const result = await fetchPRComments(octokit, 'owner', 'repo', 1);
+
+    expect(result).toEqual([]);
+  });
+
+  it('returns a single-element array unchanged', async () => {
+    const comment = { id: 1, body: 'hello', updated_at: '2026-05-22T12:00:00.000Z' };
+    const octokit = makeMockOctokit([comment]);
+
+    const result = await fetchPRComments(octokit, 'owner', 'repo', 1);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe(1);
+  });
+
+  it('sorts multiple comments by updated_at descending (newest first)', async () => {
+    const comments = [
+      { id: 1, body: 'oldest', updated_at: '2026-05-22T10:00:00.000Z' },
+      { id: 3, body: 'newest', updated_at: '2026-05-22T12:00:00.000Z' },
+      { id: 2, body: 'middle', updated_at: '2026-05-22T11:00:00.000Z' },
+    ];
+    const octokit = makeMockOctokit(comments);
+
+    const result = await fetchPRComments(octokit, 'owner', 'repo', 1);
+
+    expect(result.map(c => c.id)).toEqual([3, 2, 1]);
+  });
+
+  it('orders correctly when timestamps differ only in milliseconds', async () => {
+    const comments = [
+      { id: 1, body: 'earlier', updated_at: '2026-05-22T12:00:00.000Z' },
+      { id: 2, body: 'later',   updated_at: '2026-05-22T12:00:00.001Z' },
+    ];
+    const octokit = makeMockOctokit(comments);
+
+    const result = await fetchPRComments(octokit, 'owner', 'repo', 1);
+
+    expect(result.map(c => c.id)).toEqual([2, 1]);
+  });
+
+  it('propagates API rejection to the caller', async () => {
+    const octokit = {
+      rest: {
+        issues: {
+          listComments: jest.fn().mockRejectedValue(new Error('API error')),
+        },
+      },
+    } as unknown as Octokit;
+
+    await expect(fetchPRComments(octokit, 'owner', 'repo', 1)).rejects.toThrow('API error');
+  });
+
+  it('passes owner, repo, and prNumber to listComments', async () => {
+    const octokit = makeMockOctokit([]);
+
+    await fetchPRComments(octokit, 'my-owner', 'my-repo', 42);
+
+    expect(octokit.rest.issues.listComments).toHaveBeenCalledWith(expect.objectContaining({
+      owner: 'my-owner',
+      repo: 'my-repo',
+      issue_number: 42,
+    }));
   });
 });

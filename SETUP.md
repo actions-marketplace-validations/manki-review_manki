@@ -10,39 +10,45 @@ Install [Manki](https://github.com/apps/manki-review) on the repositories you wa
 
 ### 2. Add Secrets
 
-Add your Claude authentication to the repository:
+Manki supports three providers. Add credentials for the one you want to use:
 
 ```bash
-# Option A: Claude Max subscription (no extra API costs)
-claude setup-token
-gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>
-
-# Option B: Anthropic API key (pay-per-use)
+# Anthropic (default)
 gh secret set ANTHROPIC_API_KEY --repo <owner>/<repo>
+
+# OpenAI
+gh secret set OPENAI_API_KEY --repo <owner>/<repo>
+
+# Gemini
+gh secret set GEMINI_API_KEY --repo <owner>/<repo>
 ```
+
+OAuth alternatives that ride your existing CLI subscription are also supported. See [Step 2](#step-2-authentication-secrets) for the full matrix.
 
 ### 3. Add the Workflow
 
-Create `.github/workflows/manki.yml` -- see [full workflow below](#step-3-add-the-workflow).
+Create `.github/workflows/manki.yml`. See [full workflow below](#step-3-add-the-workflow).
 
 ---
 
 ## Prerequisites
 
 - A GitHub repository
-- A Claude Max subscription (or Anthropic API key)
+- Credentials for at least one provider (Anthropic, OpenAI, or Gemini)
 - Repository admin access (for settings changes)
 
-### Enable GitHub Actions PR Approval
+## Required Repository Settings
 
-**Required** -- without this, the action cannot approve PRs.
+### Enable PR Approvals and Change Requests
+
+**Required.** Without this setting, the action cannot post APPROVE or REQUEST_CHANGES reviews. The "Failed to post APPROVE review" error in CI means this is not enabled.
 
 1. Go to **Settings > Actions > General**
 2. Scroll to **Workflow permissions**
 3. Check **"Allow GitHub Actions to create and approve pull requests"**
 4. Click Save
 
-### Branch Protection (Optional)
+## Branch Protection (Optional)
 
 If you use branch protection rules and want Manki to be a required check:
 
@@ -59,7 +65,7 @@ If you use branch protection rules and want Manki to be a required check:
 
 ## Step 1: Install the GitHub App
 
-Install the [Manki GitHub App](https://github.com/apps/manki-review) on the repositories you want reviewed. This gives Manki its own identity -- reviews appear as `manki-review[bot]` with a distinct avatar instead of the generic `github-actions[bot]`.
+Install the [Manki GitHub App](https://github.com/apps/manki-review) on the repositories you want reviewed. This gives Manki its own identity: reviews appear as `manki-review[bot]` with a distinct avatar instead of the generic `github-actions[bot]`.
 
 1. Go to [github.com/apps/manki-review](https://github.com/apps/manki-review)
 2. Click **Install**
@@ -71,35 +77,112 @@ The app requires these permissions:
 |------------|--------|---------|
 | Contents | Read | Read repository files and diffs |
 | Pull requests | Read and write | Post review comments and approvals |
-| Issues | Read and write | Create nit issues and triage |
+| Issues | Read and write | Post progress comments and app warnings; read linked issues for review context |
 
 ## Step 2: Authentication Secrets
 
 > **When do you need a GitHub token?** If you installed the GitHub App (Step 1), you do **not** need to pass `github_token` -- the App handles PR access. The `memory_repo_token` input is only required when your memory repo is a **separate** repository (the App can't reach it). Users who skip the GitHub App can fall back to `github_token: ${{ secrets.GITHUB_TOKEN }}`.
 
-### Claude Code OAuth Token (Max Subscription)
+### Choosing a provider
 
-This allows the action to use your Claude Max subscription -- no extra API costs.
+Manki supports Anthropic, OpenAI, and Gemini. You only need credentials for the provider(s) you actually use. The model ID in `.manki.yml` selects the provider automatically (`claude-*` routes to Anthropic, `gpt-*` and `o1`/`o3`/`o4`/... to OpenAI, `gemini-*` to Gemini), or use `provider/model` syntax to be explicit.
 
-1. Run locally:
-   ```bash
-   claude setup-token
-   ```
-2. Copy the generated token
-3. Add as a repository secret:
-   ```bash
-   gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>
-   ```
+| Provider | API key input | OAuth input |
+|----------|--------------|-------------|
+| Anthropic | `anthropic_api_key` | `claude_code_oauth_token` (deprecated, see note) |
+| OpenAI | `openai_api_key` | `openai_oauth_token` (Codex CLI) |
+| Gemini | `gemini_api_key` | `gemini_oauth_token` (Gemini CLI) |
 
-**OR**
+The table lists action input names (lowercase, passed in `with:`). The corresponding GitHub secret is the uppercase version: `anthropic_api_key` reads from `secrets.ANTHROPIC_API_KEY`, and so on, as shown in the workflow examples below.
 
-### Anthropic API Key (Pay-per-use)
+> **`claude_code_oauth_token` is deprecated.** Anthropic restricted Claude Code OAuth tokens for third-party tools on April 4, 2026. The input still works and the action emits a one-line `core.warning` per run. New setups should use `anthropic_api_key`. If you want a subscription-based path with no extra API charges, switch to `openai_oauth_token` (Codex CLI) or `gemini_oauth_token` (Gemini CLI).
+
+#### Effort mapping
+
+The `low | medium | high | max` knobs map per provider as follows. Manki passes effort tiers per stage and per agent based on planner decisions and config.
+
+| Effort | Anthropic | OpenAI o-series | OpenAI GPT | Gemini |
+|--------|-----------|-----------------|------------|--------|
+| low    | no thinking | `reasoning_effort: low` | (ignored, warning) | no thinking |
+| medium | `budget_tokens: 5000` | `reasoning_effort: medium` | (ignored, warning) | `thinkingBudget: 5000` |
+| high   | `budget_tokens: 10000` | `reasoning_effort: high` | (ignored, warning) | `thinkingBudget: 10000` |
+| max    | `budget_tokens: 16000` | `reasoning_effort: high` (collapsed) | (ignored, warning) | `thinkingBudget: 10000` (collapsed) |
+
+The `max` tier collapses silently to `high` for OpenAI o-series and Gemini — no warning is emitted, unlike the GPT non-reasoning path which logs a warning when effort is ignored. For GPT models via the Codex CLI (OAuth path), the warning notes that the CLI will apply its own default effort (which may differ from the requested tier). For GPT models via the API, the warning notes that effort has no effect. The Gemini OAuth (CLI) path passes prompts through the Gemini CLI binary and does not support effort tiers. Use API key auth if you need thinking budgets on Gemini.
+
+### Anthropic
+
+#### Anthropic API Key (recommended)
 
 1. Get your API key from [console.anthropic.com](https://console.anthropic.com)
 2. Add as a repository secret:
    ```bash
    gh secret set ANTHROPIC_API_KEY --repo <owner>/<repo>
    ```
+
+#### Claude Code OAuth Token (deprecated)
+
+Older setups used `claude_code_oauth_token` to ride a Claude Max subscription. Anthropic restricted this token type for third-party tools on April 4, 2026. Existing tokens still work, the action prints a deprecation warning. New installations should use `ANTHROPIC_API_KEY` or one of the other providers below.
+
+For reference, the original setup was:
+
+```bash
+claude setup-token
+gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>
+```
+
+### OpenAI
+
+#### OpenAI API Key
+
+1. Get your API key from [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+2. Add as a repository secret:
+   ```bash
+   gh secret set OPENAI_API_KEY --repo <owner>/<repo>
+   ```
+
+Reasoning models (`o1`, `o3`, `o4`, ...) accept the effort tiers above. Non-reasoning chat models (`gpt-4o`, `gpt-4.1`, ...) ignore effort and log a warning.
+
+#### Codex CLI OAuth Token (subscription, experimental)
+
+> **Status: experimental for CI.** The Codex CLI stores subscription auth in `~/.codex/auth.json` as short-lived tokens (`access_token` ~1h) refreshed automatically when the CLI runs. For CI workflows, use the API-key path above unless you can keep the secret refreshed externally.
+
+If you have a ChatGPT Plus or Pro subscription and the Codex CLI installed:
+
+1. Run `codex login` and complete the browser flow. This populates `~/.codex/auth.json`.
+2. Bootstrap the secret from that file:
+   ```bash
+   cat ~/.codex/auth.json | base64 | gh secret set OPENAI_OAUTH_TOKEN --repo <owner>/<repo>
+   ```
+   The secret must be the base64-encoded contents of `~/.codex/auth.json`, which contains `tokens.access_token` and `tokens.refresh_token`. Re-run when the refresh token expires.
+3. The workflow needs to install the Codex CLI on the runner (see [Step 3](#step-3-add-the-workflow))
+
+> **Security note:** The base64 encoding is for transport format only — it is not encrypted. Anyone with access to repository secrets can decode the full credential, including the refresh token, which grants ongoing access to your ChatGPT Plus/Pro subscription. If this secret is ever compromised, revoke the OAuth session immediately at [platform.openai.com/account/sessions](https://platform.openai.com/account/sessions). For production use, prefer the API key path (`OPENAI_API_KEY`), which can be rotated without affecting your account session.
+
+### Gemini
+
+#### Gemini API Key
+
+1. Get your API key from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+2. Add as a repository secret:
+   ```bash
+   gh secret set GEMINI_API_KEY --repo <owner>/<repo>
+   ```
+
+#### Gemini CLI OAuth Token (subscription)
+
+Rides a Google AI subscription via the Gemini CLI binary. Effort tiers are not honored on this path.
+
+1. Install the Gemini CLI: see [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli)
+2. Sign in with Google when prompted (`gemini` opens a browser flow)
+3. Bootstrap the secret from `~/.gemini/oauth_creds.json`:
+   ```bash
+   cat ~/.gemini/oauth_creds.json | base64 | gh secret set GEMINI_OAUTH_TOKEN --repo <owner>/<repo>
+   ```
+   The secret must be the base64-encoded contents of `~/.gemini/oauth_creds.json`, which contains `access_token` and `refresh_token`. Re-run when the refresh token expires.
+4. The workflow needs to install the Gemini CLI on the runner (see [Step 3](#step-3-add-the-workflow))
+
+> **Security note:** The base64 encoding is for transport format only — it is not encrypted. Anyone with access to repository secrets can decode the full credential, including the refresh token, which grants ongoing access to your Google AI subscription. If this secret is ever compromised, revoke the OAuth session immediately at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). For production use, prefer the API key path (`GEMINI_API_KEY`), which can be rotated without affecting your account session.
 
 ### Review Memory Token (Optional)
 
@@ -117,6 +200,8 @@ Required only if you enable the review memory system. This is a fine-grained PAT
    gh secret set REVIEW_MEMORY_TOKEN --repo <owner>/<repo>
    ```
 
+The token's write surface is limited to cross-PR memory files (`learnings.yml`, `patterns.yml`, `suppressions.yml`). As of v5.0.0, per-round state lives in a `Manki context` block embedded in each review summary on the PR, so the memory repo no longer receives `prs/{n}/handover.json` writes. Existing `handover.json` files in older memory repos are orphaned but harmless and require no migration.
+
 ## Step 3: Add the Workflow
 
 Create `.github/workflows/manki.yml`:
@@ -126,7 +211,7 @@ name: Manki
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
   pull_request_review:
     types: [submitted, dismissed]
   issue_comment:
@@ -137,7 +222,7 @@ on:
 permissions:
   contents: read          # read repo files and diffs
   pull-requests: write    # post review comments and approvals
-  issues: write           # create nit issues when configured
+  issues: write           # post progress comments and app warnings on PRs
   id-token: write         # OIDC token for GitHub App identity
   actions: read           # verify workflow run is legitimate
 
@@ -145,41 +230,110 @@ jobs:
   review:
     if: github.actor != 'manki-review[bot]'
     concurrency:
-      group: manki-${{ github.event_name }}-${{ github.event.comment.id || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      group: manki-${{ (github.event_name == 'issue_comment' && github.event.comment.id) || format('pr-{0}', github.event.pull_request.number || github.event.issue.number) }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
-      - name: Install Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       - name: Manki Review
-        uses: manki-review/manki@v4
+        uses: manki-review/manki@v5
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}  # Alternative to OAuth
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # github_token: ${{ secrets.GITHUB_TOKEN }}  # Only if not using the GitHub App
           # memory_repo_token: ${{ secrets.REVIEW_MEMORY_TOKEN }}  # Only if memory repo is separate
 ```
 
+#### Workflow examples per provider
+
+OpenAI API key:
+
+```yaml
+      - name: Manki Review
+        uses: manki-review/manki@v5
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+```
+
+OpenAI Codex CLI OAuth (requires the CLI on the runner):
+
+```yaml
+      - name: Install Codex CLI
+        # --ignore-scripts is safe: @openai/codex@0.129.0 ships a plain JS bin with no postinstall steps. Re-verify if you bump the version pin.
+        run: npm install -g --ignore-scripts '@openai/codex@0.129.0'
+      - name: Manki Review
+        uses: manki-review/manki@v5
+        with:
+          openai_oauth_token: ${{ secrets.OPENAI_OAUTH_TOKEN }}
+```
+
+Gemini API key:
+
+```yaml
+      - name: Manki Review
+        uses: manki-review/manki@v5
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+```
+
+Gemini CLI OAuth (requires the CLI on the runner):
+
+```yaml
+      - name: Install Gemini CLI
+        run: npm install -g @google/gemini-cli
+      - name: Manki Review
+        uses: manki-review/manki@v5
+        with:
+          gemini_oauth_token: ${{ secrets.GEMINI_OAUTH_TOKEN }}
+```
+
+You can pass multiple credentials at once. The active provider for each agent is chosen by the model ID in `.manki.yml`.
+
+Pair each workflow with a matching `models:` block in `.manki.yml`, for example:
+
+```yaml
+# OpenAI
+models:
+  planner: gpt-4o-mini
+  reviewer: gpt-4o-mini
+  judge: o4-mini
+  dedup: gpt-4o-mini
+
+# Gemini
+models:
+  planner: gemini-2.5-flash
+  reviewer: gemini-2.5-flash
+  judge: gemini-2.5-pro
+  dedup: gemini-2.5-flash
+```
+
 ### Action inputs
 
-The workflow above uses the only inputs most setups need: `claude_code_oauth_token` (or `anthropic_api_key`), `github_token`, and optionally `memory_repo_token`. To point at a config file outside the repo root, set `config_path` (default: `.manki.yml`). For GitHub App identity, set `github_app_id`, `github_app_private_key`, and `manki_token_url`. See [`action.yml`](action.yml) for the full input reference.
+The workflow above uses the only inputs most setups need: a provider credential (e.g. `anthropic_api_key`, `openai_api_key`, `gemini_api_key`, or one of the OAuth equivalents), `github_token` (only if you skipped the GitHub App), and optionally `memory_repo_token`. To point at a config file outside the repo root, set `config_path` (default: `.manki.yml`). For GitHub App identity, set `github_app_id`, `github_app_private_key`, and `manki_token_url`. To tune the in-app concurrent-submission lock TTL (defense in depth against simultaneous-start races on top of the workflow `concurrency` group), set `concurrency_lock_ttl_seconds` (default: 600). See [`action.yml`](action.yml) for the full input reference.
 
 ### Action outputs
 
 The action exposes outputs you can chain into later workflow steps: `review_id`, `verdict`, `findings_count`, `findings_json`, `severity_counts`, and `judge_model`. See [`action.yml`](action.yml) for the source of truth on each output's shape and semantics.
 
+### Pinning the action version
+
+Both the floating major tag and the immutable exact-version tag are supported:
+
+- `manki-review/manki@v5` — floating major. Picks up minor and patch releases automatically. Recommended for most setups.
+- `manki-review/manki@v5.1.0` — immutable exact-version. Stays on the published release until you bump it. Recommended when you want lockstep upgrades.
+
+Both forms point at a tree that already contains the built `dist/`, so the runner can execute the action without any extra setup on the consumer side.
+
+Releases prior to this fix (`v5.0.0`, `v5.0.1`) only work via the floating `@v5` tag. From the release that introduced committed `dist/` onwards, exact-version pins work as well.
+
 ### Using outputs in downstream workflow steps
 
 ```yaml
 # Fail CI when the judge requests changes
-- uses: manki-review/manki@v4
+- uses: manki-review/manki@v5
   id: manki
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -204,15 +358,18 @@ You can also forward `severity_counts` or `findings_json` to a metrics sink (Sla
 | Event | Purpose |
 |-------|---------|
 | `pull_request: [opened, synchronize]` | Auto-review on PR open and new pushes |
-| `issue_comment: [created, edited]` | `/manki` commands on PRs and issues (review, explain, triage, etc.) |
+| `pull_request: [ready_for_review]` | Auto-review when a draft PR is marked ready (head SHA unchanged, so the planner sees the same diff a `synchronize` would have produced) |
+| `issue_comment: [created, edited]` | `/manki` commands on PRs and issues. PR-only commands: `review`, `check`, `explain`. Available on both: `help`, `dismiss`, `remember`, `forget`, and free-form questions. |
 | `pull_request_review_comment: [created]` | Replies to review comment threads |
 | `pull_request_review: [submitted, dismissed]` | Auto-approve check when reviews change state |
 
-The `if` condition allows `issue_comment` events without the `pull_request` filter so that `/manki triage` works on nit issues (which are regular issues, not PRs). The self-trigger guard (`github.actor != 'manki-review[bot]'`) prevents the bot from reviewing its own comments.
+The self-trigger guard (`github.actor != 'manki-review[bot]'`) prevents the bot from reviewing its own comments.
 
 ### Concurrency
 
-The `concurrency` block ensures only one Manki run is active per PR at a time. If a new push arrives while a review is running, the in-progress run is cancelled. The `comment.id` in the concurrency group allows parallel runs for different comment-triggered commands on the same PR.
+The `concurrency` block keeps at most one Manki run active per PR across every PR-scoped event (`pull_request`, `pull_request_review`, `pull_request_review_comment`), serializing the vast majority of concurrent triggers so they do not race and submit conflicting reviews on the same commit. When a new PR-scoped event arrives while a run is in flight, GitHub queues it (at most one queued event per group, newer queued events replace older ones), the in-flight run completes, then the most recent queued event runs. `cancel-in-progress` is `false`, so no run is cancelled and the PR check list does not collect red crosses from superseded runs. The `issue_comment`-gated `comment.id` branch keeps distinct `/manki` invocations in separate groups so they do not serialize against each other, while `pull_request_review_comment` events fall through to the shared `pr-{N}` group alongside the other PR-scoped events.
+
+GitHub Actions concurrency is best-effort, not atomic. Two events dispatched within the same scheduling window can transition to in-progress before either reaches the queue check, in which case both runs proceed concurrently. As defense in depth, the action runs an in-app lock at the review pipeline entry point: it scans existing `manki-review[bot]` comments for an "in progress" marker carrying a different `manki-run-id`, and bails (with a `core.warning`) before any LLM call when one is found within the configurable TTL. Tune the TTL with the `concurrency_lock_ttl_seconds` action input (default 600 seconds). Lowering it makes the lock recover faster from crashed runs that left a stale marker behind. Raising it tolerates longer-running reviews.
 
 ## Step 4: Configure Reviews (Optional)
 
@@ -253,12 +410,14 @@ models:
 planner:
   enabled: true
 
-# Where to post nit findings: 'issues' (separate GitHub issue) or 'comments' (inline PR comments)
-nit_handling: issues
-
 # Multi-pass verification (integer 1-5, default: 1). Runs each reviewer N
 # times with shuffled file ordering; only consistent findings are kept.
 # review_passes: 1
+
+# Hide the structured `Manki context` block as an HTML comment
+# (`<!-- manki-context: ... -->`) instead of a `<details>` block (default: false).
+# stats:
+#   hidden: false
 
 # Additional context for reviewers
 instructions: |
@@ -295,7 +454,7 @@ The judge assigns one of four severity levels to each finding:
 |----------|---------|--------|
 | `required` | Must fix before merge | Blocks approval (REQUEST_CHANGES) |
 | `suggestion` | Should fix, but not blocking | Posted as inline comment, PR can still be approved |
-| `nit` | Minor style or preference issue | Collected into a nit issue (or inline comments, depending on `nit_handling`) |
+| `nit` | Minor style or preference issue | Posted as inline comment, PR can still be approved |
 | `ignore` | False positive or irrelevant | Dropped silently |
 
 Use the `models` config section to choose different Claude models for the reviewer and judge stages (e.g., a faster model for reviewers and a more precise model for the judge).
@@ -353,28 +512,9 @@ Make sure the `REVIEW_MEMORY_TOKEN` secret is set (see Step 2).
 ### How memory works
 
 - **Learnings** -- Stored when you use `/manki remember` or when substantive review comment discussions are detected. Injected as context into future reviewer prompts.
-- **Suppressions** -- Created by `/manki dismiss` or by leaving nit issue checkboxes unchecked during triage. Non-blocking findings matching a suppression pattern are filtered out (blocking findings are never suppressed).
+- **Suppressions** -- Created by `/manki dismiss`. Non-blocking findings matching a suppression pattern are filtered out (blocking findings are never suppressed).
 - **Patterns** -- Automatically tracked from recurring findings. After 5 occurrences a pattern is escalated for visibility.
 - **Global conventions** -- A `_global/conventions.md` file applied to all repos using the memory system.
-
-## Step 6: Nit Issue Triage Workflow
-
-When Manki approves a PR with non-blocking suggestions, she creates a GitHub issue with:
-
-- A checkbox per finding (with code snippets and AI fix prompts)
-- The `needs-human` label
-
-To triage:
-
-1. Open the nit issue
-2. Check the boxes for findings worth fixing, leave the rest unchecked
-3. Comment `/manki triage`
-
-Manki will:
-
-- Create a new GitHub issue for each checked finding
-- Store unchecked findings as suppressions in memory
-- Remove the `needs-human` label and close the nit issue
 
 ## Verification
 
@@ -408,7 +548,6 @@ Manki handles untrusted PR content and cross-repo tokens. The security model res
 | Memory not loading | Verify `REVIEW_MEMORY_TOKEN` secret is set and the PAT has Contents read/write on the memory repo |
 | Review doesn't trigger on `/manki review` | The workflow file must exist on the default branch (main) |
 | "Diff too large" | Increase `max_diff_lines` in config or split the PR |
-| `/manki triage` does nothing | Make sure the `if` condition allows plain `issue_comment` events (not just PR comments) |
 | Auto-approve not working | Check that `auto_approve: true` is set in `.manki.yml` and the `pull_request_review` event trigger is in the workflow |
 | Inline comments land on wrong lines | The judge agent validated line numbers but the diff may have shifted. Findings that can't be placed inline are moved to the review body |
 
@@ -430,10 +569,20 @@ Each review run posts fresh inline comments. The recap phase deduplicates agains
 
 ## Quick Reference: All Secrets
 
-| Secret | Required | Purpose |
-|--------|----------|---------|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Yes* | Claude Max subscription auth |
-| `ANTHROPIC_API_KEY` | Yes* | Anthropic API auth (alternative) |
-| `REVIEW_MEMORY_TOKEN` | No | Fine-grained PAT for memory repo writes |
+Provide credentials for the providers you actually use. The model ID in `.manki.yml` picks the provider per agent (`claude-*` → Anthropic, `gpt-*` and `o1`/`o3`/`o4`/... → OpenAI, `gemini-*` → Gemini), or use `provider/model` syntax to be explicit. The action fails fast with a clear error if a configured provider's credentials are missing.
 
-\* One of `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is required.
+### Provider credentials
+
+| Provider | API key | OAuth alternative |
+|----------|---------|-------------------|
+| Anthropic | `ANTHROPIC_API_KEY` | `CLAUDE_CODE_OAUTH_TOKEN` (deprecated) |
+| OpenAI | `OPENAI_API_KEY` | `OPENAI_OAUTH_TOKEN` (base64 of `~/.codex/auth.json`) |
+| Gemini | `GEMINI_API_KEY` | `GEMINI_OAUTH_TOKEN` (base64 of `~/.gemini/oauth_creds.json`) |
+
+When both are set for a provider, OAuth takes precedence (the action checks the OAuth input before the API key for each provider).
+
+### Other
+
+| Secret | Purpose |
+|--------|---------|
+| `REVIEW_MEMORY_TOKEN` | Fine-grained PAT for memory repo writes (only when the memory repo is a separate repository — see [Review memory](#review-memory)) |

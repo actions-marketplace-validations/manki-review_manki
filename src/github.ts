@@ -3,17 +3,27 @@ import { createRequire } from 'module';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 
-import { AgentProgressEntry, DEFENSIVE_HARDENING_TAG, DashboardData, Finding, FindingSeverity, OWN_PROPOSAL_TAG, ParsedDiff, ReviewMetadata, ReviewResult, ReviewStats, ReviewVerdict } from './types';
+import { AgentProgressEntry, DEFENSIVE_HARDENING_TAG, DashboardData, Finding, FindingFingerprintEntry, FindingSeverity, OWN_PROPOSAL_TAG, ParsedDiff, ReviewConfig, ReviewMetadata, ReviewResult, RoundContext, ReviewVerdict, VALID_PR_TYPES, VerdictReason, VerdictTrace } from './types';
 import { isLineInDiff, findClosestDiffLine } from './diff';
 import { MAX_AGENT_RETRIES } from './types';
+import { MAX_LOCK_TTL_SECONDS } from './config';
+import { safeTruncate } from './utils';
 
 type Octokit = ReturnType<typeof github.getOctokit>;
+
+interface IssueComment {
+  id: number;
+  body?: string | null;
+  user?: { login?: string | null; type?: string } | null;
+  updated_at: string;
+}
 
 const BOT_LOGIN = 'manki-review[bot]';
 const ACTIONS_BOT_LOGIN = 'github-actions[bot]';
 const BOT_MARKER = '<!-- manki-bot -->';
 const REVIEW_COMPLETE_MARKER = '<!-- manki-review-complete -->';
 const FORCE_REVIEW_MARKER = '<!-- manki-force-review -->';
+const FORCE_CAP_MARKER = '<!-- manki-force-cap -->';
 const RUN_ID_MARKER_PREFIX = '<!-- manki-run-id:';
 const CANCELLED_MARKER = '<!-- manki-review-cancelled -->';
 const VERSION_MARKER_PREFIX = '<!-- manki-version:';
@@ -242,9 +252,9 @@ function renderAgentLines(agents: AgentProgressEntry[]): string {
     }
     if (a.status === 'retrying') {
       if (a.retryCount != null) {
-        return `${INDENT}⟳ ${a.name} — retrying (${a.retryCount + 1}/${MAX_AGENT_RETRIES + 1})...`;
+        return `${INDENT}🔄 ${a.name} — retrying (${a.retryCount + 1}/${MAX_AGENT_RETRIES + 1})...`;
       }
-      return `${INDENT}⟳ ${a.name} — retrying...`;
+      return `${INDENT}🔄 ${a.name} — retrying...`;
     }
     if (a.status === 'reviewing') {
       return `${INDENT}⏳ ${a.name}`;
@@ -257,10 +267,8 @@ function formatDuration(ms: number): string {
   return ms < 1000 ? `${ms}ms` : `${Math.round(ms / 1000)}s`;
 }
 
-const VALID_PR_TYPES = new Set(['feature', 'bugfix', 'refactor', 'docs', 'test', 'chore', 'rename']);
-
-function sanitizePrType(prType: string): string {
-  return VALID_PR_TYPES.has(prType) ? prType : 'unknown';
+function validPrTypeOrNull(prType: string): string | null {
+  return VALID_PR_TYPES.has(prType) ? prType : null;
 }
 
 const VALID_EFFORTS = new Set(['low', 'medium', 'high']);
@@ -292,15 +300,23 @@ export function buildDashboard(data: DashboardData): string {
     plannerLines.push(`**Planner**`);
     plannerLines.push(`${INDENT}analyzing...`);
   } else if (data.plannerInfo) {
-    const prType = sanitizePrType(data.plannerInfo.prType);
+    const prType = validPrTypeOrNull(data.plannerInfo.prType);
     const plannerDur = data.plannerDurationMs != null ? ` (${formatDuration(data.plannerDurationMs)})` : '';
     plannerLines.push(`**Planner**${plannerDur}`);
-    plannerLines.push(`${INDENT}${prType} · ${data.lineCount} lines · ${data.plannerInfo.teamSize} agents`);
+    const summaryParts = [
+      ...(prType ? [prType] : []),
+      `${data.lineCount} lines`,
+      `${data.plannerInfo.agentCount} agents`,
+    ];
+    plannerLines.push(`${INDENT}${summaryParts.join(' · ')}`);
     plannerLines.push(`${INDENT}review effort: ${sanitizeEffort(data.plannerInfo.reviewerEffort)} · judge effort: ${sanitizeEffort(data.plannerInfo.judgeEffort)}`);
   } else {
     const plannerDur = data.plannerDurationMs != null ? ` (${formatDuration(data.plannerDurationMs)})` : '';
     plannerLines.push(`**Planner**${plannerDur}`);
     plannerLines.push(`${INDENT}${data.lineCount} lines · ${data.agentCount} agents`);
+    if (data.heuristicFallback) {
+      plannerLines.push(`${INDENT}_(planner heuristic fallback used)_`);
+    }
   }
   sections.push(plannerLines.join('\n'));
 
@@ -343,6 +359,9 @@ export function buildDashboard(data: DashboardData): string {
       const breakdown = renderSeverityBreakdown(data.droppedSeverities);
       if (breakdown) judgeLines.push(`${INDENT}dropped: ${breakdown}`);
     }
+    if (data.testNitSuppressedCount != null && data.testNitSuppressedCount > 0) {
+      judgeLines.push(`${INDENT}suppressed: ${data.testNitSuppressedCount} test-only nit${data.testNitSuppressedCount === 1 ? '' : 's'} (round ≥2 throttle)`);
+    }
   }
   sections.push(judgeLines.join('\n'));
 
@@ -372,6 +391,79 @@ export async function postProgressComment(
     body,
   });
   return data.id;
+}
+
+/**
+ * Post an auto-approve specific "in progress" marker comment. Distinct body
+ * text from `postProgressComment` so a human reading the PR sees which path
+ * is running, but reuses `BOT_MARKERS` + `manki-run-id` so `findInProgressLock`
+ * treats it as a live concurrency lock for sibling runs.
+ */
+export async function postAutoApproveProgressComment(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<number> {
+  const runIdMarker = buildRunIdMarker(github.context.runId);
+  const body = `${BOT_MARKERS}\n${runIdMarker}\n**Manki** — Auto-approving (no findings remain)`;
+  const { data } = await octokit.rest.issues.createComment({
+    owner,
+    repo,
+    issue_number: prNumber,
+    body,
+  });
+  return data.id;
+}
+
+/**
+ * Transition the auto-approve progress comment to its terminal "complete"
+ * state. Adds `REVIEW_COMPLETE_MARKER` so the comment is no longer treated as
+ * a live in-progress lock by `findInProgressLock`.
+ */
+export async function markAutoApproveComplete(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  commentId: number,
+): Promise<void> {
+  const body = [
+    BOT_MARKER,
+    VERSION_MARKER,
+    '**Manki** — Auto-approved (all findings resolved)',
+    REVIEW_COMPLETE_MARKER,
+  ].join('\n');
+  try {
+    await octokit.rest.issues.updateComment({ owner, repo, comment_id: commentId, body });
+  } catch (error) {
+    core.warning(`Failed to mark auto-approve comment as complete: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/**
+ * Transition the auto-approve progress comment to a terminal failure state.
+ * Uses `CANCELLED_MARKER` so `findInProgressLock` no longer treats it as a
+ * live lock, while preserving an audit trail of which run attempted the
+ * approval and why it failed.
+ */
+export async function markAutoApproveFailed(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  commentId: number,
+  reason: string,
+): Promise<void> {
+  const body = [
+    BOT_MARKER,
+    VERSION_MARKER,
+    CANCELLED_MARKER,
+    `**Manki** — Auto-approve failed: ${sanitizeMarkdown(String(reason)).slice(0, 300)}`,
+  ].join('\n');
+  try {
+    await octokit.rest.issues.updateComment({ owner, repo, comment_id: commentId, body });
+  } catch (error) {
+    core.warning(`Failed to mark auto-approve comment as failed: ${error instanceof Error ? error.message : error}`);
+  }
 }
 
 /**
@@ -405,7 +497,6 @@ export async function updateProgressComment(
     parts.push(`- Review level: ${metadata.config.reviewLevel} (${metadata.config.reviewLevelReason})`);
     parts.push(`- Team: ${metadata.config.teamAgents.join(', ')}`);
     parts.push(`- Memory: ${metadata.config.memoryEnabled ? `enabled (${metadata.config.memoryRepo})` : 'disabled'}`);
-    parts.push(`- Nit handling: ${metadata.config.nitHandling}`);
     parts.push('');
 
     if (metadata.judgeDecisions.length > 0) {
@@ -489,25 +580,102 @@ export async function dismissPreviousReviews(
   }
 }
 
-function formatStatsOneLiner(stats: ReviewStats): string {
+function formatStatsOneLiner(context: RoundContext, reviewTimeMs: number): string {
+  const sev = context.findings.severityCounts;
   const parts: string[] = [];
-  if (stats.severity.blocker) parts.push(`${stats.severity.blocker} blocker`);
-  if (stats.severity.warning) parts.push(`${stats.severity.warning} warning`);
-  if (stats.severity.suggestion) parts.push(`${stats.severity.suggestion} suggestion`);
-  if (stats.severity.nitpick) parts.push(`${stats.severity.nitpick} nitpick`);
+  if (sev.blocker) parts.push(`${sev.blocker} blocker`);
+  if (sev.warning) parts.push(`${sev.warning} warning`);
+  if (sev.suggestion) parts.push(`${sev.suggestion} suggestion`);
+  if (sev.nitpick) parts.push(`${sev.nitpick} nitpick`);
   const breakdown = parts.length > 0 ? parts.join(', ') : 'none';
-  const total = stats.findingsKept;
-  const time = Math.round(stats.reviewTimeMs / 1000);
-  return `\u{1F4CA} ${total} findings (${breakdown}) \u00B7 ${stats.diffLines} lines \u00B7 ${time}s`;
-}
-
-function formatStatsJson(stats: ReviewStats): string {
-  const json = JSON.stringify(stats, null, 2);
-  return `<details>\n<summary>Review stats</summary>\n\n\`\`\`json\n${json}\n\`\`\`\n</details>`;
+  const total = context.findings.count;
+  const time = Math.round(reviewTimeMs / 1000);
+  return `\u{1F4CA} ${total} findings (${breakdown}) \u00B7 ${context.diff.lines} lines \u00B7 ${time}s`;
 }
 
 /**
+ * Neutralise any `-->` or `--!>` inside a JSON payload by escaping the
+ * closing `>` as the JSON Unicode escape. Both sequences close HTML5 comments.
+ * Reversible: JSON parsing un-escapes back to `>`.
+ */
+function sanitizeHtmlCommentJson(json: string): string {
+  return json.replace(/--(!?)>/g, '--$1\\u003E');
+}
+
+function formatContextBlock(context: RoundContext, hidden = false): string {
+  const ctx = context.judge.threadEvaluations?.length === 0
+    ? { ...context, judge: { ...context.judge, threadEvaluations: undefined } }
+    : context;
+  if (hidden) {
+    const json = sanitizeHtmlCommentJson(JSON.stringify(ctx));
+    return `<!-- manki-context: ${json} -->`;
+  }
+  const json = JSON.stringify(ctx, null, 2)
+    .replace(/`/g, '\\u0060');
+  return `<details>\n<summary>Manki context</summary>\n\n\`\`\`json\n${json}\n\`\`\`\n</details>`;
+}
+
+/**
+ * Severity drop order when shrinking `findings.entries[]` to fit the review
+ * body budget. Lowest-impact severities go first; metadata, agents, judge
+ * summary, models, and usage are preserved unconditionally.
+ *
+ * `'unknown'` is placed before `'blocker'` because a confirmed blocker carries
+ * more informational value than an entry whose severity could not be determined.
+ */
+const TRUNCATION_PRIORITY: ReadonlyArray<FindingFingerprintEntry['severity']> = [
+  'ignore', 'nitpick', 'suggestion', 'warning', 'unknown', 'blocker',
+];
+
+/**
+ * Drop entries from `findings.entries[]` in priority order until the
+ * rendered review body is within `maxBodyLength`. Returns the (possibly
+ * mutated) context, the count of entries dropped, and whether the judge
+ * summary was capped. Caller is expected to `core.warning` on either signal.
+ */
+function truncateContextToFitBody(
+  context: RoundContext,
+  renderBody: (ctx: RoundContext) => string,
+  maxBodyLength: number,
+): { context: RoundContext; droppedCount: number; summaryCapped: boolean } {
+  if (renderBody(context).length <= maxBodyLength) {
+    return { context, droppedCount: 0, summaryCapped: false };
+  }
+  const remaining = [...context.findings.entries];
+  let dropped = 0;
+  for (const target of TRUNCATION_PRIORITY) {
+    while (renderBody({ ...context, findings: { ...context.findings, entries: remaining, truncated: true } }).length > maxBodyLength) {
+      const idx = remaining.findIndex(e => e.severity === target);
+      if (idx === -1) break;
+      remaining.splice(idx, 1);
+      dropped++;
+    }
+    if (renderBody({ ...context, findings: { ...context.findings, entries: remaining, truncated: true } }).length <= maxBodyLength) {
+      break;
+    }
+  }
+  let truncated: RoundContext = {
+    ...context,
+    findings: { ...context.findings, entries: remaining, count: remaining.length, ...(dropped > 0 && { truncated: true }) },
+  };
+  let summaryCapped = false;
+  if (renderBody(truncated).length > maxBodyLength && truncated.judge.summary) {
+    const cappedSummary = safeTruncate(truncated.judge.summary, 2000);
+    if (cappedSummary !== truncated.judge.summary) {
+      truncated = { ...truncated, judge: { ...truncated.judge, summary: cappedSummary } };
+      summaryCapped = true;
+    }
+  }
+  return { context: truncated, droppedCount: dropped, summaryCapped };
+}
+
+const REVIEW_BODY_BUDGET = 60000;
+
+/**
  * Post the review with inline comments.
+ *
+ * When `context` is provided without `reviewTimeMs`, the stats one-liner
+ * will display `0s` for review time. Pass both together to avoid this.
  */
 export async function postReview(
   octokit: Octokit,
@@ -517,8 +685,11 @@ export async function postReview(
   commitSha: string,
   result: ReviewResult,
   diff?: ParsedDiff,
-  stats?: ReviewStats,
+  context?: RoundContext,
+  reviewTimeMs?: number,
+  config?: ReviewConfig,
 ): Promise<number> {
+  const statsHidden = config?.stats?.hidden ?? false;
   const event = mapVerdictToEvent(result.verdict);
 
   // Validate and filter inline comments against the diff
@@ -575,20 +746,43 @@ export async function postReview(
     }
   }
 
-  let body = `${BOT_MARKERS}\n${sanitizeMarkdown(result.summary)}`;
-  if (result.partialNote) {
-    body += `\n\n> **Note:** ${sanitizeMarkdown(result.partialNote)}`;
+  const reviewedCommitFooter = buildReviewedCommitFooter(owner, repo, commitSha, github.context.serverUrl);
+
+  const renderBody = (ctx: RoundContext | undefined): string => {
+    let b = `${BOT_MARKERS}\n${sanitizeMarkdown(result.summary)}`;
+    if (result.partialNote) {
+      b += `\n\n> **Note:** ${sanitizeMarkdown(result.partialNote)}`;
+    }
+    const blockingThreads = formatBlockingPriorThreads(result);
+    if (blockingThreads) {
+      b += `\n\n${blockingThreads}`;
+    }
+    if (ctx) {
+      b += `\n\n${formatStatsOneLiner(ctx, reviewTimeMs ?? 0)}`;
+      b += `\n\n${formatContextBlock(ctx, statsHidden)}`;
+    }
+    if (generalFindings.length > 0) {
+      b += `\n\n**General findings:**\n${generalFindings.map(c => `- ${c}`).join('\n')}`;
+    }
+    if (invalidComments.length > 0) {
+      b += `\n\n**Findings (not on changed lines):**\n${invalidComments.map(c => `- ${c}`).join('\n')}`;
+    }
+    return b;
+  };
+
+  let effectiveContext = context;
+  if (context) {
+    const { context: maybeTruncated, droppedCount, summaryCapped } = truncateContextToFitBody(
+      context,
+      ctx => renderBody(ctx),
+      REVIEW_BODY_BUDGET,
+    );
+    effectiveContext = maybeTruncated;
+    if (droppedCount > 0 || summaryCapped) {
+      core.warning(`Manki context truncated: dropped ${droppedCount} finding entries${summaryCapped ? ', judge summary capped at 2000 chars' : ''} to fit comment body`);
+    }
   }
-  if (stats) {
-    body += `\n\n${formatStatsOneLiner(stats)}`;
-    body += `\n\n${formatStatsJson(stats)}`;
-  }
-  if (generalFindings.length > 0) {
-    body += `\n\n**General findings:**\n${generalFindings.map(c => `- ${c}`).join('\n')}`;
-  }
-  if (invalidComments.length > 0) {
-    body += `\n\n**Findings (not on changed lines):**\n${invalidComments.map(c => `- ${c}`).join('\n')}`;
-  }
+  const body = renderBody(effectiveContext);
 
   if (invalidComments.length > 0) {
     core.info(`Moved ${invalidComments.length} comments to review body (lines not in diff)`);
@@ -602,7 +796,7 @@ export async function postReview(
       pull_number: prNumber,
       commit_id: commitSha,
       event,
-      body: truncateBody(body),
+      body: appendReviewedCommitFooter(truncateBody(body), reviewedCommitFooter),
       comments: validComments,
     });
 
@@ -617,7 +811,10 @@ export async function postReview(
     if (isLineError && validComments.length > 0) {
       core.warning('Inline comments rejected by GitHub (invalid lines). Posting review without inline comments.');
       const allAsBody = validComments.map(c => `- ${c.body.split('\n')[0]}`).join('\n');
-      const lineErrFallbackBody = truncateBody(`${body}\n\n**Inline comments could not be posted:**\n${allAsBody}`);
+      const lineErrFallbackBody = appendReviewedCommitFooter(
+        truncateBody(`${body}\n\n**Inline comments could not be posted:**\n${allAsBody}`),
+        reviewedCommitFooter,
+      );
 
       const { data: review } = await octokit.rest.pulls.createReview({
         owner,
@@ -646,7 +843,10 @@ export async function postReview(
       const firstLine = c.body.split('\n')[0];
       return `- ${firstLine} (\`${c.path}:${c.line}\`)`;
     }).join('\n');
-    const fallbackBody = truncateBody(`${body}\n\n**Findings (could not post inline):**\n${findingSummary}`);
+    const fallbackBody = appendReviewedCommitFooter(
+      truncateBody(`${body}\n\n**Findings (could not post inline):**\n${findingSummary}`),
+      reviewedCommitFooter,
+    );
 
     const { data: review } = await octokit.rest.pulls.createReview({
       owner,
@@ -668,21 +868,22 @@ function dynamicFence(content: string): string {
   return '`'.repeat(Math.max(3, maxBt + 1));
 }
 
+function buildReviewedCommitFooter(owner: string, repo: string, commitSha: string, serverUrl: string): string {
+  const shortSha = commitSha.slice(0, 7);
+  const base = serverUrl.replace(/\/+$/, '');
+  return `Reviewed commit [\`${shortSha}\`](${base}/${owner}/${repo}/commit/${commitSha})`;
+}
+
+function appendReviewedCommitFooter(body: string, footer: string): string {
+  return `${body}\n\n${footer}`;
+}
+
 function truncateBody(text: string, maxLength: number = 60000): string {
   if (text.length <= maxLength) return text;
   const notice = '\n\n*(Review body truncated)*';
   const safeMax = Math.max(0, maxLength - notice.length);
   const cutoff = text.lastIndexOf(' ', safeMax);
   return text.slice(0, cutoff > safeMax - 100 ? cutoff : safeMax) + notice;
-}
-
-function safeTruncate(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  let end = maxLen;
-  if (end > 0 && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF) {
-    end--;
-  }
-  return text.slice(0, end) + '...';
 }
 
 function sanitizeFilePath(file: string): string {
@@ -721,6 +922,32 @@ const confidenceDots: Record<'high' | 'medium' | 'low', string> = {
 
 function getSeverityLabel(severity: FindingSeverity): string {
   return severityLabels[severity];
+}
+
+/**
+ * Render a `Blocking unresolved threads` section for the PR comment body
+ * when the verdict is `REQUEST_CHANGES` with reason `prior_unaddressed`.
+ * The section names every entry in `verdictTrace.unresolvedPriors` with
+ * file, line, original severity, and a link to the GitHub thread when
+ * available, so the author sees exactly which prior thread is blocking
+ * without having to read the AI-context JSON.
+ */
+export function formatBlockingPriorThreads(result: { verdictReason?: VerdictReason; verdictTrace?: VerdictTrace }): string | null {
+  if (result.verdictReason !== 'prior_unaddressed') return null;
+  const priors = result.verdictTrace?.unresolvedPriors ?? [];
+  if (priors.length === 0) return null;
+
+  const lines = priors.map(p => {
+    const file = sanitizeFilePath(p.file);
+    const location = p.line != null ? `\`${file}:${p.line}\`` : `\`${file}\``;
+    const severity = p.severity && p.severity !== 'unknown' ? `[${getSeverityLabel(p.severity)}] ` : '';
+    const title = sanitizeMarkdown(p.title || '(untitled)');
+    const safeUrl = p.threadUrl && /^https?:\/\/[^\s)]+$/.test(p.threadUrl) ? p.threadUrl : null;
+    const link = safeUrl ? ` ([view thread](${safeUrl}))` : '';
+    return `- ${severity}${title} — ${location}${link}`;
+  });
+
+  return `**Blocking unresolved review threads:**\n${lines.join('\n')}`;
 }
 
 function getSeverityEmoji(severity: FindingSeverity): string {
@@ -821,100 +1048,6 @@ function formatFindingComment(finding: Finding): string {
   comment += `\n\n<!-- manki:${finding.severity}:${titleToSlug(finding.title)} -->`;
 
   return comment;
-}
-
-/**
- * Build the markdown body for a nit issue from non-required findings.
- * Pure function — no API calls — for testability.
- */
-export function buildNitIssueBody(
-  prNumber: number,
-  findings: Finding[],
-  owner: string,
-  repo: string,
-  commitSha: string,
-): string {
-  const nits = findings.filter(f => f.severity === 'nitpick');
-
-  const checklist = nits.map(f => {
-    const icon = '\u{1F4DD}';
-    const safeTitle = sanitizeMarkdown(f.title);
-    const safeDescription = sanitizeMarkdown(f.description);
-    const safeFile = sanitizeFilePath(f.file);
-
-    const startLine = Math.max(1, f.line - 5);
-    const endLine = f.line + 10;
-    const permalink = `https://github.com/${owner}/${repo}/blob/${commitSha}/${safeFile}#L${startLine}-L${endLine}`;
-
-    let item = `- [ ] <details><summary>${icon} **${safeTitle}** \u2014 <code>${safeFile}:${f.line}</code></summary>\n`;
-    item += `\n  ${safeDescription}\n`;
-    item += `\n  ${permalink}\n`;
-
-    if (f.suggestedFix) {
-      const fence = dynamicFence(f.suggestedFix);
-      item += `\n  **Suggested fix:**\n${fence}\n${f.suggestedFix}\n${fence}\n`;
-    }
-
-    item += `\n  </details>`;
-
-    return item;
-  }).join('\n\n');
-
-  return `The following non-blocking findings were identified during automated review. Triaging these helps Manki learn your preferences.
-- **Check the box** for findings worth fixing
-- **Leave unchecked** for findings to dismiss
-- Comment \`/manki triage\` when done
-
-${checklist}
-
----
-<sub>Auto-generated by [Manki](https://github.com/${owner}/manki)</sub>`;
-}
-
-/**
- * Create a GitHub issue from non-required review findings.
- * Returns the issue number, or null if no nits or issue already exists.
- */
-export async function createNitIssue(
-  octokit: Octokit,
-  owner: string,
-  repo: string,
-  prNumber: number,
-  findings: Finding[],
-  commitSha: string,
-): Promise<number | null> {
-  const nits = findings.filter(f => f.severity === 'nitpick');
-  if (nits.length === 0) return null;
-
-  const searchQuery = `repo:${owner}/${repo} is:issue "triage: findings from PR #${prNumber}" label:needs-human`;
-  const { data: existing } = await octokit.rest.search.issuesAndPullRequests({ q: searchQuery });
-  if (existing.total_count > 0) {
-    core.info(`Nit issue already exists for PR #${prNumber}: #${existing.items[0].number}`);
-    return existing.items[0].number;
-  }
-
-  try {
-    await octokit.rest.issues.getLabel({ owner, repo, name: 'needs-human' });
-  } catch {
-    await octokit.rest.issues.createLabel({
-      owner, repo,
-      name: 'needs-human',
-      description: 'Needs human triage before AI picks it up',
-      color: 'FBCA04',
-    });
-  }
-
-  const body = buildNitIssueBody(prNumber, findings, owner, repo, commitSha);
-
-  const { data: issue } = await octokit.rest.issues.create({
-    owner, repo,
-    title: `triage: findings from PR #${prNumber}`,
-    body,
-    labels: ['needs-human'],
-  });
-
-  core.info(`Created nit issue #${issue.number} for PR #${prNumber} with ${nits.length} findings`);
-  return issue.number;
 }
 
 /**
@@ -1179,21 +1312,26 @@ interface ProgressComment {
   runId: number | null;
 }
 
+async function fetchPRComments(
+  octokit: Octokit, owner: string, repo: string, prNumber: number,
+): Promise<IssueComment[]> {
+  const { data } = await octokit.rest.issues.listComments({
+    owner, repo, issue_number: prNumber, per_page: 100,
+  });
+  return [...data].sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
+}
+
 /**
  * Find the most recent non-complete, non-cancelled progress comment posted by the bot.
  */
-async function findProgressComment(
-  octokit: Octokit, owner: string, repo: string, prNumber: number,
-): Promise<ProgressComment | null> {
-  const { data: comments } = await octokit.rest.issues.listComments({
-    owner, repo, issue_number: prNumber, per_page: 100, direction: 'desc',
-  });
+function findProgressComment(comments: IssueComment[]): ProgressComment | null {
   const match = comments.find(c =>
     c.user?.login === BOT_LOGIN &&
     c.user?.type === 'Bot' &&
     c.body?.includes(BOT_MARKER) &&
     !c.body?.includes(REVIEW_COMPLETE_MARKER) &&
     !c.body?.includes(FORCE_REVIEW_MARKER) &&
+    !c.body?.includes(FORCE_CAP_MARKER) &&
     !c.body?.includes(CANCELLED_MARKER)
   );
   if (!match || !match.body) return null;
@@ -1213,7 +1351,8 @@ const ACTIVE_RUN_STATUSES = new Set([
 async function isReviewInProgress(octokit: Octokit, owner: string, repo: string, prNumber: number): Promise<boolean> {
   let progress: ProgressComment | null;
   try {
-    progress = await findProgressComment(octokit, owner, repo, prNumber);
+    const comments = await fetchPRComments(octokit, owner, repo, prNumber);
+    progress = findProgressComment(comments);
   } catch {
     return false;
   }
@@ -1255,6 +1394,109 @@ async function isReviewInProgress(octokit: Octokit, owner: string, repo: string,
 }
 
 /**
+ * Lock info for an in-progress marker comment posted by a different run.
+ */
+interface InProgressLock {
+  runId: number;
+  updatedAt: string;
+  commentId: number;
+}
+
+/**
+ * Scan the PR's bot comments for an in-progress marker carrying a `manki-run-id`
+ * that differs from `currentRunId`. Returns the most recent such comment, or
+ * null when none is found. Skips terminal-state comments (complete, cancelled,
+ * force-review / force-cap stubs) and comments whose run id cannot be parsed.
+ *
+ * Used as a defense-in-depth check at the review entry point: if a sibling run
+ * has already announced "Review in progress" within the configured TTL, the
+ * current run bails before any LLM cost is incurred. This complements the
+ * workflow-level `concurrency` group, which is best-effort and can let two
+ * runs reach `in_progress` within the same scheduling window.
+ */
+function findInProgressLock(comments: IssueComment[], currentRunId: number): InProgressLock | null {
+  for (const c of comments) {
+    if (c.user?.login !== BOT_LOGIN || c.user?.type !== 'Bot') continue;
+    if (!c.body?.includes(BOT_MARKER)) continue;
+    if (c.body.includes(REVIEW_COMPLETE_MARKER)) continue;
+    if (c.body.includes(CANCELLED_MARKER)) continue;
+    if (c.body.includes(FORCE_REVIEW_MARKER)) continue;
+    if (c.body.includes(FORCE_CAP_MARKER)) continue;
+    const runId = extractRunIdFromBody(c.body);
+    if (runId === null) continue;
+    if (runId === currentRunId) continue;
+    return { runId, updatedAt: c.updated_at, commentId: c.id };
+  }
+  return null;
+}
+
+/**
+ * True when `updatedAt` is older than `ttlSeconds` relative to `now`. Used to
+ * ignore in-progress markers from runs that crashed without clearing their
+ * lock, so a single stale comment cannot wedge the PR indefinitely.
+ */
+function isLockExpired(updatedAt: string, ttlSeconds: number, now: Date): boolean {
+  const updated = Date.parse(updatedAt);
+  if (!Number.isFinite(updated)) return true;
+  return (now.getTime() - updated) / 1000 > ttlSeconds;
+}
+
+const DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS = 600;
+
+function readConcurrencyLockTtlSeconds(config?: ReviewConfig): number {
+  const raw = core.getInput('concurrency_lock_ttl_seconds');
+  if (raw) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n > MAX_LOCK_TTL_SECONDS) {
+      core.warning(`Invalid concurrency_lock_ttl_seconds=${raw}, using default ${DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS}`);
+      return DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS;
+    }
+    return n;
+  }
+  const fromConfig = config?.concurrency_lock_ttl_seconds;
+  if (fromConfig === undefined) return DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS;
+  if (!Number.isFinite(fromConfig) || fromConfig <= 0 || fromConfig > MAX_LOCK_TTL_SECONDS) {
+    core.warning(`Invalid \`concurrency_lock_ttl_seconds\` in config (${fromConfig}), using default ${DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS}`);
+    return DEFAULT_CONCURRENCY_LOCK_TTL_SECONDS;
+  }
+  return fromConfig;
+}
+
+/**
+ * Defense-in-depth check before any LLM call. When another `manki-review[bot]`
+ * run has posted an in-progress marker comment whose `manki-run-id` differs
+ * from ours and whose `updated_at` is within the configured TTL, bail to avoid
+ * a double review. The workflow-level `concurrency` group is best-effort and
+ * can let two runs reach `in_progress` within the same scheduling window.
+ *
+ * Returns `true` when the caller should bail.
+ */
+async function checkConcurrentSubmissionLock(
+  octokit: Octokit, owner: string, repo: string, prNumber: number, config?: ReviewConfig,
+): Promise<boolean> {
+  const currentRunId = github.context.runId;
+  let lock;
+  try {
+    const comments = await fetchPRComments(octokit, owner, repo, prNumber);
+    lock = findInProgressLock(comments, currentRunId);
+  } catch (error) {
+    core.warning(`Concurrency lock scan failed: ${error instanceof Error ? error.message : error}`);
+    return false;
+  }
+  if (!lock) return false;
+
+  const ttlSeconds = readConcurrencyLockTtlSeconds(config);
+  const now = new Date();
+  if (isLockExpired(lock.updatedAt, ttlSeconds, now)) {
+    core.info(`Ignoring stale in-progress marker from run ${lock.runId} (updated_at=${lock.updatedAt}, TTL=${ttlSeconds}s)`);
+    return false;
+  }
+  const ageSeconds = Math.round((now.getTime() - Date.parse(lock.updatedAt)) / 1000);
+  core.warning(`Bailing: another Manki run (id=${lock.runId}) posted an in-progress marker ${ageSeconds}s ago (TTL=${ttlSeconds}s). Defense-in-depth lock engaged before LLM call.`);
+  return true;
+}
+
+/**
  * Post-step cleanup: find our run's progress comment and mark it as cancelled.
  * Invoked when GitHub Actions cancels the main step.
  */
@@ -1263,7 +1505,7 @@ async function markOwnProgressCommentCancelled(
 ): Promise<boolean> {
   try {
     const { data: comments } = await octokit.rest.issues.listComments({
-      owner, repo, issue_number: prNumber, per_page: 100, direction: 'desc',
+      owner, repo, issue_number: prNumber, per_page: 100,
     });
     const target = comments.find(c =>
       c.user?.login === BOT_LOGIN &&
@@ -1282,28 +1524,87 @@ async function markOwnProgressCommentCancelled(
   }
 }
 
+type BotReviewSummary = {
+  id: number;
+  state: string;
+  commitId: string;
+  htmlUrl: string;
+  body: string;
+};
+
 /**
- * Check whether the bot already has an active (non-dismissed) APPROVED review
- * on the given commit SHA.
+ * Shared scanner: returns all non-DISMISSED `manki-review[bot]` reviews on the
+ * PR in API order (oldest first). Callers filter to the commit SHA they care
+ * about.
+ *
+ * Fail-open contract: any API error returns `[]` rather than throwing, so
+ * callers such as `hasBotReviewOnCommit` and `isApprovedOnCommit` return
+ * `false` and allow the run to proceed. Callers must not wrap this function in
+ * a try/catch to handle errors — the catch is already here.
  */
-async function isApprovedOnCommit(octokit: Octokit, owner: string, repo: string, prNumber: number, commitSha: string): Promise<boolean> {
+async function fetchBotReviews(
+  octokit: Octokit, owner: string, repo: string, prNumber: number,
+): Promise<BotReviewSummary[]> {
   try {
-    const { data: reviews } = await octokit.rest.pulls.listReviews({
+    const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
       owner,
       repo,
       pull_number: prNumber,
       per_page: 100,
     });
-    const botReviews = reviews.filter(
-      (r: { body?: string | null; state?: string; user?: { login?: string; type?: string } | null }) =>
-        r.user?.login === BOT_LOGIN && r.user?.type === 'Bot' && r.state !== 'DISMISSED',
-    );
-    const latest = botReviews[botReviews.length - 1];
-    if (!latest || latest.state !== 'APPROVED') return false;
-    return (latest as unknown as { commit_id?: string }).commit_id === commitSha;
+    return reviews.slice(-500)
+      .filter((r: { state?: string; user?: { login?: string; type?: string } | null; body?: string | null }) =>
+        r.user?.login === BOT_LOGIN && r.user?.type === 'Bot' && r.state !== 'DISMISSED' &&
+        !!r.body && r.body.includes(BOT_MARKER),
+      )
+      .map((r: unknown) => {
+        const raw = r as { id: number; state: string; commit_id: string; html_url?: string; body?: string | null };
+        return {
+          id: raw.id,
+          state: raw.state,
+          commitId: raw.commit_id,
+          htmlUrl: raw.html_url ?? '',
+          body: raw.body ?? '',
+        };
+      });
   } catch {
-    return false;
+    return [];
   }
+}
+
+/**
+ * State-based head-SHA dedupe gate. Returns the most-recent non-DISMISSED
+ * `manki-review[bot]` review whose `commit_id` matches `commitSha`, otherwise
+ * `undefined`. Run entry points consult this before any LLM call so serialized
+ * sibling events (e.g., the `pull_request_review` + `pull_request_review_comment`
+ * fan-out from a single human review) cannot post duplicate reviews on the
+ * same commit. Complements the temporally-overlapping `checkConcurrentSubmissionLock`.
+ */
+async function findBotReviewOnCommit(
+  octokit: Octokit, owner: string, repo: string, prNumber: number, commitSha: string,
+): Promise<BotReviewSummary | undefined> {
+  const reviews = await fetchBotReviews(octokit, owner, repo, prNumber);
+  const onCommit = reviews.filter(r => r.commitId === commitSha);
+  return onCommit[onCommit.length - 1];
+}
+
+async function hasBotReviewOnCommit(
+  octokit: Octokit, owner: string, repo: string, prNumber: number, commitSha: string,
+): Promise<boolean> {
+  return (await findBotReviewOnCommit(octokit, owner, repo, prNumber, commitSha)) !== undefined;
+}
+
+/**
+ * Auto-approve gate. Returns true only when the latest non-DISMISSED bot review
+ * (across all commits on the PR) is APPROVED and lands on `commitSha`. The
+ * "latest across all commits" semantic is preserved so a fresh CHANGES_REQUESTED
+ * on a newer commit overrides an older APPROVED.
+ */
+async function isApprovedOnCommit(octokit: Octokit, owner: string, repo: string, prNumber: number, commitSha: string): Promise<boolean> {
+  const reviews = await fetchBotReviews(octokit, owner, repo, prNumber);
+  const latest = reviews[reviews.length - 1];
+  if (!latest || latest.state !== 'APPROVED') return false;
+  return latest.commitId === commitSha;
 }
 
 const APP_WARNING_MARKER = '<!-- manki-app-warning -->';
@@ -1345,7 +1646,8 @@ async function cancelActiveReviewRun(
 ): Promise<boolean> {
   let progress: ProgressComment | null;
   try {
-    progress = await findProgressComment(octokit, owner, repo, prNumber);
+    const comments = await fetchPRComments(octokit, owner, repo, prNumber);
+    progress = findProgressComment(comments);
   } catch {
     return false;
   }
@@ -1384,4 +1686,5 @@ async function cancelActiveReviewRun(
   }
 }
 
-export { dynamicFence, formatFindingComment, formatStatsJson, formatStatsOneLiner, getSeverityEmoji, getSeverityLabel, mapVerdictToEvent, resolveReferences, safeTruncate, sanitizeFilePath, sanitizeMarkdown, truncateBody, BOT_LOGIN, ACTIONS_BOT_LOGIN, BOT_MARKER, REVIEW_COMPLETE_MARKER, FORCE_REVIEW_MARKER, CANCELLED_MARKER, RUN_ID_MARKER_PREFIX, VERSION_MARKER_PREFIX, MANKI_VERSION, isReviewInProgress, isApprovedOnCommit, markOwnProgressCommentCancelled, cancelActiveReviewRun, extractRunIdFromBody, extractVersionFromBody, APP_WARNING_MARKER, postAppWarningIfNeeded };
+export { dynamicFence, formatContextBlock, formatFindingComment, formatStatsOneLiner, getSeverityEmoji, getSeverityLabel, mapVerdictToEvent, resolveReferences, sanitizeFilePath, sanitizeMarkdown, truncateBody, truncateContextToFitBody, BOT_LOGIN, ACTIONS_BOT_LOGIN, BOT_MARKER, REVIEW_COMPLETE_MARKER, FORCE_REVIEW_MARKER, FORCE_CAP_MARKER, CANCELLED_MARKER, RUN_ID_MARKER_PREFIX, VERSION_MARKER_PREFIX, MANKI_VERSION, isReviewInProgress, isApprovedOnCommit, hasBotReviewOnCommit, findBotReviewOnCommit, markOwnProgressCommentCancelled, cancelActiveReviewRun, extractRunIdFromBody, extractVersionFromBody, fetchPRComments, findInProgressLock, isLockExpired, checkConcurrentSubmissionLock, APP_WARNING_MARKER, postAppWarningIfNeeded };
+export type { InProgressLock };

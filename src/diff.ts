@@ -1,24 +1,26 @@
 import parseDiff from 'parse-diff';
 import { minimatch } from 'minimatch';
 
-import { DiffFile, DiffHunk, ParsedDiff } from './types';
+import { DiffFile, DiffHunk, ParsedDiff, RoundDiffExcludedFile } from './types';
 
 /**
  * Parse a unified diff string into structured data.
  */
 export function parsePRDiff(rawDiff: string): ParsedDiff {
   if (!rawDiff.trim()) {
-    return { files: [], totalAdditions: 0, totalDeletions: 0 };
+    return { files: [], totalAdditions: 0, totalDeletions: 0, binarySkipped: [] };
   }
 
   const parsed = parseDiff(rawDiff);
   let totalAdditions = 0;
   let totalDeletions = 0;
   const files: DiffFile[] = [];
+  const binarySkipped: string[] = [];
 
   for (const file of parsed) {
-    // Skip binary files (they have no meaningful chunks)
     if (isBinaryFile(file)) {
+      const binaryPath = file.to && file.to !== '/dev/null' ? file.to : file.from ?? '';
+      if (binaryPath) binarySkipped.push(binaryPath);
       continue;
     }
 
@@ -42,10 +44,12 @@ export function parsePRDiff(rawDiff: string): ParsedDiff {
       ...(changeType === 'renamed' || changeType === 'deleted' ? { oldPath } : {}),
       changeType,
       hunks,
+      additions: file.additions,
+      deletions: file.deletions,
     });
   }
 
-  return { files, totalAdditions, totalDeletions };
+  return { files, totalAdditions, totalDeletions, binarySkipped };
 }
 
 /**
@@ -56,15 +60,32 @@ export function filterFiles(
   files: DiffFile[],
   excludePaths: string[],
 ): DiffFile[] {
-  return files.filter((file) => {
-    const matchOpts = { matchBase: true, dot: true };
+  return filterFilesWithAttribution(files, excludePaths).included;
+}
 
-    const excluded = excludePaths.some((pattern) =>
+/**
+ * Same as `filterFiles` but also returns per-file exclusion attribution
+ * (path + first matched pattern) so callers can surface noise-debugging
+ * provenance in `RoundDiff.excludedFiles`.
+ */
+export function filterFilesWithAttribution(
+  files: DiffFile[],
+  excludePaths: string[],
+): { included: DiffFile[]; excluded: RoundDiffExcludedFile[] } {
+  const matchOpts = { matchBase: true, dot: true };
+  const included: DiffFile[] = [];
+  const excluded: RoundDiffExcludedFile[] = [];
+  for (const file of files) {
+    const matchedPattern = excludePaths.find((pattern) =>
       minimatch(file.path, pattern, matchOpts),
     );
-
-    return !excluded;
-  });
+    if (matchedPattern) {
+      excluded.push({ path: file.path, matchedPattern });
+    } else {
+      included.push(file);
+    }
+  }
+  return { included, excluded };
 }
 
 /**
@@ -112,10 +133,30 @@ export function findClosestDiffLine(file: DiffFile, line: number): number | null
 }
 
 /**
- * Check if the total diff size exceeds the maximum line count.
+ * Sum additions and deletions across the given files. Files lacking
+ * per-file counts contribute zero, matching the behavior of test fixtures
+ * that omit them.
  */
-export function isDiffTooLarge(diff: ParsedDiff, maxLines: number): boolean {
-  return diff.totalAdditions + diff.totalDeletions > maxLines;
+export function countDiffLines(files: DiffFile[]): number {
+  let total = 0;
+  for (const file of files) {
+    total += (file.additions ?? 0) + (file.deletions ?? 0);
+  }
+  return total;
+}
+
+/**
+ * Check if the reviewable diff size exceeds the maximum line count.
+ * Files matching `excludePaths` are dropped before the count so generated
+ * artifacts the user has opted out of (e.g., `dist/**`) cannot trip the gate.
+ */
+export function isDiffTooLarge(
+  diff: ParsedDiff,
+  maxLines: number,
+  excludePaths: string[] = [],
+): boolean {
+  const reviewable = filterFiles(diff.files, excludePaths);
+  return countDiffLines(reviewable) > maxLines;
 }
 
 function isBinaryFile(file: parseDiff.File): boolean {

@@ -1,17 +1,23 @@
 import * as core from '@actions/core';
+import * as fs from 'fs';
 import * as github from '@actions/github';
+import * as path from 'path';
 
 import { createAuthenticatedOctokit, getMemoryToken } from './auth';
-import { ClaudeClient } from './claude';
-import { loadConfig, resolveModel } from './config';
+import { sanitizeTokens } from './utils';
+import { loadConfig, loadConfigFromFile, sanitizeForkConfig, resolveAgentModel, resolveModel } from './config';
+import { buildAuthForProvider, createLLMClient, hasAnyProviderCredentials, parseModelSpec, sanitizeLogOutput } from './providers';
+import type { LLMClient, ProviderAuth, ProviderInputs } from './providers';
 import { extractCurrentCodeWindow } from './code-window';
-import { parsePRDiff, filterFiles, isDiffTooLarge } from './diff';
+import { parsePRDiff, filterFiles, filterFilesWithAttribution, isDiffTooLarge, countDiffLines } from './diff';
 import { handleReviewCommentReply, handleReviewCommentCommand, handlePRComment, isReviewRequest, isBotMentionNonReview, hasBotMention, parseCommand, isLLMAccessAllowed } from './interaction';
-import { isEmptyInterRoundDiff } from './judge';
-import { appendHandoverRound, loadHandover, loadMemory, applyEscalations, updatePattern, RepoMemory } from './memory';
-import { classifyAuthorReply, fetchRecapState, fingerprintFinding } from './recap';
-import { buildAgentPool, collectPriorRoundAgents, runReview, determineVerdict, selectTeam, TRIVIAL_VERIFIER_AGENT } from './review';
-import { DEFENSIVE_HARDENING_TAG, DashboardData, PrContext, PrHandover, ReviewMetadata, ReviewStats } from './types';
+import { isEmptyInterRoundDiff, MAX_INTER_ROUND_DIFF_CHARS } from './judge';
+import { loadMemory, applyEscalations, updatePattern, RepoMemory } from './memory';
+import { collectResolvedThreadIds, fetchRecapState, fingerprintFinding, PreviousFinding } from './recap';
+import { buildAgentPool } from './agents';
+import { buildPriorRoundLookup, collectPriorRoundAgents, runReview, determineVerdict, selectTeam } from './review';
+import { CONTRADICTION_TAG, DEFENSIVE_HARDENING_TAG, DashboardData, FullReviewOptions, MemoryLoadStatus, OWN_PROPOSAL_TAG, PrContext, RATCHET_SUPPRESSED_TAG, RESOLVED_THREAD_SUPPRESSED_TAG, ReclassifiedPrior, ReviewMetadata, RoundCap, RoundContext, RoundDiffExcludedFile, RoundDiffPerFile, RoundRecap, RoundTrigger, RoundUsage, RoundUsageStage, ThreadResolutionOverrides, roundContextToFlatAliases } from './types';
+import type { LLMUsage } from './providers';
 import {
   fetchPRDiff,
   fetchConfigFile,
@@ -24,20 +30,102 @@ import {
   updateProgressDashboard,
   dismissPreviousReviews,
   postReview,
-  createNitIssue,
   reactToIssueComment,
   fetchLinkedIssues,
   BOT_LOGIN,
   BOT_MARKER as PROGRESS_MARKER,
   FORCE_REVIEW_MARKER,
+  FORCE_CAP_MARKER,
+  MANKI_VERSION,
   isReviewInProgress,
   isApprovedOnCommit,
+  hasBotReviewOnCommit,
   markOwnProgressCommentCancelled,
   postAppWarningIfNeeded,
+  checkConcurrentSubmissionLock,
 } from './github';
 import { checkAndAutoApprove, resolveStaleThreads } from './state';
 
 type Octokit = ReturnType<typeof github.getOctokit>;
+
+const ALLOWED_FINGERPRINT_TAGS = new Set<string>([
+  DEFENSIVE_HARDENING_TAG,
+  OWN_PROPOSAL_TAG,
+  CONTRADICTION_TAG,
+  RATCHET_SUPPRESSED_TAG,
+  RESOLVED_THREAD_SUPPRESSED_TAG,
+]);
+
+export function detectTickedMarker(body: string): 'FORCE_REVIEW_MARKER' | 'FORCE_CAP_MARKER' | null {
+  if (!body.includes('- [x] Force review')) return null;
+  if (body.includes(FORCE_CAP_MARKER)) return 'FORCE_CAP_MARKER';
+  if (body.includes(FORCE_REVIEW_MARKER)) return 'FORCE_REVIEW_MARKER';
+  return null;
+}
+
+/**
+ * Build `RoundMeta.trigger` from the current GitHub Actions event. The event
+ * string folds in the action and (for the marker-comment tickbox edits) the
+ * specific marker, so a `5/5 -> 6/5` jump in the round-cap counter is
+ * attributable to the exact UI affordance that fired.
+ */
+function buildRoundTrigger(): RoundTrigger {
+  const eventName = github.context.eventName;
+  const payload = github.context.payload;
+  const action = payload.action;
+  const sender = payload.sender?.login ?? 'unknown';
+
+  let event = action ? `${eventName}:${action}` : eventName;
+  if (eventName === 'issue_comment') {
+    const body = payload.comment?.body ?? '';
+    if (action === 'edited') {
+      const ticked = detectTickedMarker(body);
+      if (ticked) {
+        event = `${event}:tick:${ticked}`;
+      }
+    } else if (action === 'created' && isReviewRequest(body)) {
+      event = `${event}:@manki review`;
+    }
+  }
+  return { event, sender };
+}
+
+function readProviderInputs(): ProviderInputs {
+  return {
+    anthropicOauthToken: core.getInput('claude_code_oauth_token'),
+    anthropicApiKey: core.getInput('anthropic_api_key'),
+    openaiOauthToken: core.getInput('openai_oauth_token'),
+    openaiApiKey: core.getInput('openai_api_key'),
+    geminiOauthToken: core.getInput('gemini_oauth_token'),
+    geminiApiKey: core.getInput('gemini_api_key'),
+  };
+}
+
+function buildLLMClientFromInputs(opts: {
+  inputs: ProviderInputs;
+  model: string;
+}): { client: LLMClient } | null {
+  let spec: ReturnType<typeof parseModelSpec>;
+  try {
+    spec = parseModelSpec(opts.model);
+  } catch (error) {
+    core.setFailed(`Invalid model config: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+  let auth: ProviderAuth;
+  try {
+    auth = buildAuthForProvider(spec.provider, opts.inputs);
+  } catch (error) {
+    core.setFailed(`Missing credentials for provider "${spec.provider}": ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+  try {
+    return { client: createLLMClient(spec.provider, spec.model, auth) };
+  } catch (error) {
+    core.setFailed(`Invalid model config: ${error instanceof Error ? error.message : error}`);
+    return null;
+  }
+}
 
 const octokitCache = {
   instance: null as Octokit | null,
@@ -72,6 +160,16 @@ async function run(): Promise<void> {
     return;
   }
 
+  if (core.getInput('claude_code_oauth_token')) {
+    core.warning(
+      '`claude_code_oauth_token` is deprecated. Anthropic restricts Claude Code OAuth tokens for third-party tools. ' +
+      'Use `anthropic_api_key` instead, or use `openai_oauth_token` / `gemini_oauth_token` once those provider OAuth paths are stable.',
+    );
+  }
+
+  const commentAuthorLogin = github.context.payload.comment?.user?.login as string | undefined;
+  const isBotComment = commentAuthorLogin === BOT_LOGIN;
+
   // Event filtering — exit immediately for irrelevant events.
   // Tested via integration (live PR reviews) since it depends on GitHub Actions context.
   if (eventName === 'pull_request') {
@@ -85,9 +183,8 @@ async function run(): Promise<void> {
       return;
     }
     const body = github.context.payload.comment?.body ?? '';
-    const isForceReview = action === 'edited' &&
-      body.includes(FORCE_REVIEW_MARKER) && body.includes('- [x] Force review');
-    if (!isForceReview && !hasBotMention(body) && !isReviewRequest(body)) {
+    const isForceReviewChecked = action === 'edited' && isBotComment && detectTickedMarker(body) !== null;
+    if (!isForceReviewChecked && !hasBotMention(body) && !isReviewRequest(body)) {
       core.info('Comment does not mention Manki — ignoring');
       return;
     }
@@ -143,11 +240,13 @@ async function run(): Promise<void> {
 
     case 'issue_comment': {
       const commentBody = github.context.payload.comment?.body ?? '';
-      const forceReviewChecked = action === 'edited' && commentBody.includes(FORCE_REVIEW_MARKER) && commentBody.includes('- [x] Force review');
-      if (forceReviewChecked && github.context.payload.issue?.pull_request) {
-        await handleCommentTrigger(true);
+      const tickedMarker = action === 'edited' && isBotComment ? detectTickedMarker(commentBody) : null;
+      if (tickedMarker === 'FORCE_CAP_MARKER' && github.context.payload.issue?.pull_request) {
+        await handleCommentTrigger(false, true, 'skip_cap');
+      } else if (tickedMarker === 'FORCE_REVIEW_MARKER' && github.context.payload.issue?.pull_request) {
+        await handleCommentTrigger(true, false, 'force_review');
       } else if (isReviewRequest(commentBody) && github.context.payload.issue?.pull_request) {
-        await handleCommentTrigger();
+        await handleCommentTrigger(true, true, 'manual_review_command');
       } else if (isBotMentionNonReview(commentBody) && github.context.payload.issue?.pull_request) {
         await handleInteraction();
       } else if (isBotMentionNonReview(commentBody) && !github.context.payload.issue?.pull_request) {
@@ -167,32 +266,30 @@ async function run(): Promise<void> {
   }
 }
 
+type SkipReason = 'in_progress' | 'already_reviewed';
+
 async function postReviewSkippedComment(
   octokit: Octokit, owner: string, repo: string, prNumber: number,
+  commitSha: string, reason: SkipReason,
 ): Promise<void> {
   try {
+    const shortSha = commitSha.slice(0, 7);
+    const line = reason === 'in_progress'
+      ? `**Review skipped** for \`${shortSha}\` — a review is currently in progress. Retry when it completes, or force now:`
+      : `**Review skipped** for \`${shortSha}\` — a review has already been posted for this commit. Force a re-review:`;
     const body = [
       PROGRESS_MARKER,
-      `**Review skipped** — a review is currently in progress. Retry when it completes, or force now:`,
+      line,
       '',
       '- [ ] Force review',
       '',
       FORCE_REVIEW_MARKER,
     ].join('\n');
-    // Update an existing skip comment instead of creating a duplicate
-    const { data: comments } = await octokit.rest.issues.listComments({
-      owner, repo, issue_number: prNumber, per_page: 100, direction: 'desc',
-    });
-    const existing = comments.find(c =>
-      c.user?.login === BOT_LOGIN &&
-      c.user?.type === 'Bot' &&
-      c.body?.includes(PROGRESS_MARKER) && c.body?.includes('Review skipped'),
-    );
-    if (existing) {
-      await octokit.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-    } else {
-      await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
-    }
+    // Always create a fresh comment. Editing an older skip-ack in place is
+    // silent on GitHub (no notification, original timeline position), so the
+    // user perceives no response. Each fresh comment carries its own Force
+    // review checkbox.
+    await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
   } catch (error) {
     core.warning(`Failed to post review-skipped comment: ${error instanceof Error ? error.message : error}`);
   }
@@ -217,12 +314,18 @@ async function handlePullRequest(): Promise<void> {
 
   const octokit = await getOctokit();
   if (await isReviewInProgress(octokit, owner, repo, prNumber)) {
-    await postReviewSkippedComment(octokit, owner, repo, prNumber);
+    await postReviewSkippedComment(octokit, owner, repo, prNumber, commitSha, 'in_progress');
     return;
   }
 
   if (await isApprovedOnCommit(octokit, owner, repo, prNumber, commitSha)) {
     core.info('Already approved on this commit — skipping review');
+    return;
+  }
+
+  if (await hasBotReviewOnCommit(octokit, owner, repo, prNumber, commitSha)) {
+    core.info(`Bot already reviewed commit ${commitSha.slice(0, 7)} — skipping serialized sibling run`);
+    await postReviewSkippedComment(octokit, owner, repo, prNumber, commitSha, 'already_reviewed');
     return;
   }
 
@@ -232,10 +335,14 @@ async function handlePullRequest(): Promise<void> {
     baseBranch: pr.base.ref,
   };
 
-  await runFullReview(owner, repo, prNumber, commitSha, pr.base.ref, prContext, pr.user?.login);
+  await runFullReview(owner, repo, prNumber, commitSha, pr.base.ref, prContext, {
+    prAuthorLogin: pr.user?.login,
+    headRepoFullName: pr.head.repo?.full_name,
+    trigger: buildRoundTrigger(),
+  });
 }
 
-async function handleCommentTrigger(forceReview?: boolean): Promise<void> {
+async function handleCommentTrigger(forceReview?: boolean, skipCap?: boolean, bypassHint?: FullReviewOptions['bypassHint']): Promise<void> {
   const payload = github.context.payload;
 
   if (!payload.issue?.pull_request) {
@@ -266,14 +373,6 @@ async function handleCommentTrigger(forceReview?: boolean): Promise<void> {
     return;
   }
 
-  if (!forceReview) {
-    if (await isReviewInProgress(octokit, owner, repo, prNumber)) {
-      await postReviewSkippedComment(octokit, owner, repo, prNumber);
-      core.info('Review already in progress — skipping');
-      return;
-    }
-  }
-
   const { data: pr } = await octokit.rest.pulls.get({
     owner,
     repo,
@@ -281,8 +380,24 @@ async function handleCommentTrigger(forceReview?: boolean): Promise<void> {
   });
 
   if (!forceReview) {
+    if (await isReviewInProgress(octokit, owner, repo, prNumber)) {
+      await postReviewSkippedComment(octokit, owner, repo, prNumber, pr.head.sha, 'in_progress');
+      core.info('Review already in progress — skipping');
+      return;
+    }
+  }
+
+  if (!forceReview) {
     if (await isApprovedOnCommit(octokit, owner, repo, prNumber, pr.head.sha)) {
       core.info('Already approved on this commit — skipping review');
+      return;
+    }
+  }
+
+  if (!forceReview) {
+    if (await hasBotReviewOnCommit(octokit, owner, repo, prNumber, pr.head.sha)) {
+      core.info(`Bot already reviewed commit ${pr.head.sha.slice(0, 7)} — skipping serialized sibling run`);
+      await postReviewSkippedComment(octokit, owner, repo, prNumber, pr.head.sha, 'already_reviewed');
       return;
     }
   }
@@ -293,7 +408,28 @@ async function handleCommentTrigger(forceReview?: boolean): Promise<void> {
     baseBranch: pr.base.ref,
   };
 
-  await runFullReview(owner, repo, prNumber, pr.head.sha, pr.base.ref, prContext, pr.user?.login, forceReview);
+  await runFullReview(owner, repo, prNumber, pr.head.sha, pr.base.ref, prContext, {
+    prAuthorLogin: pr.user?.login,
+    headRepoFullName: pr.head.repo?.full_name,
+    forceReview,
+    skipCap,
+    bypassHint,
+    trigger: buildRoundTrigger(),
+  });
+}
+
+function _buildRoundRecap(recap: {
+  priorRounds: unknown[];
+  reclassifiedPriorCount?: number;
+  reclassifiedPriors?: ReclassifiedPrior[];
+}): RoundRecap {
+  const count = recap.reclassifiedPriorCount ?? 0;
+  const entries = recap.reclassifiedPriors ?? [];
+  return {
+    priorRoundCount: recap.priorRounds.length,
+    reclassifiedPriorCount: count,
+    ...(entries.length > 0 && { reclassifiedPriors: entries }),
+  };
 }
 
 function reconcileDashboardAgents(dashboard: DashboardData, names: string[]): void {
@@ -318,16 +454,15 @@ async function runFullReview(
   commitSha: string,
   baseRef: string,
   prContext?: PrContext,
-  prAuthorLogin?: string,
-  forceReview?: boolean,
+  options: FullReviewOptions = {},
 ): Promise<void> {
+  const { prAuthorLogin, forceReview, skipCap, bypassHint, trigger = buildRoundTrigger(), headRepoFullName } = options;
   core.info(`Starting review for ${owner}/${repo}#${prNumber}`);
 
-  const oauthToken = core.getInput('claude_code_oauth_token');
-  const apiKey = core.getInput('anthropic_api_key');
+  const providerInputs = readProviderInputs();
 
-  if (!oauthToken && !apiKey) {
-    core.setFailed('No API key configured — set claude_code_oauth_token or anthropic_api_key');
+  if (!hasAnyProviderCredentials(providerInputs)) {
+    core.setFailed('No API key configured — set claude_code_oauth_token, anthropic_api_key, openai_oauth_token, openai_api_key, gemini_oauth_token, or gemini_api_key');
     return;
   }
 
@@ -343,11 +478,73 @@ async function runFullReview(
     }
   }
 
-  const progressCommentId = await postProgressComment(octokit, owner, repo, prNumber);
-
+  let progressCommentId: number | undefined;
   let dashboardFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   try {
+    // Read `.manki.yml` from the local checkout so a PR that modifies its own
+    // config (e.g., extending `exclude_paths`) takes effect on the same PR.
+    // `process.cwd()` is the PR tree because the action runs as a local
+    // composite via `./` in the consumer workflow.
+    const configRelPath = configPathInput || '.manki.yml';
+    const cwd = path.resolve(process.cwd());
+    const configAbsPath = path.isAbsolute(configRelPath)
+      ? configRelPath
+      : path.join(cwd, configRelPath);
+    let resolvedConfigPath: string;
+    try {
+      resolvedConfigPath = fs.realpathSync(configAbsPath);
+    } catch {
+      resolvedConfigPath = configAbsPath;
+    }
+    if (resolvedConfigPath !== cwd && !resolvedConfigPath.startsWith(cwd + path.sep)) {
+      core.warning(`\`config_path\` resolved outside workspace — using defaults`);
+    }
+    const effectiveConfigPath = (resolvedConfigPath === cwd || resolvedConfigPath.startsWith(cwd + path.sep))
+      ? resolvedConfigPath
+      : path.join(cwd, '.manki.yml');
+    const rawConfig = loadConfigFromFile(effectiveConfigPath);
+    const isFork = headRepoFullName !== undefined && headRepoFullName !== `${owner}/${repo}`;
+    const config = isFork ? sanitizeForkConfig(rawConfig) : rawConfig;
+
+    // Scan for a competing in-progress marker before posting our own to shorten
+    // the race window. A residual window remains when two runs both pass this scan
+    // before either posts; tracking issue for the strict atomic fix: https://github.com/manki-review/manki/issues/798
+    if (await checkConcurrentSubmissionLock(octokit, owner, repo, prNumber, config)) {
+      core.warning('Defense-in-depth lock engaged — this run will not post a review. If no review appears on the PR, re-trigger with `/manki review`.');
+      return;
+    }
+
+    // Sibling head-SHA dedupe: serialized siblings (e.g., `pull_request_review`
+    // and `pull_request_review_comment` fan-out from one human review) can both
+    // pass the in-progress scan when the prior run's marker has already been
+    // cleared. The state-based check on the bot's posted reviews catches that.
+    // Honors `forceReview` so explicit re-review on the same SHA still proceeds.
+    if (!forceReview && await hasBotReviewOnCommit(octokit, owner, repo, prNumber, commitSha)) {
+      core.warning(`Bot already posted a non-DISMISSED review on commit ${commitSha.slice(0, 7)} — bailing serialized sibling run.`);
+      await postReviewSkippedComment(octokit, owner, repo, prNumber, commitSha, 'already_reviewed');
+      return;
+    }
+
+    // Fast-exit when the PR head has advanced past the event SHA between the
+    // event firing and this run reaching the LLM phase. Placed before any
+    // progress comment is posted so no marker cleanup is required on bail.
+    // Fail-open: a `pulls.get` failure does not disable the review.
+    try {
+      const { data: prHead } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+      const headSha = prHead.head?.sha;
+      if (!headSha) {
+        core.warning('Head SHA lookup returned no sha, proceeding');
+      } else if (headSha !== commitSha) {
+        core.info(`Event SHA ${commitSha.slice(0, 7)} != head SHA ${headSha.slice(0, 7)} — bailing out`);
+        return;
+      }
+    } catch (error) {
+      core.warning(`Head SHA lookup failed, proceeding: ${error instanceof Error ? error.message : error}`);
+    }
+
+    progressCommentId = await postProgressComment(octokit, owner, repo, prNumber);
+
     // Capture recap state before resolving stale threads so dedup sees
     // the original open/resolved status of each previous finding.
     const recap = await fetchRecapState(octokit, owner, repo, prNumber, prAuthorLogin);
@@ -357,36 +554,44 @@ async function runFullReview(
       core.info(`Resolved ${staleCount} stale review threads from previous commits`);
     }
 
-    let configContent: string | null = null;
-    if (configPathInput) {
-      configContent = await fetchConfigFile(octokit, owner, repo, baseRef, configPathInput);
-    } else {
-      configContent = await fetchConfigFile(octokit, owner, repo, baseRef, '.manki.yml');
-    }
-    const config = loadConfig(configContent ?? undefined);
-
     if (github.context.eventName === 'pull_request' && !config.auto_review) {
       core.info('auto_review is disabled — skipping');
       await octokit.rest.issues.deleteComment({ owner, repo, comment_id: progressCommentId });
       return;
     }
 
-    const authOptions = {
-      oauthToken: oauthToken || undefined,
-      apiKey: apiKey || undefined,
-    };
     const plannerModel = resolveModel(config, 'planner');
     const reviewerModel = resolveModel(config, 'reviewer');
     const judgeModel = resolveModel(config, 'judge');
     const dedupModel = resolveModel(config, 'dedup');
     core.info(`Models — planner: ${plannerModel}, reviewer: ${reviewerModel}, judge: ${judgeModel}, dedup: ${dedupModel}`);
+    const agentOverrides = config.models?.agents;
+    if (agentOverrides && Object.keys(agentOverrides).length > 0) {
+      const formatted = Object.entries(agentOverrides).map(([n, m]) => `${n}=${m}`).join(', ');
+      core.info(`Per-agent model overrides — ${formatted}`);
+    }
 
-    const reviewerClient = new ClaudeClient({ ...authOptions, model: reviewerModel });
-    const judgeClient = new ClaudeClient({ ...authOptions, model: judgeModel });
-    const plannerClient = config.planner?.enabled !== false
-      ? new ClaudeClient({ ...authOptions, model: plannerModel })
-      : undefined;
-    const dedupClient = new ClaudeClient({ ...authOptions, model: dedupModel });
+    const buildClient = (model: string) => {
+      const spec = parseModelSpec(model);
+      const auth = buildAuthForProvider(spec.provider, providerInputs);
+      return createLLMClient(spec.provider, spec.model, auth);
+    };
+    let reviewerClient: LLMClient, judgeClient: LLMClient, dedupClient: LLMClient;
+    let plannerClient: LLMClient | undefined;
+    const perAgentClients = new Map<string, LLMClient>();
+    try {
+      reviewerClient = buildClient(reviewerModel);
+      judgeClient = buildClient(judgeModel);
+      plannerClient = config.planner?.enabled !== false ? buildClient(plannerModel) : undefined;
+      dedupClient = buildClient(dedupModel);
+      for (const [name, model] of Object.entries(config.models?.agents ?? {})) {
+        if (model !== reviewerModel) perAgentClients.set(name, buildClient(model));
+      }
+    } catch (error) {
+      core.setFailed(`Invalid model config: ${error instanceof Error ? error.message : error}`);
+      await octokit.rest.issues.deleteComment({ owner, repo, comment_id: progressCommentId }).catch(() => {});
+      return;
+    }
 
     const rawDiff = await fetchPRDiff(octokit, owner, repo, prNumber);
     const diff = parsePRDiff(rawDiff);
@@ -412,11 +617,12 @@ async function runFullReview(
         };
     await updateProgressDashboard(octokit, owner, repo, progressCommentId, dashboard);
 
-    if (isDiffTooLarge(diff, config.max_diff_lines)) {
-      core.warning(`Diff too large (${diff.totalAdditions + diff.totalDeletions} lines > ${config.max_diff_lines} max)`);
+    if (isDiffTooLarge(diff, config.max_diff_lines, config.exclude_paths)) {
+      const reviewableLines = countDiffLines(filterFiles(diff.files, config.exclude_paths));
+      core.warning(`Diff too large (${reviewableLines} reviewable lines > ${config.max_diff_lines} max)`);
       const result = {
         verdict: 'COMMENT' as const,
-        summary: `**Manki** — This PR is too large for automated review (${diff.totalAdditions + diff.totalDeletions} lines). Consider splitting it up or request a manual review.`,
+        summary: `**Manki** — This PR is too large for automated review (${reviewableLines} lines). Consider splitting it up or request a manual review.`,
         findings: [],
         highlights: [],
         reviewComplete: true,
@@ -433,7 +639,7 @@ async function runFullReview(
       return;
     }
 
-    const filteredFiles = filterFiles(diff.files, config.exclude_paths);
+    const { included: filteredFiles, excluded: excludedFiles } = filterFilesWithAttribution(diff.files, config.exclude_paths);
     core.info(`Reviewing ${filteredFiles.length} files (${diff.files.length} total, ${diff.files.length - filteredFiles.length} filtered out)`);
 
     if (filteredFiles.length === 0) {
@@ -452,6 +658,33 @@ async function runFullReview(
       return;
     }
 
+    // Eagerly install any provider CLI before the planner timer starts. The
+    // fallback `npm install -g` inside `ensureCLI` takes around 30s on a
+    // cold runner and would otherwise race the planner's own 30s timeout.
+    // Warming up once here pays the cost before any per-call deadline runs.
+    // Deduplicate by client instance so roles that share a client don't
+    // serialize redundant install retries on failure. Placed after the
+    // diff-size and empty-files guards so cold installs are skipped on paths
+    // that never invoke an LLM.
+    const warmupTargets = new Set<LLMClient>(
+      [plannerClient, reviewerClient, judgeClient, dedupClient, ...perAgentClients.values()].filter(
+        (c): c is LLMClient => !!c,
+      ),
+    );
+    await Promise.allSettled(
+      [...warmupTargets].map((c) =>
+        c.warmupCLI
+          ? c.warmupCLI().catch((error) =>
+              core.warning(
+                sanitizeLogOutput(
+                  `Provider CLI warmup failed (${c.constructor.name}): ${error instanceof Error ? error.message : error}`,
+                ),
+              ),
+            )
+          : Promise.resolve(),
+      ),
+    );
+
     let repoContext = await fetchRepoContext(octokit, owner, repo, baseRef);
 
     const changedPaths = filteredFiles.map(f => f.path);
@@ -465,39 +698,38 @@ async function runFullReview(
     }
 
     let memory: RepoMemory | null = null;
-    let handover: PrHandover | null = null;
-    if (config.memory?.enabled) {
+    let memoryLoadStatus: MemoryLoadStatus;
+    let memoryLoadError: string | undefined;
+    if (!config.memory?.enabled) {
+      memoryLoadStatus = 'disabled';
+    } else {
       const memoryToken = getMemoryToken(octokitCache.resolvedToken);
       if (!memoryToken) {
         core.warning('No memory token available — skipping memory load. Set memory_repo_token or github_token.');
+        memoryLoadStatus = 'no_token';
       } else {
         const memoryOctokit = github.getOctokit(memoryToken);
         const memoryRepo = config.memory?.repo || `${owner}/review-memory`;
-
         try {
           memory = await loadMemory(memoryOctokit, memoryRepo, repo);
           core.info(`Loaded memory: ${memory.learnings.length} learnings, ${memory.suppressions.length} suppressions`);
+          memoryLoadStatus = 'loaded';
         } catch (error) {
-          core.warning(`Failed to load review memory: ${error}`);
-        }
-
-        try {
-          handover = await loadHandover(memoryOctokit, memoryRepo, repo, prNumber);
-          if (handover) {
-            core.info(`Loaded handover: ${handover.rounds.length} prior round(s)`);
-          }
-        } catch (error) {
-          core.warning(`Failed to load handover for PR #${prNumber}: ${error}`);
+          const message = error instanceof Error ? error.message : String(error);
+          const sanitized = sanitizeTokens(message);
+          core.warning(`Failed to load review memory: ${sanitized}`);
+          memoryLoadStatus = 'failed';
+          memoryLoadError = sanitized.length > 300 ? sanitized.slice(0, 300) + '...' : sanitized;
         }
       }
     }
 
-    const priorRoundCount = handover?.rounds.length ?? 0;
+    const priorRoundCount = recap.priorRounds.length;
     const maxAutoRounds = config.convergence?.max_auto_rounds ?? 0;
     if (
       maxAutoRounds > 0 &&
       priorRoundCount >= maxAutoRounds &&
-      !forceReview
+      !skipCap
     ) {
       core.info(`Round cap reached (${priorRoundCount} prior rounds >= max ${maxAutoRounds}) — skipping auto review`);
       try {
@@ -506,11 +738,19 @@ async function runFullReview(
         core.warning(`Failed to delete progress comment: ${error}`);
       }
       try {
+        const body = [
+          PROGRESS_MARKER,
+          `Manki has completed ${priorRoundCount}/${maxAutoRounds} review rounds on this PR. Automatic review is paused. Tick the box to force another round, or comment \`@manki review\`:`,
+          '',
+          '- [ ] Force review',
+          '',
+          FORCE_CAP_MARKER,
+        ].join('\n');
         await octokit.rest.issues.createComment({
           owner,
           repo,
           issue_number: prNumber,
-          body: `${PROGRESS_MARKER}\nManki has completed ${priorRoundCount} review rounds on this PR. Automatic review is paused; comment \`@manki review\` to force another round.`,
+          body,
         });
       } catch (error) {
         core.warning(`Failed to post round-cap notice: ${error}`);
@@ -522,14 +762,17 @@ async function runFullReview(
 
     const isFollowUp = recap.previousFindings.length > 0;
     const baseOpenThreads = recap.previousFindings
-      .filter(f => (f.status === 'open' || f.status === 'replied') && f.threadId)
+      .filter((f): f is PreviousFinding & { threadId: string } =>
+        (f.status === 'open' || f.status === 'replied') && f.threadId != null && f.threadId !== '')
       .map(f => ({
-        threadId: f.threadId!,
+        threadId: f.threadId,
         threadUrl: f.threadUrl,
         title: f.title,
         file: f.file,
         line: f.line,
         severity: f.severity,
+        description: f.description,
+        suggestedFix: f.suggestedFix,
       }));
 
     // Fetch full file contents for changed files so reviewers have surrounding context.
@@ -556,27 +799,38 @@ async function runFullReview(
     // Fetch inter-round diff (prior round commit -> current head) so the judge
     // can ground per-thread resolution in actual changes since last review.
     let interRoundDiff: string | undefined;
-    const lastPriorSha = handover?.rounds.at(-1)?.commitSha;
-    if (lastPriorSha && lastPriorSha !== commitSha) {
-      try {
-        interRoundDiff = await fetchInterRoundDiff(octokit, owner, repo, lastPriorSha, commitSha);
-      } catch (error) {
-        core.warning(`Failed to fetch inter-round diff: ${error}`);
+    const lastPriorSha = recap.priorRounds.at(-1)?.meta.commitSha;
+    const shouldFetchDiff = !!(lastPriorSha && lastPriorSha !== commitSha);
+    const prBody = prContext?.body;
+
+    let linkedIssues;
+    const diffPromise: Promise<string | undefined> = shouldFetchDiff && lastPriorSha
+      ? fetchInterRoundDiff(octokit, owner, repo, lastPriorSha, commitSha)
+      : Promise.resolve(undefined);
+    const linkedIssuesPromise = prBody
+      ? fetchLinkedIssues(octokit, owner, repo, prBody)
+      : Promise.resolve(undefined);
+    const [diffResult, linkedIssuesResult] = await Promise.allSettled([diffPromise, linkedIssuesPromise]);
+
+    if (shouldFetchDiff) {
+      if (diffResult.status === 'fulfilled') {
+        interRoundDiff = diffResult.value;
+      } else {
+        core.warning(`Failed to fetch inter-round diff: ${diffResult.reason}`);
       }
     } else if (lastPriorSha === commitSha) {
       // Same SHA as last round (force-push to same tree, or replay) — empty diff.
       interRoundDiff = '';
     }
 
-    let linkedIssues;
-    if (prContext?.body) {
-      try {
-        linkedIssues = await fetchLinkedIssues(octokit, owner, repo, prContext.body);
-        if (linkedIssues.length > 0) {
+    if (prBody) {
+      if (linkedIssuesResult.status === 'fulfilled') {
+        linkedIssues = linkedIssuesResult.value;
+        if (linkedIssues && linkedIssues.length > 0) {
           core.info(`Fetched ${linkedIssues.length} linked issue(s) from PR body`);
         }
-      } catch (error) {
-        core.warning(`Failed to fetch linked issues: ${error}`);
+      } else {
+        core.warning(`Failed to fetch linked issues: ${linkedIssuesResult.reason}`);
       }
     }
 
@@ -587,7 +841,7 @@ async function runFullReview(
     // Names of every agent that participated in any prior round of this PR.
     // Used to pin the team across rounds so the roster grows monotonically:
     // an agent that flagged something earlier always reviews later rounds.
-    const priorRoundAgents = collectPriorRoundAgents(handover?.rounds);
+    const priorRoundAgents = collectPriorRoundAgents(recap.priorRounds);
 
     // On the non-planner path the dashboard was seeded with the heuristic team
     // before prior-round agents were known. Pre-populate any pinned agents now
@@ -606,28 +860,42 @@ async function runFullReview(
       if (dashboardFlushTimer) clearTimeout(dashboardFlushTimer);
       dashboardFlushTimer = setTimeout(() => {
         dashboardFlushTimer = null;
-        updateProgressDashboard(octokit, owner, repo, progressCommentId, dashboard)
+        updateProgressDashboard(octokit, owner, repo, progressCommentId!, dashboard)
           .catch(err => core.warning(`Failed to update dashboard: ${err}`));
       }, 500);
     }
 
     const result = await runReview(
-      { reviewer: reviewerClient, judge: judgeClient, planner: plannerClient, dedup: dedupClient }, config, diff, rawDiff, fullContext,
+      {
+        reviewer: reviewerClient,
+        judge: judgeClient,
+        planner: plannerClient,
+        dedup: dedupClient,
+        reviewerForAgent: (agentName: string) =>
+          perAgentClients.get(agentName) ?? reviewerClient,
+      }, config, diff, rawDiff, fullContext,
       memory, fileContents, prContext, linkedIssues,
       (progress) => {
         if (progress.phase === 'planning') {
           core.info('Planner analyzing PR content...');
           if (progress.plannerResult) {
+            const plannerTeam = selectTeam(diff, config, config.reviewers, progress.plannerResult.teamSize, progress.plannerResult.agents, priorRoundAgents, true);
             dashboard.plannerInfo = {
-              teamSize: progress.plannerResult.teamSize,
+              agentCount: plannerTeam.agents.length,
               reviewerEffort: progress.plannerResult.reviewerEffort,
               judgeEffort: progress.plannerResult.judgeEffort,
               prType: progress.plannerResult.prType,
             };
-            const plannerTeam = selectTeam(diff, config, config.reviewers, progress.plannerResult.teamSize, progress.plannerResult.agents, priorRoundAgents, true);
             dashboard.agentCount = plannerTeam.agents.length;
             dashboard.agentProgress = plannerTeam.agents.map(a => ({ name: a.name, status: 'reviewing' as const }));
             dashboard.plannerDurationMs = progress.plannerDurationMs;
+            dashboard.phase = 'started';
+            scheduleDashboardFlush();
+          } else if (progress.heuristicFallback && progress.teamAgentNames) {
+            dashboard.agentCount = progress.teamAgentNames.length;
+            dashboard.agentProgress = progress.teamAgentNames.map(name => ({ name, status: 'reviewing' as const }));
+            dashboard.plannerDurationMs = progress.plannerDurationMs;
+            dashboard.heuristicFallback = true;
             dashboard.phase = 'started';
             scheduleDashboardFlush();
           }
@@ -657,7 +925,7 @@ async function runFullReview(
           reviewEndTime = Date.now();
           dashboard.phase = 'reviewed';
           dashboard.rawFindingCount = progress.rawFindingCount;
-          updateProgressDashboard(octokit, owner, repo, progressCommentId, dashboard)
+          updateProgressDashboard(octokit, owner, repo, progressCommentId!, dashboard)
             .catch(err => core.warning(`Failed to update dashboard: ${err}`));
         } else if (progress.phase === 'judging') {
           if (dashboardFlushTimer) {
@@ -667,14 +935,14 @@ async function runFullReview(
           dashboard.phase = 'reviewed';
           dashboard.rawFindingCount = progress.rawFindingCount;
           dashboard.judgeInputCount = progress.judgeInputCount;
-          updateProgressDashboard(octokit, owner, repo, progressCommentId, dashboard)
+          updateProgressDashboard(octokit, owner, repo, progressCommentId!, dashboard)
             .catch(err => core.warning(`Failed to update dashboard: ${err}`));
         }
       },
       isFollowUp,
       openThreads,
       recap.previousFindings,
-      handover?.rounds,
+      recap.priorRounds,
       prAuthorLogin,
       interRoundDiff,
     );
@@ -693,13 +961,20 @@ async function runFullReview(
       return;
     }
 
-    const priorFindingsFlat = handover?.rounds.flatMap(r => r.findings) ?? [];
+    const sortedPriorRounds = [...recap.priorRounds].sort((a, b) => a.meta.round - b.meta.round);
+    const priorFindingsFlat = sortedPriorRounds.flatMap(r => r.findings.entries ?? []);
+    const priorRoundLookup = buildPriorRoundLookup(sortedPriorRounds);
+    let escalationsApplied = 0;
     if (memory && memory.patterns.length > 0) {
+      const beforeSeverities = result.findings.map(f => f.severity);
       result.findings = applyEscalations(result.findings, memory.patterns);
+      escalationsApplied = result.findings.filter((f, i) => f.severity !== beforeSeverities[i]).length;
     }
-    const { verdict: recomputedVerdict, verdictReason } = determineVerdict(result.findings, priorFindingsFlat);
+    const resolvedThreadIds = collectResolvedThreadIds(recap.previousFindings);
+    const { verdict: recomputedVerdict, verdictReason, verdictTrace } = determineVerdict(result.findings, priorFindingsFlat, openThreads, resolvedThreadIds, undefined, priorRoundLookup);
     result.verdict = recomputedVerdict;
     result.verdictReason = verdictReason;
+    result.verdictTrace = verdictTrace;
 
     // Enrich findings with code context from the diff for nit issues
     for (const finding of result.findings) {
@@ -720,15 +995,6 @@ async function runFullReview(
       }
     }
 
-    // Route findings based on nit_handling config:
-    // - blocker + warning + suggestion: always go to inline PR comments
-    // - nitpick: inline comments if nit_handling === 'comments', nit issue if 'issues'
-    const nitHandling = config.nit_handling ?? 'issues';
-    const nitFindings = result.findings.filter(f => f.severity === 'nitpick');
-    const inlineFindings = nitHandling === 'comments'
-      ? result.findings
-      : result.findings.filter(f => f.severity !== 'nitpick');
-
     const reviewTimeMs = Date.now() - startTime;
     const severityMap: Record<string, number> = { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 };
     for (const f of result.findings) {
@@ -740,12 +1006,30 @@ async function runFullReview(
     const allJudged = result.allJudgedFindings ?? [];
     const rawFindings = result.rawFindings ?? allJudged;
     const agentMetrics = agentNames.length > 0
-      ? agentNames.map(name => ({
-        name,
-        findingsRaw: rawFindings.filter(f => f.reviewers.includes(name)).length,
-        findingsKept: result.findings.filter(f => f.reviewers.includes(name)).length,
-        responseLength: result.agentResponseLengths?.get(name),
-      }))
+      ? agentNames.map(name => {
+          const usage = result.agentUsage?.get(name);
+          const durationMs = result.agentDurationMs?.get(name);
+          const retryCount = result.agentRetryCount?.get(name);
+          const failureReason = result.agentFailureReasons?.[name];
+          const model = resolveAgentModel(config, name, 'reviewer');
+          const effort = result.agentEffortMap?.get(name);
+          const multiPassConsistency = result.agentMultiPassConsistency?.get(name);
+          return {
+            name,
+            findingsRaw: rawFindings.filter(f => f.reviewers.includes(name)).length,
+            findingsKept: result.findings.filter(f => f.reviewers.includes(name)).length,
+            ...(durationMs != null && { durationMs }),
+            status: failureReason ? 'failed' as const : 'success' as const,
+            responseLength: result.agentResponseLengths?.get(name),
+            inputTokens: usage?.inputTokens ?? 0,
+            outputTokens: usage?.outputTokens ?? 0,
+            retryCount: retryCount ?? 0,
+            ...(failureReason && { failureReason }),
+            model,
+            ...(effort && { effort }),
+            ...(multiPassConsistency && { multiPassConsistency }),
+          };
+        })
       : undefined;
 
     // Judge calibration metrics
@@ -762,20 +1046,39 @@ async function runFullReview(
         - allJudged.length
       : 0;
     const defensiveHardeningCount = allJudged.filter(f => f.tags?.includes(DEFENSIVE_HARDENING_TAG)).length;
+    const ownProposalDemotedCount = allJudged.filter(f => f.tags?.includes(OWN_PROPOSAL_TAG)).length;
+    const contradictionDemotedCount = allJudged.filter(f => f.tags?.includes(CONTRADICTION_TAG)).length;
+    const ratchetSuppressedCount = allJudged.filter(f => f.tags?.includes(RATCHET_SUPPRESSED_TAG)).length;
+    const resolvedThreadSuppressedCount = allJudged.filter(f => f.tags?.includes(RESOLVED_THREAD_SUPPRESSED_TAG)).length;
     const crossRoundSuppressed = result.crossRoundSuppressed;
     const crossRoundDemoted = result.crossRoundDemoted;
+    const interRoundDiffEmptyOverride = result.interRoundDiffEmptyOverride;
     const inPrSuppressedCount = result.inPrSuppressedCount ?? 0;
-    const judgeMetrics: ReviewStats['judgeMetrics'] = {
-      confidenceDistribution,
-      severityChanges,
-      mergedDuplicates,
-      ...(defensiveHardeningCount > 0 && { defensiveHardeningCount }),
-      ...(inPrSuppressedCount > 0 && { inPrSuppressedCount }),
-      verdictReason,
-      ...(crossRoundSuppressed != null && crossRoundSuppressed > 0 && { crossRoundSuppressed }),
-      ...(crossRoundDemoted != null && crossRoundDemoted > 0 && { crossRoundDemoted }),
-    };
-
+    const openThreadCount = openThreads.length;
+    const resolvedThreadIdCount = resolvedThreadIds.size;
+    const hasPriorRoundsForJudge = recap.priorRounds.length > 0;
+    const interRoundDiffState: 'unknown' | 'empty' | 'changed' = !hasPriorRoundsForJudge || interRoundDiff === undefined
+      ? 'unknown'
+      : interRoundDiff.trim().length === 0
+        ? 'empty'
+        : 'changed';
+    const interRoundDiffBytes = interRoundDiff !== undefined ? interRoundDiff.length : undefined;
+    const interRoundDiffTruncated = interRoundDiff !== undefined && interRoundDiff.length > MAX_INTER_ROUND_DIFF_CHARS;
+    const interRoundDiffKnownEmptyForCounts = hasPriorRoundsForJudge && isEmptyInterRoundDiff(interRoundDiff);
+    const knownThreadIdSet = new Set(openThreads.map(t => t.threadId));
+    let addressedDropped = 0;
+    let uncertainCount = 0;
+    for (const ev of result.threadEvaluations ?? []) {
+      if (ev.status === 'uncertain') uncertainCount++;
+      if (ev.status === 'addressed' && (!knownThreadIdSet.has(ev.threadId) || interRoundDiffKnownEmptyForCounts)) {
+        addressedDropped++;
+      }
+    }
+    const notAddressedOverridden = interRoundDiffEmptyOverride?.applied ? interRoundDiffEmptyOverride.affectedThreadCount : 0;
+    const threadResolutionOverrides: ThreadResolutionOverrides | undefined =
+      (addressedDropped > 0 || notAddressedOverridden > 0 || uncertainCount > 0)
+        ? { addressedDropped, notAddressedOverridden, uncertainCount }
+        : undefined;
     // File analysis metrics
     const fileTypes: Record<string, number> = {};
     for (const file of filteredFiles) {
@@ -783,33 +1086,183 @@ async function runFullReview(
       const ext = dotIdx !== -1 ? file.path.slice(dotIdx) : '(none)';
       fileTypes[ext] = (fileTypes[ext] ?? 0) + 1;
     }
-    const findingsPerFile: Record<string, number> = {};
-    for (const f of result.findings) {
-      if (f.file) findingsPerFile[f.file] = (findingsPerFile[f.file] ?? 0) + 1;
-    }
-    const fileMetrics = { fileTypes, findingsPerFile };
 
-    const stats: ReviewStats = {
-      model: reviewerModel,
-      reviewTimeMs,
-      diffLines: diff.totalAdditions + diff.totalDeletions,
-      diffAdditions: diff.totalAdditions,
-      diffDeletions: diff.totalDeletions,
-      filesReviewed: filteredFiles.length,
-      agents: result.agentNames,
-      findingsRaw: result.rawFindingCount ?? result.findings.length,
-      findingsKept: result.findings.length,
-      findingsDropped: (result.rawFindingCount ?? result.findings.length) - result.findings.length,
-      severity: severityMap,
-      verdict: result.verdict,
-      prNumber,
-      commitSha,
-      agentMetrics,
-      judgeMetrics,
-      fileMetrics,
-      reviewerModel,
-      judgeModel,
+    const round = priorRoundCount + 1;
+    const cap: RoundCap = {
+      priorRoundCount,
+      maxAutoRounds,
+      skipCap: !!skipCap,
+      forceReview: !!forceReview,
+      bypassReason: bypassHint ?? (forceReview ? 'force_review' : skipCap ? 'skip_cap' : 'within_cap'),
     };
+
+    const buildStage = (usage: LLMUsage | undefined): RoundUsageStage => {
+      const inputTokens = usage?.inputTokens ?? 0;
+      const outputTokens = usage?.outputTokens ?? 0;
+      return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+    };
+    const reviewerUsage: LLMUsage | undefined = result.agentUsage && result.agentUsage.size > 0
+      ? Array.from(result.agentUsage.values()).reduce(
+          (acc, u) => ({
+            inputTokens: acc.inputTokens + u.inputTokens,
+            outputTokens: acc.outputTokens + u.outputTokens,
+            cachedTokens: acc.cachedTokens + u.cachedTokens,
+            reasoningTokens: acc.reasoningTokens + u.reasoningTokens,
+          }),
+          { inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
+        )
+      : undefined;
+    const stageUsages: Array<['planner' | 'reviewer' | 'judge' | 'dedup', LLMUsage | undefined]> = [
+      ['planner', result.plannerUsage],
+      ['reviewer', reviewerUsage],
+      ['judge', result.judgeUsage],
+      ['dedup', result.dedupUsage],
+    ];
+    const perStage: Partial<Record<'planner' | 'reviewer' | 'judge' | 'dedup', RoundUsageStage>> = {};
+    let totalInput = 0;
+    let totalOutput = 0;
+    for (const [name, u] of stageUsages) {
+      if (!u) continue;
+      const stage = buildStage(u);
+      perStage[name] = stage;
+      totalInput += stage.inputTokens ?? 0;
+      totalOutput += stage.outputTokens ?? 0;
+    }
+    const usage: RoundUsage = {
+      inputTokens: totalInput,
+      outputTokens: totalOutput,
+      totalTokens: totalInput + totalOutput,
+      ...(Object.keys(perStage).length > 0 && { perStage }),
+    };
+    const findingEntries = result.findings.map(f => ({
+      fingerprint: fingerprintFinding(f.title, f.file ?? '', f.line || 0),
+      severity: f.severity,
+      ...(f.reviewers[0] && { specialist: f.reviewers[0] }),
+      ...(f.suggestedFix && { suggestedFix: f.suggestedFix.slice(0, 300) }),
+      ...(f.title && { title: f.title.slice(0, 200) }),
+      ...(f.judgeNotes && { judgeNotes: f.judgeNotes.slice(0, 500) }),
+      ...(f.judgeConfidence && { judgeConfidence: f.judgeConfidence }),
+      ...(f.reachability && { reachability: f.reachability }),
+      ...(f.reachabilityReasoning && { reachabilityReasoning: f.reachabilityReasoning.slice(0, 500) }),
+      ...(f.tags && f.tags.length > 0 && { tags: f.tags.filter(t => ALLOWED_FINGERPRINT_TAGS.has(t)) }),
+      ...(f.originalSeverity && { originalSeverity: f.originalSeverity }),
+    }));
+    const context: RoundContext = {
+      meta: {
+        prNumber,
+        commitSha,
+        round,
+        timestamp: new Date().toISOString(),
+        mankiVersion: MANKI_VERSION,
+        cap,
+        trigger,
+      },
+      config: {
+        reviewLevel: team.level === 'trivial' ? 'small' : team.level,
+        memoryEnabled: config.memory?.enabled ?? false,
+        ...(config.review_passes != null && { reviewPasses: config.review_passes }),
+      },
+      diff: {
+        lines: diff.totalAdditions + diff.totalDeletions,
+        additions: diff.totalAdditions,
+        deletions: diff.totalDeletions,
+        filesReviewed: filteredFiles.length,
+        fileTypes,
+        ...(excludedFiles.length > 0 && { excludedFiles: excludedFiles.slice(0, 100) as RoundDiffExcludedFile[] }),
+        ...(diff.binarySkipped && diff.binarySkipped.length > 0 && { binarySkipped: diff.binarySkipped.slice(0, 100) }),
+        oversizedHandled: false,
+        perFile: filteredFiles.slice(0, 200).map((f): RoundDiffPerFile => ({
+          path: f.path,
+          additions: f.additions ?? 0,
+          deletions: f.deletions ?? 0,
+          changeType: f.changeType,
+        })),
+      },
+      models: {
+        ...(plannerClient && { planner: plannerModel }),
+        reviewer: reviewerModel,
+        judge: judgeModel,
+        dedup: dedupModel,
+      },
+      planner: (() => {
+        const source = result.plannerSource ?? (result.plannerResult ? 'planner' : 'disabled');
+        const used = source === 'planner';
+        const base = {
+          source,
+          used,
+          coreAgentInjections: result.coreAgentInjections ?? [],
+          priorRoundEffortDowngrades: result.priorRoundEffortDowngrades ?? [],
+          ...(result.plannerFallbackReason && { fallbackReason: result.plannerFallbackReason }),
+        };
+        if (!result.plannerResult) return base;
+        return {
+          ...base,
+          teamSize: result.plannerResult.teamSize,
+          reviewerEffort: result.plannerResult.reviewerEffort,
+          judgeEffort: result.plannerResult.judgeEffort,
+          prType: result.plannerResult.prType,
+          ...(dashboard.plannerDurationMs != null && { durationMs: dashboard.plannerDurationMs }),
+          ...(result.plannerResult.language && { language: result.plannerResult.language }),
+          ...(result.plannerResult.context && { context: result.plannerResult.context }),
+          ...(result.plannerResult.agents && { agents: result.plannerResult.agents }),
+        };
+      })(),
+      reviewers: {
+        agents: result.agentNames,
+        ...(agentMetrics && { agentMetrics }),
+      },
+      judge: {
+        summary: result.summary,
+        confidenceDistribution,
+        severityChanges,
+        mergedDuplicates,
+        durationMs: judgeEndTime - reviewEndTime,
+        retryCount: result.judgeRetryCount ?? 0,
+        ...(verdictReason && { verdictReason }),
+        ...(defensiveHardeningCount > 0 && { defensiveHardeningCount }),
+        ...(ownProposalDemotedCount > 0 && { ownProposalDemotedCount }),
+        ...(contradictionDemotedCount > 0 && { contradictionDemotedCount }),
+        ...(ratchetSuppressedCount > 0 && { ratchetSuppressedCount }),
+        ...(resolvedThreadSuppressedCount > 0 && { resolvedThreadSuppressedCount }),
+        ...(inPrSuppressedCount > 0 && { inPrSuppressedCount }),
+        ...(crossRoundSuppressed != null && crossRoundSuppressed > 0 && { crossRoundSuppressed }),
+        ...(crossRoundDemoted != null && crossRoundDemoted > 0 && { crossRoundDemoted }),
+        ...(interRoundDiffEmptyOverride && { interRoundDiffEmptyOverride }),
+        ...(result.threadEvaluations && result.threadEvaluations.length > 0 && { threadEvaluations: result.threadEvaluations }),
+        ...(verdictTrace && { verdictTrace }),
+        openThreadsState: recap.openThreadsState,
+        openThreadCount,
+        resolvedThreadIdCount,
+        interRoundDiffState,
+        ...(interRoundDiffBytes != null && { interRoundDiffBytes }),
+        interRoundDiffTruncated,
+        ...(threadResolutionOverrides && { threadResolutionOverrides }),
+      },
+      dedup: {
+        ...(result.staticDedupCount != null && { staticDropped: result.staticDedupCount }),
+        ...(result.llmDedupCount != null && { llmDropped: result.llmDedupCount }),
+        ...(mergedDuplicates > 0 && { sameRoundLlmDropped: mergedDuplicates }),
+        ...(result.duplicateMatches && result.duplicateMatches.length > 0 && { duplicateMatches: result.duplicateMatches.slice(0, 50) }),
+        ...(result.testNitSuppressedCount != null && result.testNitSuppressedCount > 0 && { testNitSuppressedCount: result.testNitSuppressedCount }),
+        ...(result.dedupDurationMs != null && { durationMs: result.dedupDurationMs }),
+      },
+      memory: {
+        ...(memory && memory.patterns.length > 0 && { patternsApplied: memory.patterns.length }),
+        ...(result.suppressionCount != null && result.suppressionCount > 0 && { suppressionsApplied: result.suppressionCount }),
+        ...(escalationsApplied > 0 && { escalationsApplied }),
+        loadStatus: memoryLoadStatus,
+        ...(memoryLoadError && { loadError: memoryLoadError }),
+      },
+      findings: {
+        count: result.findings.length,
+        severityCounts: severityMap,
+        entries: findingEntries,
+      },
+      usage,
+      verdict: result.verdict,
+      recap: _buildRoundRecap(recap),
+    };
+    const flatAliases = roundContextToFlatAliases(context);
 
     // Resolve threads the judge marked `addressed`. Other statuses
     // (`not_addressed`, `uncertain`) are logged for audit but never trigger a
@@ -821,7 +1274,7 @@ async function runFullReview(
     // refactor that bypasses `runJudgeAgent` would lose that guarantee. Drop
     // any `addressed` evaluation here as a second layer. `undefined` is the
     // unknown sentinel (compare-API failure) and must not trigger the guard.
-    const hasPriorRounds = (handover?.rounds.length ?? 0) > 0;
+    const hasPriorRounds = recap.priorRounds.length > 0;
     const interRoundDiffKnownEmpty = hasPriorRounds && isEmptyInterRoundDiff(interRoundDiff);
     if (result.threadEvaluations && result.threadEvaluations.length > 0) {
       const knownThreadIds = new Set(openThreads.map(t => t.threadId));
@@ -845,16 +1298,7 @@ async function runFullReview(
       }
     }
 
-    const reviewResult = { ...result, findings: inlineFindings };
-    const reviewId = await postReview(octokit, owner, repo, prNumber, commitSha, reviewResult, diff, stats);
-
-    if (nitHandling === 'issues' && nitFindings.length > 0) {
-      try {
-        await createNitIssue(octokit, owner, repo, prNumber, nitFindings, commitSha);
-      } catch (error) {
-        core.warning(`Failed to create nit issue: ${error}`);
-      }
-    }
+    const reviewId = await postReview(octokit, owner, repo, prNumber, commitSha, result, diff, context, reviewTimeMs, config);
 
     if (memory && config.memory?.enabled) {
       const memoryToken = getMemoryToken(octokitCache.resolvedToken);
@@ -872,42 +1316,24 @@ async function runFullReview(
           }
         }
         core.info(`Updated ${result.findings.length} patterns in memory repo`);
-
-        try {
-          await appendHandoverRound(
-            memoryOctokit,
-            memoryRepo,
-            repo,
-            prNumber,
-            commitSha,
-            result.findings,
-            recap.previousFindings,
-            result.summary,
-            result.agentNames.filter(n => n !== TRIVIAL_VERIFIER_AGENT.name),
-            fingerprintFinding,
-            classifyAuthorReply,
-            handover,
-          );
-        } catch (error) {
-          core.warning(`Failed to write handover for PR #${prNumber}: ${error}`);
-        }
       }
     }
 
-    if (result.plannerResult) {
-      dashboard.plannerInfo = {
-        teamSize: result.plannerResult.teamSize,
-        reviewerEffort: result.plannerResult.reviewerEffort,
-        judgeEffort: result.plannerResult.judgeEffort,
-        prType: result.plannerResult.prType,
-      };
-    }
     // Reconcile the dashboard with the actual resolved team. On round 2+ the
     // initial dashboard was built without priorRoundAgents (not yet loaded),
     // so the agent list would otherwise show a stale, too-small count. On
     // round 1 without a planner, agents may fail and drop out, so reconcile
     // unconditionally to keep agentCount and agentProgress accurate.
     reconcileDashboardAgents(dashboard, result.agentNames);
+
+    if (result.plannerResult) {
+      dashboard.plannerInfo = {
+        agentCount: result.agentNames.length,
+        reviewerEffort: result.plannerResult.reviewerEffort,
+        judgeEffort: result.plannerResult.judgeEffort,
+        prType: result.plannerResult.prType,
+      };
+    }
 
     const allJudgedForDashboard = result.allJudgedFindings || result.findings;
     const rawForLookup = result.rawFindings ?? allJudgedForDashboard;
@@ -928,15 +1354,21 @@ async function runFullReview(
 
     const keptSeverities: Record<string, number> = {};
     const droppedSeverities: Record<string, number> = {};
-    for (const d of judgeDecisions) {
-      if (d.kept) {
-        keptSeverities[d.severity] = (keptSeverities[d.severity] ?? 0) + 1;
-      } else {
-        droppedSeverities[d.originalSeverity] = (droppedSeverities[d.originalSeverity] ?? 0) + 1;
-      }
+    const keptSet = new Set(result.findings);
+    for (const f of result.findings) {
+      keptSeverities[f.severity] = (keptSeverities[f.severity] ?? 0) + 1;
     }
+    // judgeDecisions is built in lock-step with allJudgedForDashboard, so the
+    // index aligns and d.originalSeverity carries the pre-judge severity even
+    // when the judge merged or renamed the finding before dropping it.
+    allJudgedForDashboard.forEach((f, i) => {
+      if (!keptSet.has(f)) {
+        const sev = judgeDecisions[i].originalSeverity;
+        droppedSeverities[sev] = (droppedSeverities[sev] ?? 0) + 1;
+      }
+    });
 
-    const judgeDroppedCount = judgeDecisions.filter(d => !d.kept).length;
+    const judgeDroppedCount = allJudgedForDashboard.length - keptSet.size;
     const completeDashboard: DashboardData = {
       ...dashboard,
       phase: 'complete',
@@ -944,6 +1376,7 @@ async function runFullReview(
       droppedCount: judgeDroppedCount,
       keptSeverities,
       droppedSeverities,
+      ...(result.testNitSuppressedCount != null && result.testNitSuppressedCount > 0 && { testNitSuppressedCount: result.testNitSuppressedCount }),
       judgeDurationMs: judgeEndTime - reviewEndTime,
     };
 
@@ -963,7 +1396,6 @@ async function runFullReview(
         teamAgents: result.agentNames,
         memoryEnabled: config.memory?.enabled ?? false,
         memoryRepo: config.memory?.repo ?? '',
-        nitHandling,
       },
       judgeDecisions,
       timing,
@@ -972,17 +1404,17 @@ async function runFullReview(
     await updateProgressComment(octokit, owner, repo, progressCommentId, completeDashboard, metadata);
 
     core.setOutput('review_id', reviewId.toString());
-    core.setOutput('verdict', result.verdict);
-    core.setOutput('findings_count', result.findings.length.toString());
+    core.setOutput('verdict', flatAliases.verdict);
+    core.setOutput('findings_count', flatAliases.findingsKept.toString());
     core.setOutput('findings_json', JSON.stringify(result.findings));
 
     // `result.findings` excludes 'ignore' severity (filtered in review.ts), so
-    // the counts here mirror `severityMap` above and the `stats.severity` output.
-    core.setOutput('severity_counts', JSON.stringify(severityMap));
+    // the counts here mirror `severityMap` above and the legacy `severity` alias.
+    core.setOutput('severity_counts', JSON.stringify(flatAliases.severity));
 
-    core.setOutput('judge_model', judgeModel);
+    core.setOutput('judge_model', flatAliases.judgeModel);
 
-    core.info(`Review complete: ${result.verdict} with ${result.findings.length} findings`);
+    core.info(`Review complete: ${result.verdict} with ${flatAliases.findingsKept} findings`);
     core.info(`Severity breakdown: ${severityMap.blocker} blocker, ${severityMap.warning} warning, ${severityMap.suggestion} suggestion, ${severityMap.nitpick} nitpick`);
   } catch (error) {
     if (dashboardFlushTimer) {
@@ -992,11 +1424,13 @@ async function runFullReview(
     const msg = error instanceof Error ? error.message : String(error);
     core.warning(`Review failed: ${msg}`);
 
-    await updateProgressComment(octokit, owner, repo, progressCommentId, {
-      phase: 'complete',
-      lineCount: 0,
-      agentCount: 0,
-    });
+    if (progressCommentId !== undefined) {
+      await updateProgressComment(octokit, owner, repo, progressCommentId, {
+        phase: 'complete',
+        lineCount: 0,
+        agentCount: 0,
+      });
+    }
   }
 }
 
@@ -1033,7 +1467,7 @@ async function handleReviewStateCheck(): Promise<void> {
     return;
   }
 
-  const approved = await checkAndAutoApprove(octokit, owner, repo, prNumber);
+  const approved = await checkAndAutoApprove(octokit, owner, repo, prNumber, config);
   if (approved) {
     core.info(`PR #${prNumber} auto-approved after all findings resolved`);
   }
@@ -1041,8 +1475,13 @@ async function handleReviewStateCheck(): Promise<void> {
 
 
 async function handleInteraction(): Promise<void> {
-  const oauthToken = core.getInput('claude_code_oauth_token');
-  const apiKey = core.getInput('anthropic_api_key');
+  const providerInputs = readProviderInputs();
+
+  if (!hasAnyProviderCredentials(providerInputs)) {
+    core.setFailed('No API key configured — set claude_code_oauth_token, anthropic_api_key, openai_oauth_token, openai_api_key, gemini_oauth_token, or gemini_api_key');
+    return;
+  }
+
   const configPathInput = core.getInput('config_path');
 
   const octokit = await getOctokit();
@@ -1063,17 +1502,14 @@ async function handleInteraction(): Promise<void> {
   }
   const config = loadConfig(configContent ?? undefined);
 
-  const interactionModel = resolveModel(config, 'judge');
-  const claude = new ClaudeClient({
-    oauthToken: oauthToken || undefined,
-    apiKey: apiKey || undefined,
-    model: interactionModel,
-  });
+  const built = buildLLMClientFromInputs({ inputs: providerInputs, model: resolveModel(config, 'judge') });
+  if (!built) return;
+  const { client } = built;
 
   const memoryConfig = config.memory?.enabled ? config.memory : undefined;
   const memoryToken = config.memory?.enabled ? getMemoryToken(octokitCache.resolvedToken) ?? undefined : undefined;
 
-  await handlePRComment(octokit, claude, owner, repo, prNumber, memoryConfig, memoryToken, config);
+  await handlePRComment(octokit, client, owner, repo, prNumber, memoryConfig, memoryToken, config);
 }
 
 async function handleIssueInteraction(): Promise<void> {
@@ -1125,8 +1561,13 @@ async function handleReviewCommentInteraction(): Promise<void> {
     return;
   }
 
-  const oauthToken = core.getInput('claude_code_oauth_token');
-  const apiKey = core.getInput('anthropic_api_key');
+  const providerInputs = readProviderInputs();
+
+  if (!hasAnyProviderCredentials(providerInputs)) {
+    core.setFailed('No API key configured — set claude_code_oauth_token, anthropic_api_key, openai_oauth_token, openai_api_key, gemini_oauth_token, or gemini_api_key');
+    return;
+  }
+
   const configPathInput = core.getInput('config_path');
 
   const octokit = await getOctokit();
@@ -1141,16 +1582,23 @@ async function handleReviewCommentInteraction(): Promise<void> {
   }
   const config = loadConfig(configContent ?? undefined);
 
-  const claude = new ClaudeClient({
-    oauthToken: oauthToken || undefined,
-    apiKey: apiKey || undefined,
-    model: resolveModel(config, 'judge'),
-  });
+  const built = buildLLMClientFromInputs({ inputs: providerInputs, model: resolveModel(config, 'judge') });
+  if (!built) return;
+  const { client } = built;
 
   const memoryConfig = config.memory?.enabled ? config.memory : undefined;
   const memoryToken = config.memory?.enabled ? getMemoryToken(octokitCache.resolvedToken) ?? undefined : undefined;
 
   const command = parseCommand(body);
+  const forceReview = isReviewRequest(body);
+
+  const headSha = payload.pull_request?.head?.sha;
+  const prNumberForGuard = payload.pull_request?.number;
+  if (!forceReview && headSha && prNumberForGuard && await hasBotReviewOnCommit(octokit, owner, repo, prNumberForGuard, headSha)) {
+    core.info(`Bot already reviewed commit ${headSha.slice(0, 7)} — skipping serialized sibling run`);
+    await postReviewSkippedComment(octokit, owner, repo, prNumberForGuard, headSha, 'already_reviewed');
+    return;
+  }
   if (command.type !== 'generic') {
     const prNumber = payload.pull_request?.number;
     if (prNumber) {
@@ -1164,13 +1612,13 @@ async function handleReviewCommentInteraction(): Promise<void> {
       core.warning('Cannot handle reply — pull request number not available');
       return;
     }
-    await handleReviewCommentReply(octokit, claude, owner, repo, prNumber, memoryConfig, memoryToken);
+    await handleReviewCommentReply(octokit, client, owner, repo, prNumber, memoryConfig, memoryToken);
   }
 
   // Check if all review threads are now resolved (e.g. the reply resolved the last conversation)
   const prNum = payload.pull_request?.number;
   if (prNum && config.auto_approve) {
-    const approved = await checkAndAutoApprove(octokit, owner, repo, prNum);
+    const approved = await checkAndAutoApprove(octokit, owner, repo, prNum, config);
     if (approved) {
       core.info(`PR #${prNum} auto-approved after all findings resolved`);
     }
@@ -1247,4 +1695,4 @@ function _resetOctokitCache(): void {
   octokitCache.identity = null;
 }
 
-export { run, handlePullRequest, handleCommentTrigger, handleInteraction, handleIssueInteraction, handleReviewCommentInteraction, handleReviewStateCheck, runFullReview, main, _resetOctokitCache };
+export { run, handlePullRequest, handleCommentTrigger, handleInteraction, handleIssueInteraction, handleReviewCommentInteraction, handleReviewStateCheck, runFullReview, main, _resetOctokitCache, _buildRoundRecap };

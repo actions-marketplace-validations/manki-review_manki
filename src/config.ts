@@ -2,7 +2,10 @@ import * as core from '@actions/core';
 import * as fs from 'fs';
 import { parse as parseYaml } from 'yaml';
 
-import { ReviewConfig } from './types';
+import { buildAgentPool } from './agents';
+import { ReviewerAgent, ReviewConfig } from './types';
+
+export const MAX_LOCK_TTL_SECONDS = 3600;
 
 export const DEFAULT_CONFIG: ReviewConfig = {
   auto_review: true,
@@ -26,13 +29,17 @@ export const DEFAULT_CONFIG: ReviewConfig = {
     enabled: false,
     repo: '',
   },
-  nit_handling: 'issues',
+  noise_level: 'low',
   review_passes: 1,
   convergence: {
     max_auto_rounds: 5,
     test_path_patterns: ['**/*.test.*', '**/*.spec.*', '**/tests/**', '**/__tests__/**'],
     suppress_resolved_threads: true,
   },
+  stats: {
+    hidden: false,
+  },
+  concurrency_lock_ttl_seconds: 600,
 };
 
 const KNOWN_KEYS = new Set([
@@ -48,8 +55,11 @@ const KNOWN_KEYS = new Set([
   'models',
   'planner',
   'nit_handling',
+  'noise_level',
   'review_passes',
   'convergence',
+  'stats',
+  'concurrency_lock_ttl_seconds',
 ]);
 
 const REPO_FORMAT = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
@@ -63,6 +73,20 @@ interface ConfigValidationResult {
 function validateConfig(config: Record<string, unknown>): ConfigValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
+
+  const customReviewers = Array.isArray(config.reviewers)
+    ? (config.reviewers as Array<Record<string, unknown>>)
+        .filter(r => r && typeof r === 'object' && typeof r.name === 'string' && typeof r.focus === 'string')
+        .map(r => ({ name: r.name as string, focus: r.focus as string }))
+    : [];
+  const knownAgentNames = new Set(buildAgentPool(customReviewers as ReviewerAgent[]).map(a => a.name));
+  const declaredReviewerNames = new Set(
+    Array.isArray(config.reviewers)
+      ? (config.reviewers as Array<Record<string, unknown>>)
+          .filter(r => r && typeof r === 'object' && typeof r.name === 'string' && (r.name as string).length > 0)
+          .map(r => r.name as string)
+      : [],
+  );
 
   for (const key of Object.keys(config)) {
     if (!KNOWN_KEYS.has(key)) {
@@ -91,6 +115,12 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
   if ('exclude_paths' in config) {
     if (!Array.isArray(config.exclude_paths)) {
       errors.push('`exclude_paths` must be an array of strings');
+    } else {
+      for (let i = 0; i < config.exclude_paths.length; i++) {
+        if (typeof config.exclude_paths[i] !== 'string') {
+          errors.push(`\`exclude_paths[${i}]\` must be a string, got ${typeof config.exclude_paths[i]}`);
+        }
+      }
     }
   }
 
@@ -158,6 +188,27 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
       if ('dedup' in models && typeof models.dedup !== 'string') {
         errors.push('`models.dedup` must be a string');
       }
+      if ('agents' in models) {
+        const agents = models.agents as Record<string, unknown>;
+        if (!agents || typeof agents !== 'object' || Array.isArray(agents)) {
+          errors.push('`models.agents` must be an object mapping agent names to model strings');
+        } else {
+          for (const [agentName, modelValue] of Object.entries(agents)) {
+            if (typeof modelValue !== 'string' || modelValue === '') {
+              errors.push(`\`models.agents.${agentName}\` must be a non-empty string`);
+              continue;
+            }
+            if (!knownAgentNames.has(agentName)) {
+              if (declaredReviewerNames.has(agentName)) {
+                errors.push(`Agent "${agentName}" in \`models.agents\` matches a reviewer declared under \`reviewers:\` but that entry is invalid. Check its \`name\` and \`focus\` fields.`);
+              } else {
+                const known = Array.from(knownAgentNames).map(n => `"${n}"`).join(', ');
+                errors.push(`Unknown agent name "${agentName}" in \`models.agents\`. Known agents: ${known}`);
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -173,8 +224,17 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
   }
 
   if ('nit_handling' in config) {
-    if (config.nit_handling !== 'issues' && config.nit_handling !== 'comments') {
-      errors.push('`nit_handling` must be "issues" or "comments"');
+    if (config.nit_handling === 'issues' || config.nit_handling === 'comments') {
+      warnings.push("`nit_handling: '" + config.nit_handling + "'` is deprecated and ignored, surviving nit findings now post inline. See https://github.com/manki-review/manki/issues/738 for context.");
+    } else {
+      warnings.push(`\`nit_handling: '${String(config.nit_handling)}'\` is not a recognized value. Remove it from your config.`);
+    }
+  }
+
+  if ('noise_level' in config) {
+    const valid = new Set(['low', 'medium', 'high']);
+    if (typeof config.noise_level !== 'string' || !valid.has(config.noise_level)) {
+      errors.push('`noise_level` must be one of: low, medium, high');
     }
   }
 
@@ -215,6 +275,28 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     }
   }
 
+  if ('stats' in config) {
+    const stats = config.stats as Record<string, unknown>;
+    if (!stats || typeof stats !== 'object' || Array.isArray(stats)) {
+      errors.push('`stats` must be an object');
+    } else {
+      if ('hidden' in stats && typeof stats.hidden !== 'boolean') {
+        errors.push('`stats.hidden` must be a boolean');
+      }
+    }
+  }
+
+  if ('concurrency_lock_ttl_seconds' in config) {
+    if (
+      typeof config.concurrency_lock_ttl_seconds !== 'number' ||
+      !Number.isFinite(config.concurrency_lock_ttl_seconds) ||
+      config.concurrency_lock_ttl_seconds < 0 ||
+      config.concurrency_lock_ttl_seconds > MAX_LOCK_TTL_SECONDS
+    ) {
+      errors.push(`\`concurrency_lock_ttl_seconds\` must be a non-negative number ≤ ${MAX_LOCK_TTL_SECONDS}`);
+    }
+  }
+
   if ('memory' in config) {
     const memory = config.memory as Record<string, unknown>;
     if (!memory || typeof memory !== 'object' || Array.isArray(memory)) {
@@ -245,13 +327,29 @@ function deepMerge(defaults: ReviewConfig, overrides: Record<string, unknown>): 
     if (key === 'memory' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.memory = { ...defaults.memory, ...(value as Record<string, unknown>) } as ReviewConfig['memory'];
     } else if (key === 'models' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      result.models = { ...defaults.models, ...(value as Record<string, unknown>) } as ReviewConfig['models'];
+      const incoming = value as Record<string, unknown>;
+      const incomingAgents = incoming.agents as Record<string, string> | undefined;
+      const existingAgents = defaults.models?.agents;
+      const merged = { ...defaults.models, ...incoming } as ReviewConfig['models'];
+      if (merged) {
+        merged.agents = (existingAgents || incomingAgents)
+          ? { ...(existingAgents ?? {}), ...(incomingAgents ?? {}) }
+          : undefined;
+      }
+      result.models = merged;
     } else if (key === 'planner' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.planner = { ...defaults.planner, ...(value as Record<string, unknown>) } as ReviewConfig['planner'];
     } else if (key === 'review_thresholds' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.review_thresholds = { ...defaults.review_thresholds, ...(value as Record<string, unknown>) } as ReviewConfig['review_thresholds'];
     } else if (key === 'convergence' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.convergence = { ...defaults.convergence, ...(value as Record<string, unknown>) } as ReviewConfig['convergence'];
+    } else if (key === 'stats' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      result.stats = { ...defaults.stats, ...(value as Record<string, unknown>) } as ReviewConfig['stats'];
+    } else if (key === 'exclude_paths' && Array.isArray(value)) {
+      // Union with defaults so users adding a single pattern don't lose
+      // built-in skips (`*.lock`, `dist/**`, `*.generated.*`).
+      const userPatterns = value.filter((p): p is string => typeof p === 'string');
+      result.exclude_paths = Array.from(new Set([...defaults.exclude_paths, ...userPatterns]));
     } else {
       (result as Record<string, unknown>)[key] = value;
     }
@@ -308,12 +406,34 @@ export function loadConfigFromFile(filePath: string): ReviewConfig {
     return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
   }
 
-  const content = fs.readFileSync(filePath, 'utf-8');
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    core.warning(`Failed to read config file at ${filePath}: ${msg}. Using defaults.`);
+    return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
+  }
+
   return loadConfigFromContent(content);
 }
 
 export function resolveModel(config: ReviewConfig, stage: 'planner' | 'reviewer' | 'judge' | 'dedup'): string {
   return config.models?.[stage] || DEFAULT_CONFIG.models![stage]!;
+}
+
+/**
+ * Resolves the model for a specific reviewer agent. Resolution order:
+ * `models.agents[agentName]` → `models[stage]` → built-in default for `stage`.
+ */
+export function resolveAgentModel(
+  config: ReviewConfig,
+  agentName: string,
+  stage: 'planner' | 'reviewer' | 'judge' | 'dedup',
+): string {
+  const override = config.models?.agents?.[agentName];
+  if (override) return override;
+  return resolveModel(config, stage);
 }
 
 export function loadConfig(yamlContent: string | undefined): ReviewConfig {
@@ -323,4 +443,13 @@ export function loadConfig(yamlContent: string | undefined): ReviewConfig {
   }
 
   return loadConfigFromContent(yamlContent);
+}
+
+export function sanitizeForkConfig(config: ReviewConfig): ReviewConfig {
+  return {
+    ...config,
+    instructions: DEFAULT_CONFIG.instructions,
+    reviewers: [...DEFAULT_CONFIG.reviewers],
+    memory: { ...config.memory, repo: DEFAULT_CONFIG.memory.repo },
+  };
 }

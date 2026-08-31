@@ -2,7 +2,7 @@ name: Manki
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
   pull_request_review:
     types: [submitted, dismissed]
   issue_comment:
@@ -23,14 +23,14 @@ jobs:
     # Bot login defined in src/github.ts as BOT_LOGIN — keep in sync
     if: github.actor != 'manki-review[bot]'
     concurrency:
-      group: manki-${{ github.event_name }}-${{ github.event.comment.id || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      group: manki-${{ (github.event_name == 'issue_comment' && github.event.comment.id) || format('pr-{0}', github.event.pull_request.number || github.event.issue.number) }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
       - run: npm ci
       - run: npm run build
@@ -39,9 +39,25 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      - name: Install Codex CLI
+        if: env.OPENAI_OAUTH_TOKEN != ''
+        # Pin and `--ignore-scripts` mirror the runtime fallback in `src/providers/openai.ts`.
+        # If you update `CODEX_CLI_VERSION` in `src/providers/openai.ts`, update the version here too.
+        run: npm install -g --ignore-scripts '@openai/codex@0.129.0'
+        env:
+          OPENAI_OAUTH_TOKEN: ${{ secrets.OPENAI_OAUTH_TOKEN }}
+      - name: Install Gemini CLI
+        if: env.GEMINI_OAUTH_TOKEN != ''
+        run: npm install -g @google/gemini-cli
+        env:
+          GEMINI_OAUTH_TOKEN: ${{ secrets.GEMINI_OAUTH_TOKEN }}
       - name: Manki Review
         uses: ./  # Use local action for self-testing
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          openai_oauth_token: ${{ secrets.OPENAI_OAUTH_TOKEN }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          gemini_oauth_token: ${{ secrets.GEMINI_OAUTH_TOKEN }}
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           memory_repo_token: ${{ secrets.REVIEW_MEMORY_TOKEN }}

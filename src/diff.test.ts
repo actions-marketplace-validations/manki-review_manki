@@ -1,6 +1,7 @@
 import {
   parsePRDiff,
   filterFiles,
+  filterFilesWithAttribution,
   isLineInDiff,
   findClosestDiffLine,
   isDiffTooLarge,
@@ -163,6 +164,16 @@ describe('parsePRDiff', () => {
     expect(result.totalDeletions).toBe(0);
   });
 
+  it('records binary-skipped paths for attribution', () => {
+    const result = parsePRDiff(BINARY_FILE_DIFF);
+    expect(result.binarySkipped).toEqual(['assets/logo.png']);
+  });
+
+  it('returns an empty `binarySkipped` array when no binaries are present', () => {
+    const result = parsePRDiff(SIMPLE_DIFF);
+    expect(result.binarySkipped).toEqual([]);
+  });
+
   it('returns empty result for empty diff', () => {
     const result = parsePRDiff('');
 
@@ -259,6 +270,37 @@ describe('filterFiles', () => {
   });
 });
 
+describe('filterFilesWithAttribution', () => {
+  const files: DiffFile[] = [
+    { path: 'src/main.ts', changeType: 'modified', hunks: [] },
+    { path: 'dist/index.js', changeType: 'modified', hunks: [] },
+    { path: 'tests/main.test.ts', changeType: 'modified', hunks: [] },
+    { path: 'package.json', changeType: 'modified', hunks: [] },
+  ];
+
+  it('records the matched pattern for each excluded file', () => {
+    const result = filterFilesWithAttribution(files, ['dist/**', 'tests/**']);
+    expect(result.included.map(f => f.path)).toEqual(['src/main.ts', 'package.json']);
+    expect(result.excluded).toEqual([
+      { path: 'dist/index.js', matchedPattern: 'dist/**' },
+      { path: 'tests/main.test.ts', matchedPattern: 'tests/**' },
+    ]);
+  });
+
+  it('records the FIRST matching pattern when multiple patterns would match the same path', () => {
+    const result = filterFilesWithAttribution(files, ['*.js', 'dist/**']);
+    expect(result.excluded).toEqual([
+      { path: 'dist/index.js', matchedPattern: '*.js' },
+    ]);
+  });
+
+  it('returns empty `excluded` and the full `included` list when no patterns match', () => {
+    const result = filterFilesWithAttribution(files, ['nothing/**']);
+    expect(result.included).toHaveLength(files.length);
+    expect(result.excluded).toEqual([]);
+  });
+});
+
 describe('isLineInDiff', () => {
   const file: DiffFile = {
     path: 'src/utils.ts',
@@ -334,23 +376,83 @@ describe('findClosestDiffLine', () => {
 });
 
 describe('isDiffTooLarge', () => {
+  const makeFile = (path: string, additions: number, deletions: number): DiffFile => ({
+    path,
+    changeType: 'modified',
+    hunks: [],
+    additions,
+    deletions,
+  });
+
   it('returns false when diff is within limit', () => {
-    const diff = { files: [], totalAdditions: 100, totalDeletions: 50 };
+    const diff = {
+      files: [makeFile('src/main.ts', 100, 50)],
+      totalAdditions: 100,
+      totalDeletions: 50,
+    };
     expect(isDiffTooLarge(diff, 200)).toBe(false);
   });
 
   it('returns true when diff exceeds limit', () => {
-    const diff = { files: [], totalAdditions: 500, totalDeletions: 600 };
+    const diff = {
+      files: [makeFile('src/main.ts', 500, 600)],
+      totalAdditions: 500,
+      totalDeletions: 600,
+    };
     expect(isDiffTooLarge(diff, 1000)).toBe(true);
   });
 
   it('returns false when diff exactly equals limit', () => {
-    const diff = { files: [], totalAdditions: 50, totalDeletions: 50 };
+    const diff = {
+      files: [makeFile('src/main.ts', 50, 50)],
+      totalAdditions: 50,
+      totalDeletions: 50,
+    };
     expect(isDiffTooLarge(diff, 100)).toBe(false);
   });
 
   it('returns true for empty max', () => {
-    const diff = { files: [], totalAdditions: 1, totalDeletions: 0 };
+    const diff = {
+      files: [makeFile('src/main.ts', 1, 0)],
+      totalAdditions: 1,
+      totalDeletions: 0,
+    };
     expect(isDiffTooLarge(diff, 0)).toBe(true);
+  });
+
+  it('excludes files matching exclude_paths before counting', () => {
+    const diff = {
+      files: [
+        makeFile('dist/index.js', 80000, 0),
+        makeFile('src/main.ts', 50, 0),
+      ],
+      totalAdditions: 80050,
+      totalDeletions: 0,
+    };
+    expect(isDiffTooLarge(diff, 5000, ['dist/**'])).toBe(false);
+  });
+
+  it('triggers when included files alone exceed the limit', () => {
+    const diff = {
+      files: [
+        makeFile('dist/index.js', 80000, 0),
+        makeFile('src/main.ts', 6000, 0),
+      ],
+      totalAdditions: 86000,
+      totalDeletions: 0,
+    };
+    expect(isDiffTooLarge(diff, 5000, ['dist/**'])).toBe(true);
+  });
+
+  it('counts every file when no exclude pattern matches', () => {
+    const diff = {
+      files: [
+        makeFile('build/output.js', 80000, 0),
+        makeFile('src/main.ts', 50, 0),
+      ],
+      totalAdditions: 80050,
+      totalDeletions: 0,
+    };
+    expect(isDiffTooLarge(diff, 5000, ['dist/**'])).toBe(true);
   });
 });

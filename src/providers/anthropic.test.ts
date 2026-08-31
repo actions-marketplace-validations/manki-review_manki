@@ -1,7 +1,8 @@
 import { spawn } from 'child_process';
 import Anthropic from '@anthropic-ai/sdk';
+import * as core from '@actions/core';
 
-import { ClaudeClient, resetCLIInstallPromise, sanitizeLogOutput, STALE_TIMEOUT_MS } from './claude';
+import { AnthropicClient, buildAnthropicAuth, extractAnthropicCLIUsage, resetCLIInstallPromise, sanitizeLogOutput, STALE_TIMEOUT_MS } from './anthropic';
 
 jest.mock('child_process', () => ({
   execFile: jest.fn(),
@@ -25,29 +26,14 @@ _execMock.fn = mockExecFileAsync;
 
 const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
 
-describe('ClaudeClient', () => {
-  it('throws without either token', () => {
-    expect(() => new ClaudeClient({ model: 'claude-opus-4-6' })).toThrow(
-      'Either claude_code_oauth_token or anthropic_api_key must be provided'
-    );
-  });
-
-  it('accepts oauthToken only', () => {
-    const client = new ClaudeClient({ oauthToken: 'test-token', model: 'claude-opus-4-6' });
+describe('AnthropicClient', () => {
+  it('accepts oauth auth', () => {
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'test-token' }, model: 'claude-opus-4-6' });
     expect(client).toBeDefined();
   });
 
-  it('accepts apiKey only', () => {
-    const client = new ClaudeClient({ apiKey: 'sk-test-key', model: 'claude-opus-4-6' });
-    expect(client).toBeDefined();
-  });
-
-  it('accepts both oauthToken and apiKey', () => {
-    const client = new ClaudeClient({
-      oauthToken: 'test-token',
-      apiKey: 'sk-test-key',
-      model: 'claude-opus-4-6',
-    });
+  it('accepts apiKey auth', () => {
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-test-key' }, model: 'claude-opus-4-6' });
     expect(client).toBeDefined();
   });
 
@@ -101,7 +87,7 @@ describe('sendMessage effort option (CLI path)', () => {
 
   it('includes --effort flag when effort option is set', async () => {
     setupSpawnMock('response text');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', { effort: 'high' });
 
@@ -112,7 +98,7 @@ describe('sendMessage effort option (CLI path)', () => {
 
   it('omits --effort flag when no options provided', async () => {
     setupSpawnMock('response text');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user');
 
@@ -122,7 +108,7 @@ describe('sendMessage effort option (CLI path)', () => {
 
   it('omits --effort flag when effort is undefined', async () => {
     setupSpawnMock('response text');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', {});
 
@@ -144,7 +130,7 @@ describe('sendMessage effort option (API path)', () => {
   });
 
   it('includes thinking param when effort is high', async () => {
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', { effort: 'high' });
 
@@ -154,7 +140,7 @@ describe('sendMessage effort option (API path)', () => {
   });
 
   it('includes thinking param when effort is max', async () => {
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', { effort: 'max' });
 
@@ -164,7 +150,7 @@ describe('sendMessage effort option (API path)', () => {
   });
 
   it('includes thinking param when effort is medium', async () => {
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', { effort: 'medium' });
 
@@ -174,7 +160,7 @@ describe('sendMessage effort option (API path)', () => {
   });
 
   it('omits thinking param when effort is low', async () => {
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user', { effort: 'low' });
 
@@ -184,7 +170,7 @@ describe('sendMessage effort option (API path)', () => {
   });
 
   it('omits thinking param when no options provided', async () => {
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('system', 'user');
 
@@ -202,7 +188,7 @@ describe('sendMessage effort option (API path)', () => {
       ],
     });
 
-    const client = new ClaudeClient({ apiKey: 'sk-key', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
     const result = await client.sendMessage('system', 'user');
 
     expect(result.content).toBe('first\nsecond');
@@ -210,10 +196,10 @@ describe('sendMessage effort option (API path)', () => {
 
   it('throws when Anthropic client is not initialized', async () => {
     // Create with oauthToken only — no Anthropic client
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     // Access private sendViaAPI directly via prototype
-    const sendViaAPI = (ClaudeClient.prototype as unknown as Record<string, unknown>)['sendViaAPI'] as (
+    const sendViaAPI = (AnthropicClient.prototype as unknown as Record<string, unknown>)['sendViaAPI'] as (
       systemPrompt: string,
       userMessage: string,
     ) => Promise<unknown>;
@@ -268,23 +254,72 @@ describe('sendViaOAuth — error paths', () => {
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
   }
 
-  it('rejects on non-zero exit code', async () => {
+  it('rejects on non-zero exit code with rich diagnostics', async () => {
     setupSpawnMock({ exitCode: 1, stderr: 'something went wrong' });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
-    await expect(client.sendMessage('sys', 'user')).rejects.toThrow('Claude CLI invocation failed');
+    await expect(client.sendMessage('sys', 'user', { effort: 'high' })).rejects.toThrow(
+      /Claude CLI invocation failed.*model=claude-opus-4-6.*effort=high.*promptChars=\d+.*elapsedMs=\d+.*stderrChars=\d+/s,
+    );
+  });
+
+  it('surfaces stdout tail, <empty stderr>, and parsed result event when exit-1 has no stderr', async () => {
+    const streamWithResultError = [
+      JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial thinking emitted right before exit' } }),
+      JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Maximum tokens exceeded' }),
+      '',
+    ].join('\n');
+    setupSpawnMock({
+      exitCode: 1,
+      stderr: '',
+      stdout: streamWithResultError,
+      rawStdout: true,
+    });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    await expect(client.sendMessage('sys', 'user')).rejects.toThrow(/Claude CLI invocation failed/);
+    const allWarnings = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(allWarnings).toContain('Claude CLI failed');
+    expect(allWarnings).toContain('<empty stderr>');
+    expect(allWarnings).toContain('stderrChars=0');
+    expect(allWarnings).toContain('is_error=true');
+    expect(allWarnings).toContain('subtype=error_during_execution');
+    expect(allWarnings).toContain('Maximum tokens exceeded');
+    warnSpy.mockRestore();
+  });
+
+  it('records <no result event> when exit-1 stream emits only text deltas with no terminal result', async () => {
+    const streamWithoutResult = [
+      JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'streamed text but no terminal event' } }),
+      '',
+    ].join('\n');
+    setupSpawnMock({
+      exitCode: 1,
+      stderr: '',
+      stdout: streamWithoutResult,
+      rawStdout: true,
+    });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    await expect(client.sendMessage('sys', 'user')).rejects.toThrow(/Claude CLI invocation failed/);
+    const allWarnings = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(allWarnings).toContain('<no result event>');
+    expect(allWarnings).not.toContain('is_error=');
+    warnSpy.mockRestore();
   });
 
   it('rejects on spawn error', async () => {
     setupSpawnMock({ error: new Error('ENOENT') });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.sendMessage('sys', 'user')).rejects.toThrow('Claude CLI spawn failed: ENOENT');
   });
 
   it('returns trimmed content on success', async () => {
     setupSpawnMock({ stdout: '  hello world  \n' });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('hello world');
@@ -292,7 +327,7 @@ describe('sendViaOAuth — error paths', () => {
 
   it('sets CLAUDE_CODE_OAUTH_TOKEN in spawn env', async () => {
     setupSpawnMock({ stdout: 'ok' });
-    const client = new ClaudeClient({ oauthToken: 'my-oauth-token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'my-oauth-token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('sys', 'user');
 
@@ -300,20 +335,9 @@ describe('sendViaOAuth — error paths', () => {
     expect(spawnOpts.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('my-oauth-token');
   });
 
-  it('sets CLAUDE_CODE_OAUTH_TOKEN env var when oauthToken is provided', async () => {
-    setupSpawnMock({ stdout: 'ok' });
-    // Both tokens provided — oauthToken takes precedence
-    const client = new ClaudeClient({ oauthToken: 'tok', apiKey: 'sk-key', model: 'claude-opus-4-6' });
-
-    await client.sendMessage('sys', 'user');
-
-    const spawnOpts = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
-    expect(spawnOpts.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok');
-  });
-
   it('passes --verbose, --output-format stream-json, and --include-partial-messages to CLI', async () => {
     setupSpawnMock({ stdout: 'ok' });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('sys', 'user');
 
@@ -334,7 +358,7 @@ describe('sendViaOAuth — error paths', () => {
       '',
     ].join('\n');
     setupSpawnMock({ stdout: streamOutput, rawStdout: true });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('hello world');
@@ -347,7 +371,7 @@ describe('sendViaOAuth — error paths', () => {
       '',
     ].join('\n');
     setupSpawnMock({ stdout: streamOutput, rawStdout: true });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('final answer');
@@ -355,7 +379,7 @@ describe('sendViaOAuth — error paths', () => {
 
   it('silently skips non-JSON lines (e.g. verbose debug output)', async () => {
     setupSpawnMock({ stdout: 'plain text fallback\n', rawStdout: true });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('');
@@ -363,7 +387,7 @@ describe('sendViaOAuth — error paths', () => {
 
   it('includes exit signal in error message when present', async () => {
     setupSpawnMock({ exitCode: 1, signal: 'SIGTERM', stderr: 'killed' });
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.sendMessage('sys', 'user')).rejects.toThrow('signal SIGTERM');
   });
@@ -402,7 +426,7 @@ describe('sendViaOAuth — error paths', () => {
     });
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('drain response');
@@ -435,7 +459,7 @@ describe('sendViaOAuth — error paths', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -489,7 +513,7 @@ describe('sendViaOAuth — error paths', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -529,7 +553,7 @@ describe('sendViaOAuth — error paths', () => {
     proc.on.mockImplementation(() => {});
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.sendMessage('sys', 'user')).rejects.toThrow('stdin write failed: write EPIPE');
   });
@@ -555,7 +579,7 @@ describe('sendViaOAuth — error paths', () => {
     });
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const promise = client.sendMessage('sys', 'user');
 
@@ -595,7 +619,7 @@ describe('sendViaOAuth — error paths', () => {
     });
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const promise = client.sendMessage('sys', 'user');
 
@@ -640,7 +664,7 @@ describe('sendViaOAuth — error paths', () => {
     });
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const promise = client.sendMessage('sys', 'user');
     await new Promise((r) => setTimeout(r, 0));
@@ -695,7 +719,7 @@ describe('sendViaOAuth — error paths', () => {
     });
 
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const promise = client.sendMessage('sys', 'user');
 
@@ -749,7 +773,7 @@ describe('ensureCLI — install path', () => {
       .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude\n' }); // which after install
 
     setupSpawnForSuccess('installed ok');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('installed ok');
@@ -762,7 +786,7 @@ describe('ensureCLI — install path', () => {
       .mockRejectedValueOnce(new Error('still not found')); // which after install
 
     setupSpawnForSuccess('should not reach');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.sendMessage('sys', 'user')).rejects.toThrow('Failed to install Claude CLI');
   });
@@ -770,7 +794,7 @@ describe('ensureCLI — install path', () => {
   it('reuses cached CLI path on second call', async () => {
     mockExecFileAsync.mockResolvedValue({ stdout: '/usr/bin/claude\n' });
     setupSpawnForSuccess('response');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.sendMessage('sys', 'first');
     await client.sendMessage('sys', 'second');
@@ -788,7 +812,7 @@ describe('ensureCLI — install path', () => {
       .mockRejectedValueOnce(new Error('still not found')); // which after install
 
     setupSpawnForSuccess('should not reach');
-    const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.sendMessage('sys', 'first')).rejects.toThrow('Failed to install Claude CLI');
 
@@ -796,9 +820,59 @@ describe('ensureCLI — install path', () => {
     mockExecFileAsync.mockResolvedValue({ stdout: '/usr/local/bin/claude\n' });
 
     // Need a fresh client since cachedCLIPath is instance-level
-    const client2 = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+    const client2 = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
     const result = await client2.sendMessage('sys', 'retry');
     expect(result.content).toBe('should not reach');
+  });
+});
+
+describe('warmupCLI', () => {
+  beforeEach(() => {
+    mockSpawn.mockReset();
+    mockExecFileAsync.mockReset();
+    resetCLIInstallPromise();
+  });
+
+  it('invokes ensureCLI once for OAuth auth', async () => {
+    mockExecFileAsync.mockResolvedValue({ stdout: '/usr/bin/claude\n' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    await client.warmupCLI();
+    await client.warmupCLI();
+
+    // First call hits `which`; second call hits the cached path.
+    expect(mockExecFileAsync).toHaveBeenCalledTimes(1);
+    expect(mockExecFileAsync).toHaveBeenCalledWith('which', ['claude']);
+  });
+
+  it('triggers npm install when CLI is missing', async () => {
+    mockExecFileAsync
+      .mockRejectedValueOnce(new Error('not found'))
+      .mockResolvedValueOnce({ stdout: '' })
+      .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude\n' });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    await client.warmupCLI();
+
+    expect(mockExecFileAsync).toHaveBeenNthCalledWith(2, 'npm', ['install', '-g', '@anthropic-ai/claude-code'], expect.any(Object));
+  });
+
+  it('is a no-op for API-key auth', async () => {
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-test' }, model: 'claude-opus-4-6' });
+
+    await client.warmupCLI();
+
+    expect(mockExecFileAsync).not.toHaveBeenCalled();
+  });
+
+  it('propagates ensureCLI errors when install fails', async () => {
+    mockExecFileAsync
+      .mockRejectedValueOnce(new Error('not found'))
+      .mockResolvedValueOnce({ stdout: '' })
+      .mockRejectedValueOnce(new Error('still not found'));
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    await expect(client.warmupCLI()).rejects.toThrow('Failed to install Claude CLI');
   });
 });
 
@@ -830,7 +904,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -875,7 +949,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -924,7 +998,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -967,7 +1041,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -1010,7 +1084,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -1058,7 +1132,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -1106,7 +1180,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -1154,7 +1228,7 @@ describe('sendViaOAuth — stale process detection', () => {
       });
 
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
-      const client = new ClaudeClient({ oauthToken: 'token', model: 'claude-opus-4-6' });
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
       const promise = client.sendMessage('sys', 'user');
 
@@ -1227,5 +1301,84 @@ describe('sanitizeLogOutput', () => {
   it('strips command with complex parameter values containing colons', () => {
     expect(sanitizeLogOutput('prefix ::warning file=a:b::msg:with:colons'))
       .toBe('prefix [redacted-workflow-cmd]');
+  });
+});
+
+describe('buildAnthropicAuth', () => {
+  it('throws when neither token is present', () => {
+    expect(() => buildAnthropicAuth('', '')).toThrow(
+      'Either claude_code_oauth_token or anthropic_api_key must be provided',
+    );
+  });
+
+  it('returns oauth kind when only oauth token is present', () => {
+    expect(buildAnthropicAuth('oauth-tok', '')).toEqual({ kind: 'oauth', token: 'oauth-tok' });
+  });
+
+  it('returns apiKey kind when only api key is present', () => {
+    expect(buildAnthropicAuth('', 'sk-key')).toEqual({ kind: 'apiKey', key: 'sk-key' });
+  });
+
+  it('oauth wins when both tokens are present', () => {
+    expect(buildAnthropicAuth('oauth-tok', 'sk-key')).toEqual({ kind: 'oauth', token: 'oauth-tok' });
+  });
+});
+
+describe('extractAnthropicCLIUsage', () => {
+  it('lifts standard usage fields from a result event', () => {
+    expect(
+      extractAnthropicCLIUsage({
+        type: 'result',
+        usage: {
+          input_tokens: 1234,
+          output_tokens: 56,
+          cache_read_input_tokens: 999,
+        },
+      }),
+    ).toEqual({ inputTokens: 1234, outputTokens: 56, cachedTokens: 999, reasoningTokens: 0 });
+  });
+
+  it('coerces string-valued counters to integers', () => {
+    expect(
+      extractAnthropicCLIUsage({ usage: { input_tokens: '7', output_tokens: '13' } }),
+    ).toEqual({ inputTokens: 7, outputTokens: 13, cachedTokens: 0, reasoningTokens: 0 });
+  });
+
+  it('returns ZERO_USAGE when the event is missing or malformed', () => {
+    const zero = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 };
+    expect(extractAnthropicCLIUsage(null)).toEqual(zero);
+    expect(extractAnthropicCLIUsage({})).toEqual(zero);
+    expect(extractAnthropicCLIUsage({ usage: null })).toEqual(zero);
+    expect(extractAnthropicCLIUsage({ usage: { input_tokens: -5 } })).toEqual(zero);
+  });
+});
+
+describe('AnthropicClient API-path usage', () => {
+  let mockCreate: jest.Mock;
+
+  beforeEach(() => {
+    mockCreate = jest.fn();
+    (Anthropic as unknown as jest.Mock).mockImplementation(() => ({
+      messages: { create: mockCreate },
+    }));
+  });
+
+  it('lifts usage and measures latency on the SDK path', async () => {
+    mockCreate.mockResolvedValue({
+      content: [{ type: 'text', text: 'response' }],
+      usage: { input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 10 },
+    });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 25, cachedTokens: 10, reasoningTokens: 0 });
+    expect(typeof result.latencyMs).toBe('number');
+    expect(result.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('returns zero usage when the SDK omits the usage block', async () => {
+    mockCreate.mockResolvedValue({ content: [{ type: 'text', text: 'response' }] });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 });
   });
 });

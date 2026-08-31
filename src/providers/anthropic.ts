@@ -5,41 +5,60 @@ import { promisify } from 'util';
 import Anthropic from '@anthropic-ai/sdk';
 import * as core from '@actions/core';
 
+import { sanitizeLogOutput, STALE_TIMEOUT_MS, buildTimeoutDiagnostics, buildExitDiagnostics } from './cli-utils';
+import { AnthropicAuth, LLMClient, LLMResponse, LLMUsage, readCount, SendMessageOptions, ZERO_USAGE } from './types';
+
+// Re-export for backward compatibility with existing test imports.
+export { sanitizeLogOutput, STALE_TIMEOUT_MS };
+
 const execFileAsync = promisify(execFile);
 
-export const STALE_TIMEOUT_MS = 90_000;
-
-/** Strip GitHub Actions workflow commands to prevent injection when logging CLI output. */
-export function sanitizeLogOutput(text: string): string {
-  // Matches any line segment starting with :: followed by a letter — covers all workflow commands
-  // regardless of parameter format (e.g. ::error file=foo.ts,line=5::message)
-  return text.replace(/::[a-z].*$/gim, '[redacted-workflow-cmd]');
+export function buildAnthropicAuth(oauthToken: string, apiKey: string): AnthropicAuth {
+  if (oauthToken) return { kind: 'oauth', token: oauthToken };
+  if (apiKey) return { kind: 'apiKey', key: apiKey };
+  throw new Error('Either claude_code_oauth_token or anthropic_api_key must be provided');
 }
 
-/** Parse a single JSON-stream line emitted by Claude CLI and return a text delta or final result. */
-function processJsonLine(line: string): { text: string; replace: boolean } {
+/**
+ * Parse a single JSON-stream line emitted by Claude CLI. Returns the text
+ * delta (if any) plus the full parsed event when it is a terminal `result`
+ * event, so callers can both stream text and capture the exit reason
+ * (`is_error`, `subtype`, error text) for diagnostics on failure.
+ */
+function processJsonLine(line: string): { text: string; replace: boolean; resultEvent: unknown } {
   try {
     const event = JSON.parse(line);
     if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) {
-      return { text: event.delta.text, replace: false };
+      return { text: event.delta.text, replace: false, resultEvent: null };
     }
-    if (event.type === 'result' && typeof event.result === 'string') {
-      return { text: event.result, replace: true };
+    if (event.type === 'result') {
+      const text = typeof event.result === 'string' ? event.result : '';
+      return { text, replace: text.length > 0, resultEvent: event };
     }
   } catch {
     // Non-JSON line (e.g. verbose debug output) — skip silently
   }
-  return { text: '', replace: false };
+  return { text: '', replace: false, resultEvent: null };
 }
 
-/** Build diagnostic snippets for timeout/stale error messages. */
-function buildTimeoutDiagnostics(lastStdoutChunk: string, stderrText: string): string {
-  const stdoutSnippet = sanitizeLogOutput(lastStdoutChunk.slice(-500));
-  const stderrSnippet = sanitizeLogOutput(stderrText.slice(0, 500));
-  const parts: string[] = [];
-  if (stdoutSnippet) parts.push(`Last stdout: ${stdoutSnippet}`);
-  if (stderrSnippet) parts.push(`stderr: ${stderrSnippet}`);
-  return parts.join('. ');
+
+
+/**
+ * Lift the `usage` block from a Claude CLI `result` event into the canonical
+ * `LLMUsage` shape. Returns `ZERO_USAGE` when the event is missing or
+ * malformed so callers can always rely on numeric counters.
+ */
+export function extractAnthropicCLIUsage(resultEvent: unknown): LLMUsage {
+  if (!resultEvent || typeof resultEvent !== 'object') return { ...ZERO_USAGE };
+  const usage = (resultEvent as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== 'object') return { ...ZERO_USAGE };
+  const u = usage as Record<string, unknown>;
+  return {
+    inputTokens: readCount(u.input_tokens),
+    outputTokens: readCount(u.output_tokens),
+    cachedTokens: readCount(u.cache_read_input_tokens),
+    reasoningTokens: 0,
+  };
 }
 
 let cliInstallPromise: Promise<string> | null = null;
@@ -48,46 +67,36 @@ export function resetCLIInstallPromise(): void {
   cliInstallPromise = null;
 }
 
-export interface ClaudeClientOptions {
-  oauthToken?: string;
-  apiKey?: string;
+export interface AnthropicClientOptions {
+  auth: AnthropicAuth;
   model: string;
 }
 
-export interface ClaudeResponse {
-  content: string;
-}
-
-export interface SendMessageOptions {
-  effort?: 'low' | 'medium' | 'high' | 'max';
-}
-
-export class ClaudeClient {
-  private oauthToken?: string;
-  private apiKey?: string;
+export class AnthropicClient implements LLMClient {
+  private readonly auth: AnthropicAuth;
   private anthropic?: Anthropic;
-  private model: string;
+  private readonly model: string;
   private cachedCLIPath?: string;
 
-  constructor(options: ClaudeClientOptions) {
-    this.oauthToken = options.oauthToken;
-    this.apiKey = options.apiKey;
+  constructor(options: AnthropicClientOptions) {
+    this.auth = options.auth;
     this.model = options.model;
 
-    if (!this.oauthToken && !this.apiKey) {
-      throw new Error('Either claude_code_oauth_token or anthropic_api_key must be provided');
-    }
-
-    if (this.apiKey) {
-      this.anthropic = new Anthropic({ apiKey: this.apiKey });
+    if (this.auth.kind === 'apiKey') {
+      this.anthropic = new Anthropic({ apiKey: this.auth.key });
     }
   }
 
-  async sendMessage(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<ClaudeResponse> {
-    if (this.oauthToken) {
+  async sendMessage(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
+    if (this.auth.kind === 'oauth') {
       return this.sendViaOAuth(systemPrompt, userMessage, options);
     }
     return this.sendViaAPI(systemPrompt, userMessage, options);
+  }
+
+  async warmupCLI(): Promise<void> {
+    if (this.auth.kind !== 'oauth') return;
+    await this.ensureCLI();
   }
 
   private async ensureCLI(): Promise<string> {
@@ -124,9 +133,12 @@ export class ClaudeClient {
     }
   }
 
-  private async sendViaOAuth(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<ClaudeResponse> {
+  private async sendViaOAuth(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
     const fullPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
     const cliPath = await this.ensureCLI();
+    const oauthToken = this.auth.kind === 'oauth' ? this.auth.token : undefined;
+    const startTime = Date.now();
+    const model = this.model;
 
     return new Promise((resolve, reject) => {
       // -p enables pipe mode — reads prompt from stdin when no argument follows
@@ -147,7 +159,7 @@ export class ClaudeClient {
           // process.env is spread intentionally — Claude CLI requires PATH, HOME, and other system vars.
           // CLAUDE_CODE_OAUTH_TOKEN is added conditionally. Secrets should be managed via GitHub Actions secret masking.
           ...process.env,
-          ...(this.oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: this.oauthToken } : {}),
+          ...(oauthToken ? { CLAUDE_CODE_OAUTH_TOKEN: oauthToken } : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -165,6 +177,7 @@ export class ClaudeClient {
       // Only set in the catch block below; clearTimeout(undefined) is a no-op on the normal path
       let stdinKillTimer: NodeJS.Timeout | undefined;
       let lastStdoutChunk = '';
+      let lastResultEvent: unknown = null;
       let rawBytes = 0;
 
       const clearAllTimers = (): void => {
@@ -231,6 +244,7 @@ export class ClaudeClient {
         for (const line of lines) {
           if (!line.trim()) continue;
           const delta = processJsonLine(line);
+          if (delta.resultEvent !== null) lastResultEvent = delta.resultEvent;
           if (delta.replace) {
             output = delta.text;
           } else {
@@ -254,6 +268,7 @@ export class ClaudeClient {
           jsonBuffer += remaining;
           if (jsonBuffer.trim()) {
             const delta = processJsonLine(jsonBuffer);
+            if (delta.resultEvent !== null) lastResultEvent = delta.resultEvent;
             if (delta.replace) {
               output = delta.text;
             } else {
@@ -281,14 +296,28 @@ export class ClaudeClient {
           return;
         }
         if (code !== 0) {
-          const msg = `exit ${code}${signal ? `, signal ${signal}` : ''}: ${stderr.slice(0, 500)}`;
+          const msg = buildExitDiagnostics({
+            exitCode: code,
+            signal,
+            stderr,
+            lastStdoutChunk,
+            model,
+            effort: options?.effort,
+            promptChars: fullPrompt.length,
+            elapsedMs: Date.now() - startTime,
+            resultEvent: lastResultEvent,
+          });
           core.warning(`Claude CLI failed (${msg})`);
           reject(new Error(`Claude CLI invocation failed (${msg})`));
           return;
         }
         const content = output.trim();
         core.debug(sanitizeLogOutput(content.slice(0, 200)));
-        resolve({ content });
+        resolve({
+          content,
+          usage: extractAnthropicCLIUsage(lastResultEvent),
+          latencyMs: Date.now() - startTime,
+        });
       });
 
       child.on('error', (error) => {
@@ -334,7 +363,7 @@ export class ClaudeClient {
     });
   }
 
-  private async sendViaAPI(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<ClaudeResponse> {
+  private async sendViaAPI(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
     if (!this.anthropic) throw new Error('Anthropic client not initialized');
 
     const useThinking = options?.effort && options.effort !== 'low';
@@ -352,12 +381,23 @@ export class ClaudeClient {
       params.thinking = { type: 'enabled', budget_tokens: budgetMap[options!.effort!] };
     }
 
+    const startTime = Date.now();
     const response = await this.anthropic.messages.create(params);
 
     const textBlocks = response.content.filter((b) => b.type === 'text');
     const content = textBlocks.map((b) => 'text' in b ? b.text : '').join('\n');
     core.debug(sanitizeLogOutput(content.slice(0, 200)));
 
-    return { content };
+    const sdkUsage = (response as unknown as { usage?: Record<string, unknown> }).usage;
+    const usage: LLMUsage = sdkUsage
+      ? {
+          inputTokens: readCount(sdkUsage.input_tokens),
+          outputTokens: readCount(sdkUsage.output_tokens),
+          cachedTokens: readCount(sdkUsage.cache_read_input_tokens),
+          reasoningTokens: 0,
+        }
+      : { ...ZERO_USAGE };
+
+    return { content, usage, latencyMs: Date.now() - startTime };
   }
 }

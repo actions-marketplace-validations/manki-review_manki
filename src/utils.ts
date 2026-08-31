@@ -7,6 +7,19 @@ export function truncate(text: string, maxLength: number): string {
 }
 
 /**
+ * Truncate a string to `maxLen` code units, backing off one position if the
+ * boundary would land inside a UTF-16 surrogate pair, then appending "...".
+ */
+export function safeTruncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  let end = maxLen;
+  if (end > 0 && text.charCodeAt(end - 1) >= 0xD800 && text.charCodeAt(end - 1) <= 0xDBFF) {
+    end--;
+  }
+  return text.slice(0, end) + '...';
+}
+
+/**
  * Format a duration in milliseconds to a human-readable string.
  */
 export function formatDuration(ms: number): string {
@@ -27,4 +40,12 @@ export function safeJsonParse(text: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Redact GitHub token literals from a string so they cannot leak into logs
+ * or user-visible output.
+ */
+export function sanitizeTokens(s: string): string {
+  return s.replace(/\b(ghp|ghs|gho|github_pat)_[A-Za-z0-9_]+/g, '[REDACTED]');
 }
