@@ -165,6 +165,8 @@ describe('formatFindingComment', () => {
       ['a doubt held a blocker cell at a warning, and the two checks disagree', { ...held, gradePath: [byTheRule], refutation: check('confirmed'), pairRefutation: check('disproved') }, true],
       ['the same, where the second check says the defect does not exist', { ...held, gradePath: [byTheRule], refutation: check('confirmed'), pairRefutation: { ...check('unsettled'), defect: 'disproved' } }, true],
       ['the same, where the second check disproved a premise that only decides the grade', { ...held, gradePath: [byTheRule], refutation: check('confirmed'), pairRefutation: { ...check('unsettled'), premises: [{ premise: 'A caller passes it', outcome: 'disproved', reason: 'r' }] } }, true],
+      // The judge stated `warning` for the case that every doubt holds, so the confirmation gives no blocker.
+      ['a doubt held a blocker cell at a warning the judge keeps, and a check confirmed it', { cell: cell('wrong'), gradeIfConfirmed: 'warning', gradePath: [byTheRule], refutation: check('confirmed') }, true],
       // Without the rule, the confirmation gives each of these its blocker.
       ['a doubt held a blocker cell at a warning, and a check confirmed it', { ...held, gradePath: [byTheRule], refutation: check('confirmed') }, false],
       ['a doubt held a finder\'s blocker at a warning, and a check confirmed it', { ...held, gradePath: [step('blocker', 'warning', 'judge'), byTheRule], refutation: check('unsettled'), pairRefutation: check('confirmed') }, false],
@@ -1986,7 +1988,7 @@ describe('postReview body lead', () => {
     // A blocker the round carries on an earlier thread follows the same rule.
     expect(sentences({ ...blocker, threadId: 'PRRT_1' }, { ...confirmed, threadId: 'PRRT_1' })).toEqual(['Nothing blocks merge.', fromBlocker]);
     // A sweep's finding is graded in a later call than the one that wrote the summary.
-    const sweeps = [{ reviewer: 'Sweep 1', blocker: 'src/a.ts:20', status: 'answered' as const }];
+    const sweeps = [{ reviewer: 'Sweep 1', source: 'src/a.ts:20', severity: 'blocker' as const, status: 'answered' as const }];
     expect(roundSentence(blocked([lowered, { ...byJudge, reviewers: ['Sweep 1'] }], { sweeps }))).toBe('The first item is read unchecked.');
     expect(roundSentence(blocked([lowered, byJudge], { sweeps }))).toBe('Nothing blocks merge.');
     // One such blocker is enough, next to one the judge graded.

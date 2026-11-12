@@ -3031,6 +3031,7 @@ describe('runFullReview orchestration', () => {
       agentDurationMs: new Map([['security', 1500], ['general', 1200]]),
       agentRetryCount: new Map([['security', 0], ['general', 1]]),
       agentFailureReasons: { general: 'CLI timed out' },
+      agentWarnings: new Map([['general', ['malformed response', 'CLI timed out']]]),
       plannerDurationMs: 500,
       judgeDurationMs: 800,
       judgeRetryCount: 2,
@@ -3082,8 +3083,10 @@ describe('runFullReview orchestration', () => {
         retryCount: 1,
         status: 'failed',
         failureReason: 'CLI timed out',
+        warnings: ['malformed response', 'CLI timed out'],
       }),
     ]);
+    expect(ctx!.reviewers.agentMetrics![0]).not.toHaveProperty('warnings');
   });
 
   it('emits `usage` with zero rollups and no `perStage` when no stage reports tokens', async () => {
@@ -4019,7 +4022,7 @@ describe('runFullReview orchestration', () => {
           call('compare', 'dddddddddddd', { agent: 'Sibling field: utxos vs spent' }),
         ],
         comparisons,
-        sweeps: [{ reviewer: 'Sweep: Bug', blocker: 'src/app.ts:5', status: 'answered' as const, class: 'a cache key leaves out a field', findings: 1 }, { reviewer: 'Sweep: Other', blocker: 'src/app.ts:9', status: 'cut' as const }],
+        sweeps: [{ reviewer: 'Sweep: Bug', source: 'src/app.ts:5', severity: 'blocker' as const, status: 'answered' as const, class: 'a cache key leaves out a field', findings: 1 }, { reviewer: 'Sweep: Other', source: 'src/app.ts:9', severity: 'note' as const, status: 'cut' as const }],
         relatedRepos: [{ repo: 'o/r', status: 'fetched', durationMs: 900 }, { repo: 'o/s', status: 'failed', reason: 'fatal: repository not found' }],
         usesOutsideDiff: { symbols: [{ name: 'compute_fee', declared: 'src/fee.rs:4', uses: ['src/tx.rs:9'], notShown: 1 }], types: ['src/fee.rs:1: struct Fee { base, rate }'] },
         relatedWork: {
@@ -4056,7 +4059,7 @@ describe('runFullReview orchestration', () => {
       expect(rc.meta.needsHuman).toEqual({ cause: 'repeated', blockers: [blocker] });
       expect(rc.meta.promptVersions).toEqual({ reviewer: ['aaaaaaaaaaaa', 'bbbbbbbbbbbb'], judge: ['cccccccccccc'], compare: ['dddddddddddd'] });
       expect(rc.comparisons).toEqual(comparisons);
-      expect(rc.sweeps).toEqual([{ reviewer: 'Sweep: Bug', blocker: 'src/app.ts:5', status: 'answered', class: 'a cache key leaves out a field', findings: 1 }, { reviewer: 'Sweep: Other', blocker: 'src/app.ts:9', status: 'cut' }]);
+      expect(rc.sweeps).toEqual([{ reviewer: 'Sweep: Bug', source: 'src/app.ts:5', severity: 'blocker', status: 'answered', class: 'a cache key leaves out a field', findings: 1 }, { reviewer: 'Sweep: Other', source: 'src/app.ts:9', severity: 'note', status: 'cut' }]);
       expect(rc.usage.perStage?.compare).toMatchObject({ calls: 1 });
       expect(rc.usage.llmCalls?.[0]).toMatchObject({ stepBudget: 15, wrapUpNoted: true });
       expect(rc.usage.llmCalls?.[3]).not.toHaveProperty('limits');
@@ -6438,9 +6441,7 @@ describe('runFullReview orchestration', () => {
       const notice = pauseNotice();
       expect(notice).toContain('came back after a fix');
       expect(notice).toContain(PAUSE_NOTICE_MARKER);
-      expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(
-        expect.anything(), TEST_BOT, 'test-owner', 'test-repo', expect.any(Number), expect.anything(), { previousFindings, priorRounds: rounds },
-      );
+      expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(expect.anything(), { previousFindings, priorRounds: rounds });
       // A security override is recorded in its thread once, even while review is paused.
       expect(jest.mocked(stateModule.announceSecurityOverrides)).toHaveBeenCalledWith(expect.anything(), [
         { thread: 'T_new', login: 'owner', role: 'maintain', via: 'resolve', announced: false },
@@ -7497,9 +7498,7 @@ describe('handleReviewStateCheck', () => {
     // The role the author needs comes from the base branch's config.
     expect(jest.mocked(ghUtils.readConfigFile)).toHaveBeenCalledWith(expect.anything(), 'test-owner', 'test-repo', 'main', '.manki.yml');
     expect(jest.mocked(recapModule.fetchRecapState)).toHaveBeenCalledWith(expect.anything(), TEST_BOT, 'test-owner', 'test-repo', 1, 'author', 'admin');
-    expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(
-      expect.anything(), TEST_BOT, 'test-owner', 'test-repo', 1, expect.objectContaining({ auto_approve: false }), { previousFindings, priorRounds: [round] },
-    );
+    expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(expect.anything(), { previousFindings, priorRounds: [round] });
     expect(jest.mocked(core.info)).toHaveBeenCalledWith(
       'auto_approve is disabled — skipping state check',
     );
@@ -7525,9 +7524,7 @@ describe('handleReviewStateCheck', () => {
 
     await handleReviewStateCheck();
 
-    expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(
-      expect.anything(), TEST_BOT, 'test-owner', 'test-repo', 5, expect.objectContaining({ auto_approve: true }), expect.objectContaining({ previousFindings: [] }),
-    );
+    expect(jest.mocked(stateModule.reopenAuthorResolvedThreads)).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ previousFindings: [] }));
     expect(jest.mocked(stateModule.checkAndAutoApprove)).toHaveBeenCalledWith(
       expect.anything(), TEST_BOT, 'test-owner', 'test-repo', 5, expect.objectContaining({ auto_approve: true }),
     );

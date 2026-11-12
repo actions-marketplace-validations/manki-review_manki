@@ -7,9 +7,9 @@ import { addUsage, LLMCall, LLMClient, LLMUsage, modelDisplayName, QuotaError, r
 import { mapWithConcurrency, parseRetryNote } from './utils';
 import { capUnconfirmedBuildClaim, runJudgeAgent, JudgeInput, PriorFinding, collectPriorBlockers, computeProvenanceMap, foldInto } from './judge';
 import { RepoMemory, applySuppressions, buildMemoryContext } from './memory';
-import { cachedFileLines, dynamicFence, fenceText, InstructionFile, LinkedIssue, RepoFiles, sanitizeFilePath, titleToSlug } from './github';
+import { AFTER_PUSH_LINE, cachedFileLines, dynamicFence, fenceText, InstructionFile, LinkedIssue, RepoFiles, sanitizeFilePath, titleToSlug } from './github';
 import { blockersToRecheck, collectGuardedThreadIds, collectInPrSuppressions, collectResolvedThreadIds, deduplicateFindings, isGuarded, judgeAddressedThreadIds, llmDeduplicateFindings, llmSameDefects, PreviousFinding, replyClassOf, titleOverlapType } from './recap';
-import { canLeaveOut, disproof, findingKey, isBlockingSeverity, isRareClaim, wouldBlockIfTrue, CarriedEnd, CarriedEndReason, cellGrade, FOLLOW_UP_TAG, UNPOSTED_REASONS, leftOutUnproven, gradeStep, isGradeCell, isSecurityFinding, LeadOutcome, RoundLead, PRE_EXISTING_TAG, PreExistingCheck, SECURITY_TAG, SEVERITY_ORDER, threadBlocks, ReviewConfig, RoundSlicing, RoundSweep, ReviewerAgent, Finding, FindingEvidence, FindingFingerprint, FindingFingerprintEntry, FindingSeverity, NeedsHuman, OpenThread, ReviewResult, ReviewVerdict, RoundOutcome, VerdictReason, VerdictReport, ParsedDiff, GroupReviewer, ReviewGroup, TeamRoster, TeamRouting, PrContext, PlannerResult, RoundContext, RoundDedupDuplicateMatch, RoundModelFallback, RoundPlannerSource, RoundRelatedRepo, RoundStaticSignalMatch, EffortLevel, Finder, RelatedRepoTools, RelatedWork, Triage, ThreadEvaluation, VerdictTrace, VerdictTraceEntry, MAX_AGENT_RETRIES, VALID_PR_TYPES, ValidPrType } from './types';
+import { canLeaveOut, disproof, findingKey, isBlockingSeverity, isRareClaim, staysWarningIfConfirmed, wouldBlockIfTrue, CarriedEnd, CarriedEndReason, cellGrade, FOLLOW_UP_TAG, UNPOSTED_REASONS, leftOutUnproven, gradeStep, isGradeCell, isSecurityFinding, LeadOutcome, RoundLead, PRE_EXISTING_TAG, PreExistingCheck, SECURITY_TAG, SEVERITY_ORDER, threadBlocks, ReviewConfig, RoundSlicing, RoundSweep, ReviewerAgent, Finding, FindingEvidence, FindingFingerprint, FindingFingerprintEntry, FindingSeverity, NeedsHuman, OpenThread, ReviewResult, ReviewVerdict, RoundOutcome, VerdictReason, VerdictReport, ParsedDiff, GroupReviewer, ReviewGroup, TeamRoster, TeamRouting, PrContext, PlannerResult, RoundContext, RoundDedupDuplicateMatch, RoundModelFallback, RoundPlannerSource, RoundRelatedRepo, RoundStaticSignalMatch, EffortLevel, Finder, RelatedRepoTools, RelatedWork, Triage, ThreadEvaluation, VerdictTrace, VerdictTraceEntry, MAX_AGENT_RETRIES, VALID_PR_TYPES, ValidPrType } from './types';
 import { countChangedLines, isLineInDiff, MAX_LINE_CHARS, MAX_SLICE_CHARS, OverlongLine, overlongChangedLines, parsePRDiff, rebuildRawDiff, sliceDiff } from './diff';
 import { translateNames } from './name-translation';
 import { fetchedRelatedRepos, fetchRelatedRepos, relatedRepoGuides, relatedRepoOutcomes, relatedReposCacheDir, requireRelatedRepos } from './related-repos';
@@ -24,7 +24,7 @@ import { buildRepositoryRules, GRADE_DEFINITIONS, OUTSIDE_INPUT_RULE, SEVERITY_T
 import { checkFindingClaims, ClaimSources, formatStaticSignals, isAnalyzerSignal, toolAlertFindings } from './static-signals';
 import { listRelatedUses, listUsesOutsideDiff } from './symbol-uses';
 import { runComparisons } from './compare';
-import { citedBy, runSweeps } from './sweep';
+import { citedBy, runSweeps, startsSweep } from './sweep';
 import { formatLockfileChanges, isLockfileAlert, LockfileDiff, withLockfiles } from './lockfile';
 
 const DISMISSED_LINE_TOLERANCE = 5;
@@ -100,15 +100,16 @@ function markPreExisting(findings: Finding[], checkOf: (finding: Finding) => Pre
  * Splits off the warnings that `needsProof` and that nothing proves, by `unprovenReason`, as `unposted` with that
  * reason, for the round record only. A warning is left out only when it is certain that no rule keeps it, so these
  * stay `posted` too: a finding `foldIntoEarlierFindings` or the judge put under one an earlier round still shows, and
- * a finding that `wouldBlock`. A finding that `isRareClaim` stays `posted` as well, whatever its check answered. Each
- * posted blocker and warning that no tool reported gets its `checkStatus`.
+ * a finding that `wouldBlock`. A finding that `isRareClaim` stays `posted` as well, whatever its check answered, and so
+ * does one that `staysWarningIfConfirmed`, since its cell gives a blocker. Each posted blocker and warning that no tool
+ * reported gets its `checkStatus`.
  */
 function hideUnprovenWarnings(findings: Finding[], wouldBlock = wouldBlockIfTrue): { posted: Finding[]; unposted: Finding[] } {
   const posted: Finding[] = [];
   const unposted: Finding[] = [];
   for (const f of findings) {
     const unpostedReason = needsProof(f) ? unprovenReason(f) : undefined;
-    if (!unpostedReason || f.threadId || f.answeredIn || f.raisedIn !== undefined || wouldBlock(f) || isRareClaim(f.cell)) {
+    if (!unpostedReason || f.threadId || f.answeredIn || f.raisedIn !== undefined || wouldBlock(f) || isRareClaim(f.cell) || staysWarningIfConfirmed(f)) {
       posted.push(isBlockingSeverity(f.severity) && !f.toolSource ? { ...f, checkStatus: checkStatus(f) } : f);
     } else {
       core.info(`Recording warning "${f.title}" on ${f.file}:${f.line} without posting it: ${UNPOSTED_REASONS[unpostedReason]}`);
@@ -142,7 +143,7 @@ const MAX_LISTED_LINES = 10;
 function overlongSummary(lines: OverlongLine[]): string {
   const listed = lines.slice(0, MAX_LISTED_LINES).map(l => `\`${sanitizeFilePath(l.file)}:${l.line}\` (${l.length} characters)`);
   const more = lines.length > MAX_LISTED_LINES ? `, and ${lines.length - MAX_LISTED_LINES} more` : '';
-  return `No model read this PR in full: ${listed.join(', ')}${more} ${lines.length === 1 ? 'is' : 'are'} longer than ${MAX_LINE_CHARS} characters, the most a prompt shows of one line. Split the line, or exclude its file in \`exclude_paths\` on the base branch, and push again.`;
+  return `No model read this PR in full: ${listed.join(', ')}${more} ${lines.length === 1 ? 'is' : 'are'} longer than ${MAX_LINE_CHARS} characters, the most a prompt shows of one line. Split the line, or exclude its file in \`exclude_paths\` on the base branch, and push again. ${AFTER_PUSH_LINE}`;
 }
 
 
@@ -156,7 +157,7 @@ export const FINDER_TOOLS_TIMEOUT_MS = 900_000;
 /** How long the round still waits for the sibling comparisons once the finders are done. */
 const COMPARISON_GRACE_MS = 60_000;
 
-/** A finder reply that is not the JSON array of findings, which a retry with `parseRetryNote` can correct. */
+/** A finder reply that is not the JSON array of findings or holds no usable element, which a retry with `parseRetryNote` can correct. */
 class FinderReplyError extends Error {}
 
 class PlannerTimeoutError extends Error {
@@ -816,7 +817,8 @@ export async function runReview(
   const agentUsage = new Map<string, LLMUsage>();
   const agentDurationMs = new Map<string, number>();
   const agentRetryCount = new Map<string, number>();
-  Object.assign(recorded, { rawFindings: allFindings, agentResponseLengths, agentDurationMs, agentRetryCount });
+  const agentWarnings = new Map<string, string[]>();
+  Object.assign(recorded, { rawFindings: allFindings, agentResponseLengths, agentDurationMs, agentRetryCount, agentWarnings });
   // A finder whose provider reported a used-up limit is not retried: it would fail the same way.
   const quotaErrors = new Map<string, QuotaError>();
   // The note each finder's next retry gets: one that names the parse error when its last reply did not parse.
@@ -828,7 +830,9 @@ export async function runReview(
     return note;
   };
   const recordFailure = (name: string, error: unknown): void => {
-    agentFailureReasons.set(name, sanitizeLogOutput(String(((error as Error)?.message ?? error) || 'unknown failure')).slice(0, 500));
+    const reason = sanitizeLogOutput(String(((error as Error)?.message ?? error) || 'unknown failure')).slice(0, 500);
+    agentFailureReasons.set(name, reason);
+    agentWarnings.set(name, [...(agentWarnings.get(name) ?? []), reason]);
     if (error instanceof QuotaError) quotaErrors.set(name, error);
     if (error instanceof FinderReplyError) retryNotes.set(name, parseRetryNote(error, 'array'));
     else retryNotes.delete(name);
@@ -1351,7 +1355,7 @@ export async function runReview(
   });
   await checkpoint?.();
 
-  // A blocker's defect class can recur elsewhere in the diff, so with `review.sweep` each kept blocker starts a search for it.
+  // A finding's defect class can recur elsewhere in the diff, so the kept findings that `review.sweep` names each start a search for it.
   let sweeps: RoundSweep[] | undefined;
   let sweepRaw: Finding[] = [];
   // The sweep and the checks at the round's end change what the judge's call recorded, so a round that ends incomplete after it records these as they then are.
@@ -1359,10 +1363,10 @@ export async function runReview(
     allJudgedFindings, rawFindings: [...allFindings, ...sweepRaw], rawFindingCount: checkedFindings.length + sweepRaw.length, staticDedupCount, llmDedupCount,
     ...(duplicateMatches.length > 0 && { duplicateMatches }), ...(sweeps && { sweeps }), ...(openLeads.length > 0 && { openLeads }),
   });
-  // A blocker the refuters disproved stays posted, but it starts no sweep, so one false blocker never turns into several.
-  const sweptBlockers = config.review?.sweep ? finalFindings.filter(f => f.severity === 'blocker' && !disproof(f)) : [];
-  if (sweptBlockers.length > 0) {
-    const sweep = await runSweeps(reviewer => withFallback(pickReviewerClient(clients, comparisonModel), 'sweep', reviewer), sweptBlockers, {
+  // Below blocker, a finding on code the PR did not change is posted only once a later check confirms it, so it starts none.
+  const sweepSources = finalFindings.filter(f => startsSweep(f, config.review?.sweep ?? 'off') && (f.severity === 'blocker' || unchangedCheck(f) !== 'pre_existing'));
+  if (sweepSources.length > 0) {
+    const sweep = await runSweeps(reviewer => withFallback(pickReviewerClient(clients, comparisonModel), 'sweep', reviewer), sweepSources, {
       rawDiff, effort: comparisonEffort, workspace,
     });
     sweeps = sweep.sweeps;
@@ -1638,6 +1642,7 @@ export async function runReview(
     agentResponseLengths,
     agentDurationMs,
     agentRetryCount,
+    agentWarnings,
     ...(agentFailureReasons.size > 0 && { agentFailureReasons: Object.fromEntries(agentFailureReasons) }),
     ...(plannerDurationMs != null && { plannerDurationMs }),
     ...(judgeDurationMs != null && { judgeDurationMs }),
@@ -2052,7 +2057,15 @@ export function parseFindings(responseText: string, reviewerName: string, instru
     throw new Error(`response is not a JSON array, got ${parsed === null ? 'null' : typeof parsed} (length ${responseText.length})`);
   }
 
-  return parsed.map((f: Record<string, unknown>) => {
+  const unusable = parsed.filter(element => !isUsableElement(element));
+  if (unusable.length > 0) {
+    const shapes = elementShapes(unusable);
+    // One stray element next to real findings is dropped. A reply with nothing else is no reply, so the caller's retry asks again.
+    if (unusable.length === parsed.length) throw new Error(`no element has a title or a description (${parsed.length} element(s), ${shapes})`);
+    core.warning(`${reviewerName}: dropped ${unusable.length} of ${parsed.length} element(s) without a title or a description (${shapes})`);
+  }
+
+  return parsed.filter(isUsableElement).map(f => {
     const evidence = parseEvidence(f);
     const lead = f.lead === true ? { checked: textOf(f.checked), left: textOf(f.left) } : undefined;
     // A lead the judge keeps is posted like a finding, so it needs a description even when the reviewer gave none.
@@ -2073,6 +2086,32 @@ export function parseFindings(responseText: string, reviewerName: string, instru
       ...ruleOf(f, instructionFiles),
     };
   });
+}
+
+/** Whether a reply element says anything a finding can carry: a title, a description, or what a lead checked or left open. */
+function isUsableElement(element: unknown): element is Record<string, unknown> {
+  if (element === null || typeof element !== 'object' || Array.isArray(element)) return false;
+  const f = element as Record<string, unknown>;
+  return [f.title, f.description, ...(f.lead === true ? [f.checked, f.left] : [])].some(value => textOf(value) !== '');
+}
+
+const MAX_ELEMENT_SHAPES = 3;
+const MAX_SHAPE_KEYS = 8;
+const SHAPE_KEY_CHARS = 30;
+
+/**
+ * Names what `elements` hold, so the log and the retry note show the shape the reviewer used: the keys of an object, or
+ * the type of anything else. The keys are model output, so they are cut and kept to plain characters.
+ */
+function elementShapes(elements: readonly unknown[]): string {
+  const shapes = new Set(elements.map(element => {
+    if (element === null || typeof element !== 'object') return element === null ? 'null' : typeof element;
+    if (Array.isArray(element)) return 'array';
+    const keys = Object.keys(element);
+    const shown = keys.slice(0, MAX_SHAPE_KEYS).map(key => key.slice(0, SHAPE_KEY_CHARS).replace(/[^\w .-]/g, '?'));
+    return `keys: ${shown.join(', ') || 'none'}${keys.length > MAX_SHAPE_KEYS ? ', ...' : ''}`;
+  }));
+  return [...shapes].slice(0, MAX_ELEMENT_SHAPES).join(' | ') + (shapes.size > MAX_ELEMENT_SHAPES ? ' | ...' : '');
 }
 
 /** Reads the fix a finding describes in words, which a reply without one leaves inside its `description`. */

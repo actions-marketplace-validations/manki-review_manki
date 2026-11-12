@@ -35,7 +35,7 @@ import { relatedReposCacheDir } from './related-repos';
 import * as core from '@actions/core';
 import * as napi from '@ast-grep/napi';
 import { formatFindingComment, LinkedIssue, titleToSlug } from './github';
-import { CELL_GRADES, cellGrade, Finding, FindingFingerprintEntry, FindingSeverity, GradeCell, ReviewResult, RoundContext, RoundLead, OpenThread, RelatedRepoKind, ReviewerAgent, ReviewConfig, ReviewGroup, ParsedDiff, DiffFile, ProvenanceEntry, ThreadEvaluation, MAX_AGENT_RETRIES, REACH_DOUBT, SECURITY_TAG } from './types';
+import { CELL_GRADES, cellGrade, Finding, FindingFingerprintEntry, FindingSeverity, GradeCell, ReviewResult, RoundContext, RoundLead, OpenThread, RelatedRepoKind, ReviewerAgent, ReviewConfig, ReviewGroup, ParsedDiff, DiffFile, ProvenanceEntry, ThreadEvaluation, MAX_AGENT_RETRIES, REACH_DOUBT, SECURITY_TAG, SweepMode } from './types';
 import { citedLine } from './finding-fingerprint';
 import { fingerprintEntriesFromLegacy, gitWorkspace, LegacyHandoverFindingFixture, LegacyHandoverRoundFixture, makeFindingFingerprintEntry, makeRoundContext, roundContextFromLegacy, TEST_LINKS } from './test-utils';
 import { listUsesOutsideDiff } from './symbol-uses';
@@ -217,6 +217,13 @@ describe('parseFindings', () => {
     ['null', 'null', /^response is not a JSON array, got null/],
     ['an empty response', '', /^empty response/],
     ['a whitespace-only response', '  \n ', /^empty response/],
+    // An element that holds none of the fields a finding is read from says nothing, however it is shaped.
+    ['findings nested under a key', '[{"finding":{"title":"Unchecked sum","description":"Overflows."}},{"finding":{"title":"b"}}]', /^no element has a title or a description \(2 element\(s\), keys: finding\)$/],
+    ['other key names', '[{"summary":"Unchecked sum","path":"src/a.ts","line":5}]', /^no element has a title or a description \(1 element\(s\), keys: summary, path, line\)$/],
+    ['elements that are no objects', '["Unchecked sum",null,7,["x"],{}]', /^no element has a title or a description \(5 element\(s\), string \| null \| number \| \.\.\.\)$/],
+    ['blank fields and a lead that names nothing', '[{"severity":"blocker","title":" ","description":""},{"lead":true,"checked":"","title":7}]', /\(2 element\(s\), keys: severity, title, description \| keys: lead, checked, title\)$/],
+    // The keys are model output: each is cut, kept to plain characters, and only the first few are named.
+    ['keys that are long, odd or many', JSON.stringify([Object.fromEntries([['a\n::error::`b`', 1], ['k'.repeat(80), 1], ...Array.from({ length: 9 }, (_, i) => [`k${i}`, 1])])]), new RegExp(`\\(1 element\\(s\\), keys: a\\?\\?\\?error\\?\\?\\?b\\?, k{30}, k0, k1, k2, k3, k4, k5, \\.\\.\\.\\)$`)],
   ])('throws on %s', (_label, input, expected) => {
     expect(() => parseFindings(input, 'Reviewer')).toThrow(expected);
   });
@@ -232,16 +239,27 @@ describe('parseFindings', () => {
     }
   });
 
-  it('handles missing fields gracefully', () => {
-    const json = JSON.stringify([{ severity: 'blocker' }]);
+  it('fills the fields an element leaves out, and drops an element without a title and a description next to usable ones', () => {
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    try {
+      const json = JSON.stringify([
+        { severity: 'blocker', description: 'The sum overflows.' },
+        { severity: 'blocker' },
+        { title: 'Unchecked sum' },
+        { lead: true, left: 'find the writers' },
+        'a stray note',
+      ]);
 
-    const findings = parseFindings(json, 'Reviewer');
-    expect(findings).toHaveLength(1);
-    expect(findings[0].title).toBe('Untitled finding');
-    expect(findings[0].file).toBe('');
-    expect(findings[0].line).toBe(0);
-    expect(findings[0].description).toBe('');
-    expect(findings[0].suggestedFix).toBeUndefined();
+      const findings = parseFindings(json, 'Reviewer');
+      expect(findings.map(f => [f.title, f.file, f.line, f.description, f.suggestedFix])).toEqual([
+        ['Untitled finding', '', 0, 'The sum overflows.', undefined],
+        ['Unchecked sum', '', 0, '', undefined],
+        ['Untitled finding', '', 0, 'A reviewer raised this as a suspicion it had not finished checking. It had checked: nothing. Still to check: find the writers.', undefined],
+      ]);
+      expect(warnSpy.mock.calls).toEqual([['Reviewer: dropped 2 of 5 element(s) without a title or a description (keys: severity | string)']]);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('defaults unknown severity to note', () => {
@@ -2230,12 +2248,13 @@ describe('runReview', () => {
     const agreed = (title: string, line: number): LegacyHandoverFindingFixture =>
       ({ fingerprint: { file: 'src/app.ts', lineStart: line, lineEnd: line, slug: titleToSlug(title) }, severity: 'warning', title, authorReply: 'agree' });
     const judged = (r: ReviewResult, title: string) => r.allJudgedFindings?.filter(f => f.title === title).map(f => [f.severity, f.tags]);
+    const keptDown = { row: 'wrong', gradeIfConfirmed: 'warning' };
     // One row per case where no outcome of a check changes whether the review shows the warning: the warning, what
     // makes it such a case, and how the round ends for it. A new step that hides a warning gets a row here.
     const hidden: Array<{ step: string; title: string; finding?: object; verdict?: object; options?: Partial<Parameters<typeof runReview>[1]>; ends: (r: ReviewResult) => unknown; as: unknown }> = [
       {
         step: 'cross-round suppression', title: 'Agreed last round',
-        options: { priorRounds: [roundContextFromLegacy({ round: 1, commitSha: 'abc', timestamp: 't', findings: [agreed('Agreed last round', 11), agreed('Reverses the agreed fix', 12)] })] },
+        options: { priorRounds: [roundContextFromLegacy({ round: 1, commitSha: 'abc', timestamp: 't', findings: [agreed('Agreed last round', 11), agreed('Reverses the agreed fix', 12), agreed('Agreed sum stays a warning', 21)] })] },
         ends: r => judged(r, 'Agreed last round'), as: [['ignore', ['suppressed-by-ratchet']]],
       },
       {
@@ -2245,7 +2264,10 @@ describe('runReview', () => {
       {
         // A finder's blocker passes the dedup against the resolved thread, so only the suppression after the judge drops it.
         step: 'in-PR suppression', title: 'Resolved in its thread', finding: { severity: 'blocker' },
-        options: { previousFindings: [{ title: 'Resolved in its thread', file: 'src/app.ts', line: 13, severity: 'warning', status: 'resolved', threadId: 'T1' }] },
+        options: { previousFindings: [
+          { title: 'Resolved in its thread', file: 'src/app.ts', line: 13, severity: 'warning', status: 'resolved', threadId: 'T1' },
+          { title: 'Closed thread on a wrong count', file: 'src/app.ts', line: 22, severity: 'warning', status: 'resolved', threadId: 'T3' },
+        ] },
         ends: r => judged(r, 'Resolved in its thread'), as: [['ignore', ['suppressed-in-pr']]],
       },
       {
@@ -2281,6 +2303,20 @@ describe('runReview', () => {
         step: 'restated open thread', title: 'Timer leaks on retry',
         options: { openThreads: [{ threadId: 'T2', title: 'Timer leaks on retry', file: 'src/app.ts', line: 18, severity: 'warning' }] },
         ends: r => r.findings.filter(f => f.title === 'Timer leaks on retry').map(f => [f.severity, f.threadId]), as: [['warning', 'T2']],
+      },
+      // The judge keeps these three at a warning on a cell that gives a blocker. No answer raises them, so each step hides them unchecked like any other warning.
+      {
+        step: 'memory suppression of a blocker cell the judge keeps at a warning', title: 'Remembered pattern the judge keeps down', verdict: keptDown,
+        ends: r => r.memorySuppressed?.filter(f => f.title === 'Remembered pattern the judge keeps down').map(f => [f.suppressedBy, f.cell, f.gradeIfConfirmed, f.refutation]),
+        as: [['sup-1', { row: 'wrong', column: 'normal' }, 'warning', undefined]],
+      },
+      {
+        step: 'cross-round suppression of a blocker cell the judge keeps at a warning', title: 'Agreed sum stays a warning', verdict: keptDown,
+        ends: r => judged(r, 'Agreed sum stays a warning'), as: [['ignore', ['suppressed-by-ratchet']]],
+      },
+      {
+        step: 'in-PR suppression of a blocker cell the judge keeps at a warning', title: 'Closed thread on a wrong count', finding: { severity: 'blocker' }, verdict: keptDown,
+        ends: r => judged(r, 'Closed thread on a wrong count'), as: [['ignore', ['suppressed-in-pr']]],
       },
     ];
     // Behind them, eight warnings the review posts once a check confirms them. The eighth is checked only when no row took a check.
@@ -2460,7 +2496,7 @@ describe('runReview', () => {
     const old = Array.from({ length: 8 }, (_, i) => ({ severity: 'warning', title: `Old ${i + 1}`, ...at('src/old.ts', 11 + i), preExisting: true, preExistingReason: 'The loop predates this PR.' }));
     // The sweep that the blocker starts finds a warning on changed code, which the judge keeps with a doubt whether the defect exists.
     const swept = { severity: 'warning', title: 'Search key misses the tenant', ...at('src/app.ts', 20) };
-    const sweeping = (system: string) => system.startsWith('A code review found the blocker');
+    const sweeping = (system: string) => system.startsWith('A code review reported the finding');
     const refuterCalls: string[] = [];
     const clients = makeClients();
     // One finder reports them, so the judge merges no copies.
@@ -2488,12 +2524,14 @@ describe('runReview', () => {
     mockedRunJudgeAgent.mockImplementation(jest.requireActual<typeof import('./judge')>('./judge').runJudgeAgent);
     let result: ReviewResult;
     try {
-      result = await runReview(clients, { config: makeConfig({ review: { sweep: true } }), diff, rawDiff: 'raw diff', repoContext: '', workspace: root });
+      result = await runReview(clients, { config: makeConfig({ review: { sweep: 'warnings' } }), diff, rawDiff: 'raw diff', repoContext: '', workspace: root });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
 
     expect(result.reviewComplete).toBe(true);
+    // A warning on code the PR did not change starts no sweep, although its cited lines prove it.
+    expect(result.sweeps?.map(s => [s.source, s.severity])).toEqual([['src/app.ts:3', 'blocker']]);
     // The first judge call checks only its blocker, so the sweep's warning gets its check. The warnings on unchanged code share the seven left.
     expect([refuterCalls.slice(0, 2), refuterCalls.slice(2).sort()]).toEqual([[blocker.title, swept.title], old.slice(0, 7).map(f => f.title)]);
     expect(result.findings.map(f => [f.title, f.severity, f.checkStatus])).toEqual([
@@ -2504,7 +2542,7 @@ describe('runReview', () => {
     expect(result.allJudgedFindings?.filter(f => f.refutation).map(f => f.title).sort()).toEqual([blocker, swept, ...old.slice(0, 7)].map(f => f.title).sort());
   });
 
-  it('sweeps the diff for other instances of each kept blocker\'s class with `review.sweep`, and judges what it finds', async () => {
+  it('sweeps the diff for other instances of the class of each kept finding `review.sweep` names, and judges what it finds', async () => {
     const original = { severity: 'blocker', title: 'Cache key misses the locale', file: 'src/cache.ts', line: 10, description: 'd', evidence: ['src/cache.ts:10 builds the key'], proof: ['src/cache.ts:10'] };
     const elsewhere = { ...original, title: 'Search key misses the tenant', file: 'src/search.ts', line: 40, evidence: ['src/search.ts:40 builds the key'], proof: ['src/search.ts:40'] };
     const restated = { ...original, title: 'Cache key misses the locale again', line: 14 };
@@ -2517,10 +2555,10 @@ describe('runReview', () => {
     const nearCited = { ...elsewhere, title: 'Shard key misses the region', line: 72, evidence: ['src/search.ts:72 builds the key'], proof: ['src/search.ts:72'] };
     const dropped = { severity: 'note', title: 'Rename the helper', file: 'src/retry.ts', line: 9, description: 'd', evidence: ['src/retry.ts:9 names it'], proof: ['src/search.ts:80'] };
     const citedByDropped = { ...elsewhere, title: 'Page key misses the region', line: 80, evidence: ['src/search.ts:80 builds the key'], proof: ['src/search.ts:80'] };
-    const sweeping = (system: string) => system.startsWith('A code review found the blocker');
+    const sweeping = (system: string) => system.startsWith('A code review reported the finding');
     const openThread: OpenThread = { threadId: 'T1', title: 'Search is slow', file: 'src/search.ts', line: 90, severity: 'warning' };
     const evaluation: ThreadEvaluation = { threadId: 'T1', status: 'not_addressed', reason: 'r' };
-    const run = async (sweep: boolean, disproved = false, sweepJudgeError?: Error) => {
+    const run = async (sweep: SweepMode, disproved = false, sweepJudgeError?: Error) => {
       const clients = makeClients();
       jest.mocked(clients.reviewer.sendMessage).mockImplementation(async (system: string) => ({
         content: sweeping(system) ? JSON.stringify({ class: 'a cache key leaves out a field the value depends on', general: true, findings: [elsewhere, restated, reworded, citedElsewhere, nearCited, citedByDropped] }) : JSON.stringify([original, other, dropped]),
@@ -2542,13 +2580,15 @@ describe('runReview', () => {
       return { result, sweeps: jest.mocked(clients.reviewer.sendMessage).mock.calls.filter(call => sweeping(call[0])) };
     };
 
-    const off = await run(false);
+    const off = await run('off');
     expect([off.sweeps.length, mockedRunJudgeAgent.mock.calls.length, off.result.sweeps]).toEqual([0, 1, undefined]);
     // A blocker the refuters disproved starts no sweep.
-    const disproved = await run(true, true);
+    const disproved = await run('blockers', true);
     expect([disproved.sweeps.length, disproved.result.sweeps]).toEqual([0, undefined]);
+    // With `warnings`, the warning its cited lines prove starts one too, after the blocker's.
+    expect((await run('warnings')).result.sweeps?.map(s => [s.reviewer, s.source, s.severity])).toEqual([['Sweep 1', 'src/cache.ts:10', 'blocker'], ['Sweep 2', 'src/retry.ts:5', 'warning']]);
 
-    const { result, sweeps } = await run(true);
+    const { result, sweeps } = await run('blockers');
     const reviewer = 'Sweep 1';
     expect(sweeps).toHaveLength(1);
     // A place the round already judged is not judged twice, and the rest gets a judge call of its own, without the open threads.
@@ -2567,17 +2607,17 @@ describe('runReview', () => {
     // A rank from the sweep's judge call is on another scale, so only the first call's ranks stay.
     expect(result.findings.map(f => [f.severity, f.noteRank])).toEqual([['blocker', 1], ['warning', 1], ['blocker', undefined], ['note', undefined], ['blocker', undefined]]);
     expect(result.allJudgedFindings?.filter(f => f.reviewers.includes(reviewer)).map(f => f.noteRank)).toEqual([undefined, undefined, undefined]);
-    expect(result.sweeps).toEqual([{ reviewer, blocker: 'src/cache.ts:10', status: 'answered', class: 'a cache key leaves out a field the value depends on', findings: 6 }]);
+    expect(result.sweeps).toEqual([{ reviewer, source: 'src/cache.ts:10', severity: 'blocker', status: 'answered', class: 'a cache key leaves out a field the value depends on', findings: 6 }]);
     expect(result.llmCalls?.filter(c => c.stage === 'sweep').map(c => c.agent)).toEqual([reviewer]);
 
     // A judge that fails on the sweep's findings ends the round incomplete, so no blocker the sweep found is lost
     // behind an approval. The record keeps what the first judge call graded, and nothing is posted.
     for (const [error, summary] of [[new Error('Judge left out 1 of 3 findings twice'), 'The judge failed on the findings of the sweep. Retry with @manki review.'], [new QuotaError('rate limited', 'requests'), expect.stringContaining('requests')]] as const) {
-      const failed = (await run(true, false, error)).result;
+      const failed = (await run('blockers', false, error)).result;
       expect([failed.outcome, failed.verdict, failed.reviewComplete, failed.findings]).toEqual(['INCOMPLETE', 'COMMENT', false, []]);
       expect(failed.summary).toEqual(summary);
       expect(failed.allJudgedFindings?.map(f => f.title)).toEqual(['Cache key misses the locale', 'Retry loses the reason', 'Rename the helper']);
-      expect(failed.sweeps).toEqual([{ reviewer, blocker: 'src/cache.ts:10', status: 'answered', class: 'a cache key leaves out a field the value depends on', findings: 6 }]);
+      expect(failed.sweeps).toEqual([{ reviewer, source: 'src/cache.ts:10', severity: 'blocker', status: 'answered', class: 'a cache key leaves out a field the value depends on', findings: 6 }]);
       // The record also keeps the places the sweep found, which the judge did not get to grade.
       expect(failed.rawFindings?.map(f => f.title)).toEqual(expect.arrayContaining([elsewhere.title, nearCited.title, citedByDropped.title]));
     }
@@ -2866,11 +2906,16 @@ describe('runReview', () => {
       expect(result.outcome).toBe('ADDRESS_FIRST');
     });
 
-    it('never leaves out a finding that would be a blocker if true, a finding in the `rare` column, a security finding, a tool alert or a finding that breaks a confirmed rule', async () => {
+    it('never leaves out a finding that would be a blocker if true, a blocker cell the judge keeps at a warning, a finding in the `rare` column, a security finding, a tool alert or a finding that breaks a confirmed rule', async () => {
       const rule = { file: 'AGENTS.md', quote: 'Every migration needs a rollback.' };
       const lowered = (by: 'unproven' | 'build_claim' | 'refutation' | 'judge') => ({ gradePath: [{ from: 'blocker' as const, to: 'warning' as const, by }] });
+      const keptDown = { doubts, gradeIfConfirmed: 'warning' as const, cell: { row: 'wrong' as const, column: 'normal' as const } };
       const result = await review({
         'The judge held a blocker cell down': { ...proof, doubts, gradeIfConfirmed: 'blocker', ...checked('unsettled') },
+        // The judge stated `warning` for the case that the doubt holds. The cell still gives a blocker, so an open doubt never leaves it out.
+        'The judge keeps a blocker cell at a warning': { ...keptDown, ...checked('unsettled') },
+        'The judge keeps a blocker cell at a warning, past the limit of checks': { ...keptDown, overCheckLimit: true },
+        'The judge keeps a blocker cell at a warning, confirmed': { ...keptDown, ...checked('confirmed') },
         // No answer makes it a blocker, and it is posted whatever its check answered.
         'The judge placed it in the rare column': { doubts, gradeIfConfirmed: 'blocker', cell: { row: 'wrong', column: 'rare' }, ...checked('unsettled') },
         'A blocker without cited lines': { tags: ['unproven-blocker'], ...lowered('unproven'), ...checked('unsettled') },
@@ -2886,7 +2931,9 @@ describe('runReview', () => {
       }, true);
 
       expect(shown(result)).toEqual([
-        ['The judge held a blocker cell down', 'unconfirmed'], ['The judge placed it in the rare column', 'unconfirmed'], ['A blocker without cited lines', 'unconfirmed'], ['A build failure no CI result reports', 'unconfirmed'],
+        ['The judge held a blocker cell down', 'unconfirmed'], ['The judge keeps a blocker cell at a warning', 'unconfirmed'],
+        ['The judge keeps a blocker cell at a warning, past the limit of checks', 'unconfirmed'], ['The judge keeps a blocker cell at a warning, confirmed', 'confirmed'],
+        ['The judge placed it in the rare column', 'unconfirmed'], ['A blocker without cited lines', 'unconfirmed'], ['A build failure no CI result reports', 'unconfirmed'],
         ['A finder filed it as a blocker', 'unconfirmed'], ['A blocker the judge lowered', 'unconfirmed'], ['A security finding', 'unconfirmed'], ['A tool alert', undefined],
         ['A rule blocker without a search', 'unconfirmed'],
       ]);
@@ -4075,6 +4122,7 @@ describe('runReview', () => {
     ['the provider call rejects', () => Promise.reject(new Error('API error')), 'API error'],
     ['the output is not JSON', () => Promise.resolve({ content: 'I cannot review this.' }), 'malformed response'],
     ['the output is truncated', () => Promise.resolve({ content: '[]', truncated: true }), 'truncated at the output token limit'],
+    ['no element of the output has a title or a description', () => Promise.resolve({ content: '[{"finding":{"title":"Unchecked sum"}}]' }), 'no element has a title or a description (1 element(s), keys: finding)'],
   ])('returns COMMENT verdict after retries when all agents fail because %s', async (_label, respond, reason) => {
     const sendMessage = jest.fn().mockImplementation(respond);
     const clients: ReviewClients = {
@@ -4095,6 +4143,7 @@ describe('runReview', () => {
     expect(sendMessage).toHaveBeenCalledTimes(2 * (MAX_AGENT_RETRIES + 1));
     for (const name of result.failedAgents!) {
       expect(result.agentFailureReasons?.[name]).toContain(reason);
+      expect(result.agentWarnings?.get(name)).toEqual(Array(MAX_AGENT_RETRIES + 1).fill(result.agentFailureReasons?.[name]));
     }
     expect(mockedRunJudgeAgent).not.toHaveBeenCalled();
   });
@@ -5386,6 +5435,7 @@ describe('runReview', () => {
     expect(result.outcome).toBe('INCOMPLETE');
     expect(result.reviewComplete).toBe(false);
     expect(result.summary).toContain('`src/blob.ts:2` (60016 characters)');
+    expect(result.summary).toMatch(/and push again\. If the push starts no review, .+ comment `@manki review`\.$/);
     expect(clients.reviewer.sendMessage).not.toHaveBeenCalled();
     expect(clients.judge.sendMessage).not.toHaveBeenCalled();
 
@@ -5501,10 +5551,13 @@ describe('runReview', () => {
     expect(pairSuccess[0].completedAgents).toBeGreaterThan(pairFailure[0].completedAgents!);
   });
 
-  it('retries a finder whose reply is prose with a note that names the error, and keeps the findings of the retry', async () => {
+  it.each<[string, string, RegExp]>([
+    ['is prose', 'I checked the changed files and the sum looks fine.', /^malformed response \(length 51\): .+$/],
+    ['holds no element with a title or a description', '[{"finding":{"title":"Unchecked sum","file":"src/a.ts"}}]', /^no element has a title or a description \(1 element\(s\), keys: finding\)$/],
+  ])('retries a finder whose reply %s with a note that names the error, and keeps the findings of the retry', async (_label, reply, reason) => {
     const finding = { severity: 'blocker', title: 'Unchecked sum', file: 'src/a.ts', line: 5, description: 'Overflows.' };
     const pair = jest.fn()
-      .mockResolvedValueOnce({ content: 'I checked the changed files and the sum looks fine.' })
+      .mockResolvedValueOnce({ content: reply })
       .mockResolvedValue({ content: JSON.stringify([finding]) });
     const clients = pairedClients(jest.fn().mockResolvedValue({ content: '[]' }), pair);
     mockedRunJudgeAgent.mockImplementation(async (_client, _config, input) => ({ findings: input.findings, summary: 'ok' }));
@@ -5513,9 +5566,12 @@ describe('runReview', () => {
     expect(result.reviewComplete).toBe(true);
     expect(result.failedAgents).toBeUndefined();
     expect(pair).toHaveBeenCalledTimes(2);
+    // The record keeps why the first attempt failed, and only for the finder that was retried.
+    expect(result.agentFailureReasons).toBeUndefined();
+    expect([...result.agentWarnings!]).toEqual([['Claude Opus 5.5 · high', [expect.stringMatching(reason)]]]);
     const [[firstSystem, firstMessage], [retrySystem, retryMessage]] = pair.mock.calls as [string, string][];
     expect(retrySystem).toBe(firstSystem);
-    expect(retryMessage).toMatch(/^[\s\S]*\n\nYour previous reply could not be used: malformed response \(length 51\): .+\n\nReply with only the JSON array the system prompt describes, with no text, markdown or code fence around it\.$/);
+    expect(retryMessage.slice(firstMessage.length)).toMatch(new RegExp(`^\n\nYour previous reply could not be used: ${reason.source.slice(1, -1)}\n\nReply with only the JSON array the system prompt describes, with no text, markdown or code fence around it\\.$`));
     expect(retryMessage.startsWith(firstMessage)).toBe(true);
     // Only the retry carries the note: no first attempt does, of this finder or the other one.
     expect(firstMessage).not.toContain('Your previous reply could not be used');
