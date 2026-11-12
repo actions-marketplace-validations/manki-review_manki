@@ -2,6 +2,11 @@ name: Provider smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      prompt:
+        description: Prompt sent to each provider instead of the default one
+        type: string
+        required: false
   schedule:
     # Mondays at 09:00 UTC
     - cron: '0 9 * * 1'
@@ -19,18 +24,18 @@ jobs:
       matrix:
         include:
           - provider: anthropic
-            model: claude-haiku-4-5
+            model: claude-haiku-5-5
             effort: low
           - provider: openai
-            model: o4-mini
+            model: gpt-6-luna
             effort: low
           - provider: gemini
-            model: gemini-2.5-flash
+            model: gemini-3.5-flash-lite
             effort: low
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
@@ -43,6 +48,7 @@ jobs:
           MODEL: ${{ matrix.model }}
           EFFORT: ${{ matrix.effort }}
           PROVIDER: ${{ matrix.provider }}
+          PROMPT: ${{ inputs.prompt }}
           ANTHROPIC_API_KEY: ${{ matrix.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ matrix.provider == 'anthropic' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           OPENAI_API_KEY: ${{ matrix.provider == 'openai' && secrets.OPENAI_API_KEY || '' }}
@@ -51,9 +57,10 @@ jobs:
           GEMINI_OAUTH_TOKEN: ${{ matrix.provider == 'gemini' && secrets.GEMINI_OAUTH_TOKEN || '' }}
         run: |
           set +e
-          EFFORT_ARG=""
-          [ -n "${EFFORT}" ] && EFFORT_ARG="--effort ${EFFORT}"
-          npm run smoke -- --model "${MODEL}" ${EFFORT_ARG}
+          ARGS=(--model "${MODEL}")
+          [ -n "${EFFORT}" ] && ARGS+=(--effort "${EFFORT}")
+          [ -n "${PROMPT}" ] && ARGS+=(--prompt "${PROMPT}")
+          npm run smoke -- "${ARGS[@]}"
           rc=$?
           if [ $rc -eq 2 ]; then
             echo "::notice title=Smoke skipped::No credentials configured for ${PROVIDER}"

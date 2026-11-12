@@ -1,7 +1,10 @@
-import { Finding, FindingFingerprintEntry, RoundContext } from './types';
-import { Suppression } from './memory';
-import { classifyAuthorReply, collectInPrSuppressions, collectResolvedThreadIds, deduplicateFindings, fingerprintFinding, PreviousFinding, fetchRecapState, titlesOverlap, titleOverlapType, refreshAuthorReplyClass, llmDeduplicateFindings, parseFindingFromComment } from './recap';
-import { BOT_LOGIN, titleToSlug } from './github';
+import { Finding, FindingFingerprintEntry, RoundContext, SECURITY_TAG, ThreadEvaluation, threadBlocks } from './types';
+import { classifyAuthorReply, collectGuardedThreadIds, collectInPrSuppressions, isGuarded, collectResolvedThreadIds, currentFindingLine, deduplicateFindings, fingerprintFinding, PreviousFinding, fetchRecapState, REOPENED_MARKER, securityOverrideMarker, titlesOverlap, titleOverlapType, refreshAuthorReplyClass, replyClassOf, llmDeduplicateFindings, parseFindingFromComment } from './recap';
+import { AUTO_APPROVE_MARKER, BOT_LOGIN, formatFindingComment, titleToSlug } from './github';
+import { LAST_PAGE, makeFindingFingerprintEntry, makeRoundContext, paginateSinglePage, TEST_BOT, TEST_LINKS } from './test-utils';
+import { determineOutcome } from './review';
+import { highlightCode } from './highlight';
+import { applyCrossRoundSuppression } from './judge';
 
 jest.mock('@actions/core', () => ({
   info: jest.fn(),
@@ -13,7 +16,7 @@ jest.mock('@actions/core', () => ({
 import * as core from '@actions/core';
 
 const makeFinding = (overrides: Partial<Finding> = {}): Finding => ({
-  severity: 'suggestion',
+  severity: 'note',
   title: 'Test finding',
   file: 'src/index.ts',
   line: 10,
@@ -26,18 +29,8 @@ const makePrevious = (overrides: Partial<PreviousFinding> = {}): PreviousFinding
   title: 'Test finding',
   file: 'src/index.ts',
   line: 10,
-  severity: 'suggestion',
+  severity: 'note',
   status: 'open',
-  ...overrides,
-});
-
-const makeSuppression = (overrides: Partial<Suppression> = {}): Suppression => ({
-  id: 'sup-1',
-  pattern: 'test finding',
-  reason: 'intentional',
-  created_by: 'user',
-  created_at: '2025-01-01',
-  pr_ref: 'owner/repo#1',
   ...overrides,
 });
 
@@ -50,6 +43,36 @@ describe('deduplicateFindings', () => {
     expect(result.unique).toHaveLength(0);
     expect(result.duplicates).toHaveLength(1);
     expect(result.duplicates[0].matchType).toBe('exact');
+
+    const fixed = makePrevious({ ...previous[0], line: 40, fixed: true });
+    const kept = deduplicateFindings(findings, [fixed]);
+    expect(kept.duplicates).toHaveLength(0);
+    expect(kept.unique).toEqual([{ ...findings[0], resemblesFixed: { title: 'Missing null check', file: 'src/foo.ts', line: 40 } }]);
+    expect(deduplicateFindings(findings, [fixed, ...previous]).duplicates).toHaveLength(1);
+
+    // A lockfile alert on a nearby package shares most words with a waived one, but names another package.
+    const waivedAlert = makePrevious({ title: 'lockfile-change: updated hex 0.4.3 -> 0.4.2: downgrade.', file: 'Cargo.lock', line: 40, status: 'resolved' });
+    const alerts = [makeFinding({ title: 'lockfile-change: updated hey 0.4.3 -> 0.4.2: downgrade.', file: 'Cargo.lock', line: 44 })];
+    expect(deduplicateFindings(alerts, [waivedAlert]).unique).toEqual(alerts);
+    expect(deduplicateFindings([{ ...alerts[0], title: waivedAlert.title }], [waivedAlert]).duplicates).toHaveLength(1);
+  });
+
+  it('drops a repeat of an answered thread on a file unchanged since the last round, and sends any other to the judge with the answer', () => {
+    const findings = [makeFinding({ title: 'Missing null check', file: 'src/foo.ts', line: 42 })];
+    const answered = makePrevious({ title: 'Missing null check', file: 'src/foo.ts', line: 42, status: 'auto-resolved', threadId: 'T1', answer: 'Withdrawn. `id` is checked first.' });
+
+    expect(deduplicateFindings(findings, [answered], new Set(['src/bar.ts']))).toEqual({
+      unique: [],
+      duplicates: [{ finding: findings[0], matchedTitle: 'Missing null check', matchType: 'exact' }],
+    });
+    const toJudge = [{ ...findings[0], answeredIn: { threadId: 'T1', answer: 'Withdrawn. `id` is checked first.' } }];
+    expect(deduplicateFindings(findings, [answered], new Set(['src/foo.ts'])).unique).toEqual(toJudge);
+    expect(deduplicateFindings(findings, [answered]).unique).toEqual(toJudge);
+    expect(deduplicateFindings(findings, [{ ...answered, line: 0, originalLine: 41 }]).unique).toEqual(toJudge);
+    expect(deduplicateFindings(findings, [{ ...answered, originalLine: 10 }]).unique).toEqual(toJudge);
+    expect(deduplicateFindings(findings, [{ ...answered, answer: undefined }], new Set()).unique).toEqual(findings);
+    const unrelated = [makeFinding({ title: 'Unrelated race', file: 'src/foo.ts', line: 42 })];
+    expect(deduplicateFindings(unrelated, [answered], new Set()).unique).toEqual(unrelated);
   });
 
   it('attributes match types: exact, substring, word_overlap', () => {
@@ -76,6 +99,10 @@ describe('deduplicateFindings', () => {
     const result = deduplicateFindings(findings, previous);
     expect(result.unique).toHaveLength(0);
     expect(result.duplicates).toHaveLength(1);
+
+    // An outdated thread has `line` 0, so it is matched on the line its finding was posted on.
+    expect(deduplicateFindings(findings, [{ ...previous[0], line: 0, originalLine: 30, findingLine: 42 }]).duplicates).toHaveLength(1);
+    expect(deduplicateFindings(findings, [{ ...previous[0], line: 0, originalLine: 20 }]).duplicates).toHaveLength(0);
   });
 
   it('does not match different file with same title', () => {
@@ -239,6 +266,21 @@ describe('deduplicateFindings', () => {
     const result = deduplicateFindings(findings, previous);
     expect(result.unique).toHaveLength(1);
     expect(result.duplicates).toHaveLength(0);
+
+    // A thread posted on another file for a blocker without a line stands for the whole file, so the same title on any
+    // line repeats it once someone allowed to cleared it. A title that only overlaps does not, and neither does a line-less
+    // thread on the finding's own file.
+    const blocker = makeFinding({ ...findings[0], severity: 'blocker' });
+    const wholeFile = makePrevious({ ...previous[0], line: 0, severity: 'blocker', detached: true });
+    expect(deduplicateFindings([blocker], [wholeFile]).duplicates.map(d => d.matchType)).toEqual(['exact']);
+    expect(deduplicateFindings([{ ...blocker, title: 'Missing null-check before dereference' }], [wholeFile]).duplicates).toHaveLength(1);
+    expect(deduplicateFindings([{ ...blocker, title: 'Missing null check before the dereference in the loader' }], [wholeFile]).unique).toHaveLength(1);
+    expect(deduplicateFindings([blocker], [{ ...wholeFile, detached: undefined }]).unique).toHaveLength(1);
+    // The thread still has to be cleared: one the PR author resolved alone stays open and hides nothing.
+    expect(deduplicateFindings([blocker], [{ ...wholeFile, status: 'open' }]).unique).toHaveLength(1);
+    // With a line, such a thread matches by that line like any other.
+    expect(deduplicateFindings([blocker], [{ ...wholeFile, line: 45 }]).unique).toHaveLength(1);
+    expect(deduplicateFindings([blocker], [{ ...wholeFile, line: 66 }]).duplicates).toHaveLength(1);
   });
 
   it('does not match different file even with matching title', () => {
@@ -323,6 +365,12 @@ describe('classifyAuthorReply', () => {
     expect(classifyAuthorReply("I'll handle most of it in a follow-up")).toBe('partial');
     expect(classifyAuthorReply('Working on it')).toBe('partial');
     expect(classifyAuthorReply('Partially handled')).toBe('partial');
+  });
+
+  it('classifies a reply that opens with a dismiss command as agree', () => {
+    expect(classifyAuthorReply('@manki dismiss')).toBe('agree');
+    expect(classifyAuthorReply('/manki dismiss the token is test data')).toBe('agree');
+    expect(classifyAuthorReply('Please do not @manki dismiss this.')).not.toBe('agree');
   });
 
   it('returns none for undefined or empty text', () => {
@@ -446,86 +494,18 @@ describe('titlesOverlap', () => {
   });
 });
 
-describe('deduplicateFindings with suppressions', () => {
-  it('filters findings matching a suppression', () => {
-    const findings = [makeFinding({ title: 'Test finding in module', file: 'src/foo.ts', line: 10 })];
-    const suppressions = [makeSuppression({ pattern: 'test finding' })];
-
-    const result = deduplicateFindings(findings, [], suppressions);
-    expect(result.unique).toHaveLength(0);
-  });
-
-  it('keeps findings that do not match any suppression', () => {
-    const findings = [makeFinding({ title: 'Unused variable', file: 'src/foo.ts', line: 10 })];
-    const suppressions = [makeSuppression({ pattern: 'test finding' })];
-
-    const result = deduplicateFindings(findings, [], suppressions);
-    expect(result.unique).toHaveLength(1);
-    expect(result.unique[0].title).toBe('Unused variable');
-  });
-
-  it('works with no suppressions (backward compat)', () => {
-    const findings = [makeFinding({ title: 'Missing null check', file: 'src/foo.ts', line: 42 })];
-
-    const result = deduplicateFindings(findings, []);
-    expect(result.unique).toHaveLength(1);
-  });
-
-  it('works with undefined suppressions (backward compat)', () => {
-    const findings = [makeFinding({ title: 'Missing null check', file: 'src/foo.ts', line: 42 })];
-
-    const result = deduplicateFindings(findings, [], undefined);
-    expect(result.unique).toHaveLength(1);
-  });
-
-  it('works with empty suppressions array', () => {
-    const findings = [makeFinding({ title: 'Missing null check', file: 'src/foo.ts', line: 42 })];
-
-    const result = deduplicateFindings(findings, [], []);
-    expect(result.unique).toHaveLength(1);
-  });
-
-  it('respects file_glob in suppressions', () => {
-    const findings = [
-      makeFinding({ title: 'Test finding A', file: 'src/foo.ts', line: 10 }),
-      makeFinding({ title: 'Test finding B', file: 'test/bar.ts', line: 20 }),
-    ];
-    const suppressions = [makeSuppression({ pattern: 'test finding', file_glob: 'src/**' })];
-
-    const result = deduplicateFindings(findings, [], suppressions);
-    expect(result.unique).toHaveLength(1);
-    expect(result.unique[0].title).toBe('Test finding B');
-  });
-
-  it('applies both suppressions and dedup together', () => {
-    const findings = [
-      makeFinding({ title: 'Test finding', file: 'src/foo.ts', line: 10 }),
-      makeFinding({ title: 'Missing null check', file: 'src/bar.ts', line: 42 }),
-      makeFinding({ title: 'Unused import', file: 'src/baz.ts', line: 5 }),
-    ];
-    const previous = [makePrevious({ title: 'Missing null check', file: 'src/bar.ts', line: 42, status: 'resolved' })];
-    const suppressions = [makeSuppression({ pattern: 'test finding' })];
-
-    const result = deduplicateFindings(findings, previous, suppressions);
-    expect(result.unique).toHaveLength(1);
-    expect(result.unique[0].title).toBe('Unused import');
-    expect(result.duplicates).toHaveLength(1);
-    expect(result.duplicates[0].finding.title).toBe('Missing null check');
-    expect(result.duplicates[0].matchedTitle).toBe('Missing null check');
-  });
-});
-
 describe('fetchRecapState', () => {
   function makeThread(overrides: Record<string, unknown> = {}) {
     return {
       id: 'thread-1',
       isResolved: false,
+      resolvedBy: { login: 'alice' },
       path: 'src/foo.ts',
       line: 10,
       comments: {
         nodes: [{
           body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Missing null check\n\nDescription here.',
-          author: { login: 'github-actions[bot]' },
+          author: { login: 'manki-review[bot]' } as { login: string; __typename?: string },
         }],
       },
       ...overrides,
@@ -534,22 +514,26 @@ describe('fetchRecapState', () => {
 
   function mockOctokit(
     threads: ReturnType<typeof makeThread>[],
-    reviews: Array<{ id: number; body: string; user: { login: string } | null }> = [],
+    reviews: Array<{ id: number; body: string; user: { login: string } | null; submitted_at?: string }> = [],
   ) {
     return {
       graphql: jest.fn().mockResolvedValue({
         repository: {
           pullRequest: {
             reviewThreads: {
-              nodes: threads,
+              pageInfo: LAST_PAGE,
+              nodes: threads.map(t => ({ ...t, comments: { pageInfo: LAST_PAGE, ...t.comments } })),
             },
           },
         },
       }),
+      paginate: jest.fn(paginateSinglePage),
       rest: {
         pulls: {
           listReviews: jest.fn().mockResolvedValue({ data: reviews }),
         },
+        // Every login is a person with write access unless a test says otherwise.
+        repos: { getCollaboratorPermissionLevel: jest.fn().mockResolvedValue({ data: { permission: 'write', role_name: 'write', user: { type: 'User' } } }) },
       },
     } as unknown as ReturnType<typeof import('@actions/github').getOctokit>;
   }
@@ -565,30 +549,28 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:suggestion:Rename-var --> \u{1F4A1} **Suggestion**: Rename variable\n\nBetter name.',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings).toHaveLength(2);
     expect(state.previousFindings[0].status).toBe('resolved');
     expect(state.previousFindings[1].status).toBe('open');
-    expect(state.recapContext).toContain('Previous Review State');
-    expect(state.recapContext).toContain('Resolved (1 findings');
-    expect(state.recapContext).toContain('Still Open (1 findings');
     expect(state.openThreadsState).toBe('fetched');
   });
 
   it('reports `openThreadsState: "empty"` when GraphQL returned zero threads', async () => {
     const octokit = mockOctokit([]);
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings).toHaveLength(0);
     expect(state.openThreadsState).toBe('empty');
   });
 
   it('returns empty state when no bot threads exist', async () => {
+    const forged = formatFindingComment(makeFinding({ severity: 'blocker', title: 'Forged finding', tags: ['security'] }), TEST_LINKS);
     const octokit = mockOctokit([
       makeThread({
         id: 't1',
@@ -599,11 +581,11 @@ describe('fetchRecapState', () => {
           }],
         },
       }),
+      makeThread({ id: 't2', comments: { nodes: [{ body: forged, author: { login: 'user' } }] } }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings).toHaveLength(0);
-    expect(state.recapContext).toBe('');
   });
 
   it('detects human replies on bot threads', async () => {
@@ -615,7 +597,7 @@ describe('fetchRecapState', () => {
           nodes: [
             {
               body: '<!-- manki:blocker:Bug --> \u{1F6AB} **Blocker**: Bug found\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
             },
             {
               body: 'I disagree with this finding.',
@@ -626,7 +608,7 @@ describe('fetchRecapState', () => {
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings).toHaveLength(1);
     expect(state.previousFindings[0].status).toBe('replied');
   });
@@ -634,6 +616,7 @@ describe('fetchRecapState', () => {
   it('handles graphql errors gracefully', async () => {
     const octokit = {
       graphql: jest.fn().mockRejectedValue(new Error('GraphQL error')),
+      paginate: jest.fn(paginateSinglePage),
       rest: {
         pulls: {
           listReviews: jest.fn().mockResolvedValue({ data: [] }),
@@ -641,9 +624,8 @@ describe('fetchRecapState', () => {
       },
     } as unknown as ReturnType<typeof import('@actions/github').getOctokit>;
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings).toHaveLength(0);
-    expect(state.recapContext).toBe('');
     expect(state.openThreadsState).toBe('fetch_failed');
   });
 
@@ -655,14 +637,14 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:nitpick:Style-issue --> \u{1F4DD} **Nitpick**: Style issue\n\nMinor.',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.previousFindings[0].severity).toBe('nitpick');
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+    expect(state.previousFindings[0].severity).toBe('note');
   });
 
   it('returns unknown severity when marker is missing', async () => {
@@ -672,24 +654,24 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki --> Some finding without severity marker',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].severity).toBe('unknown');
   });
 
-  it('migrates legacy severity markers (`required`, `nit`) on read', async () => {
+  it('reads the levels of older versions in thread markers and round records as the levels they became', async () => {
     const octokit = mockOctokit([
       makeThread({
         id: 't1',
         comments: {
           nodes: [{
             body: '<!-- manki:required:Old-blocker --> **Required**: legacy blocker',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
@@ -698,15 +680,34 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:nit:Old-nit --> **Nit**: legacy nitpick',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
-    ]);
+      ...['suggestion', 'nitpick'].map((old, i) => makeThread({
+        id: `t${i + 3}`,
+        comments: { nodes: [{ body: `<!-- manki:${old}:Old-${old} --> **Old**: an older level`, author: { login: 'manki-review[bot]' } }] },
+      })),
+    ], [{
+      id: 1, user: { login: 'manki-review[bot]' }, body: `<!-- manki-context: ${JSON.stringify(makeRoundContext(1, {
+        findings: {
+          count: 2, severityCounts: { blocker: 0, warning: 0, suggestion: 1, nitpick: 1 },
+          entries: [
+            { ...makeFindingFingerprintEntry({ title: 'Rename helper' }), severity: 'suggestion', reviewerSeverity: 'nitpick', gradePath: [{ from: 'nitpick', to: 'suggestion', by: 'judge' }] },
+            { ...makeFindingFingerprintEntry({ title: 'Typo' }), severity: 'nitpick', originalSeverity: 'required' },
+          ] as unknown as FindingFingerprintEntry[],
+        },
+      }))} -->`,
+    }]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.previousFindings[0].severity).toBe('blocker');
-    expect(state.previousFindings[1].severity).toBe('nitpick');
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+    expect(state.previousFindings.map(f => f.severity)).toEqual(['blocker', 'note', 'note', 'note']);
+    expect(state.priorRounds[0].findings.severityCounts).toEqual({ blocker: 0, warning: 0, note: 2 });
+    expect(state.priorRounds[0].findings.entries.map(e => [e.severity, e.reviewerSeverity, e.originalSeverity, e.gradePath])).toEqual([
+      // The step between the two old levels is no grade change any more, so the entry keeps no path.
+      ['note', 'note', undefined, undefined],
+      ['note', undefined, 'blocker', undefined],
+    ]);
   });
 
   it('extracts title when confidence sub tag is present', async () => {
@@ -717,7 +718,7 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:blocker:Prompt-injection --> 🚫 **Blocker** <sub>[high confidence]</sub>: Prompt injection via unsanitized file paths\n\nDescription.',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
@@ -729,13 +730,13 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:suggestion:LLM-dedup --> 💡 **Suggestion** <sub>[medium confidence]</sub>: LLM dedup only compares against resolved findings\n\nDetails.',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].title).toBe('Prompt injection via unsanitized file paths');
     expect(state.previousFindings[1].title).toBe('LLM dedup only compares against resolved findings');
   });
@@ -745,7 +746,7 @@ describe('fetchRecapState', () => {
       makeThread({ id: 't1', line: null }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].line).toBe(0);
   });
 
@@ -757,13 +758,13 @@ describe('fetchRecapState', () => {
           nodes: [{
             body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Missing null check',
             url: 'https://github.com/owner/repo/pull/1#discussion_r123',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].threadUrl).toBe('https://github.com/owner/repo/pull/1#discussion_r123');
   });
 
@@ -774,17 +775,23 @@ describe('fetchRecapState', () => {
         comments: {
           nodes: [{
             body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Missing null check',
-            author: { login: 'github-actions[bot]' },
+            author: { login: 'manki-review[bot]' },
           }],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].threadUrl).toBe('');
   });
 
-  it('treats last non-bot comment body as author reply text', async () => {
+  it('treats last non-bot comment body as author reply text, and the latest Manki outcome or found-again reply as its answer', async () => {
+    const record = (round: number, threadEvaluations: ThreadEvaluation[], carried: string[] = []) => ({
+      id: round, user: { login: 'manki-review[bot]' }, body: `<!-- manki-context: ${JSON.stringify(makeRoundContext(round, {
+        judge: { summary: '', threadEvaluations },
+        findings: { count: carried.length, severityCounts: {}, entries: carried.map(threadId => makeFindingFingerprintEntry({ title: 'Came back', severity: 'blocker', threadId })) },
+      }))} -->`,
+    });
     const octokit = mockOctokit([
       makeThread({
         id: 't1',
@@ -793,7 +800,8 @@ describe('fetchRecapState', () => {
           nodes: [
             {
               body: '<!-- manki:blocker:Bug --> \u{1F6AB} **Blocker**: Bug found\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
+              originalCommit: { oid: 'c0ffee' },
             },
             {
               body: 'Fixed, done.',
@@ -802,10 +810,81 @@ describe('fetchRecapState', () => {
           ],
         },
       }),
+      makeThread({
+        id: 't2',
+        comments: {
+          nodes: [
+            { body: '<!-- manki:blocker:Bug --> \u{1F6AB} **Blocker**: Bug found\n\nDesc.', author: { login: 'manki-review[bot]' } },
+            { body: 'It is intended.', author: { login: 'developer' } },
+            { body: '**Withdrawn.** `load` returns early.\n\n<!-- manki -->', author: { login: 'manki-review[bot]' } },
+            { body: 'Agreed. Developer text that looks like an answer.', author: { login: 'developer' } },
+            { body: 'Fixed in abc1234.\n\n<!-- manki -->', author: { login: 'manki-review[bot]' } },
+          ],
+        },
+      }),
+      makeThread({
+        id: 't3',
+        comments: {
+          nodes: [
+            { body: '<!-- manki:warning:Bug --> **Warning**: Bug found\n\nDesc.', author: { login: 'manki-review[bot]' } },
+            { body: 'Agreed. Handling it later is fine.\n\n<!-- manki -->', author: { login: 'manki-review[bot]' } },
+            { body: 'This came up again.\n\nDetails.\n\n<!-- manki -->\n<!-- manki-found-again -->', author: { login: 'manki-review[bot]' } },
+          ],
+        },
+      }),
+      makeThread({
+        id: 't4',
+        comments: {
+          nodes: [
+            { body: '<!-- manki:blocker:Upload --> **Blocker**: Upload\n\nDesc.', author: { login: 'manki-review[bot]' } },
+            { body: '**Partly fixed.** Still open: a slow log.\n\n<!-- manki -->', author: { login: 'manki-review[bot]' } },
+          ],
+        },
+      }),
+      makeThread({
+        id: 't6',
+        comments: {
+          nodes: [
+            { body: formatFindingComment({ severity: 'blocker', title: 'Token in log', file: 'src/a.ts', line: 3, description: 'd', reviewers: [], tags: ['security'] }, TEST_LINKS), author: { login: 'manki-review[bot]' } },
+          ],
+        },
+      }),
+      makeThread({
+        id: 't5',
+        comments: {
+          nodes: [
+            { body: '<!-- manki:blocker:Upload --> **Blocker**: Upload\n\nDesc.', author: { login: 'manki-review[bot]' } },
+            { body: 'This came up again.\n\n<!-- manki -->\n<!-- manki-found-again-blocker -->', author: { login: 'manki-review[bot]' } },
+          ],
+        },
+      }),
+    ], [
+      // The round records keep the grade each partial fix left, and the latest one counts. Only Manki's records count.
+      record(1, [{ threadId: 't4', status: 'partly_addressed', reason: 'r', remaining: 'No timeout.', grade: 'warning' }]),
+      record(2, [
+        { threadId: 't4', status: 'partly_addressed', reason: 'r', remaining: 'A slow log.', grade: 'note' },
+        { threadId: 't5', status: 'partly_addressed', reason: 'r', remaining: 'A slow log.', grade: 'note' },
+        { threadId: 't6', status: 'partly_addressed', reason: 'r', remaining: 'One log line.', grade: 'warning' },
+      ]),
+      // A blocker a round carried on a thread raises it, after any partial fix in that round or before.
+      record(3, [{ threadId: 't4', status: 'not_addressed', reason: 'r' }, { threadId: 't3', status: 'partly_addressed', reason: 'r', remaining: 'r', grade: 'note' }], ['t3', 't5']),
+      { ...record(4, [{ threadId: 't1', status: 'partly_addressed', reason: 'r', remaining: 'r', grade: 'note' }]), user: { login: 'developer' } },
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].authorReplyText).toBe('Fixed, done.');
+    // The commit a thread was posted on still holds the code it named after the thread goes outdated.
+    expect(state.previousFindings.map(f => f.originalCommit)).toEqual(['c0ffee', undefined, undefined, undefined, undefined, undefined]);
+    expect(state.previousFindings.slice(0, 3).map(f => f.answer)).toEqual([undefined, '**Withdrawn.** `load` returns early.', 'This came up again.\n\nDetails.']);
+    // A severity comes from the first comment only, and no reply marker raises it, not even a pasted one.
+    expect(state.previousFindings.map(f => f.severity)).toEqual(['blocker', 'blocker', 'warning', 'blocker', 'blocker', 'blocker']);
+    // A security thread keeps a recorded lower grade too, which `threadBlocks` never lets lower it.
+    expect(state.previousFindings.map(f => f.recordedGrade)).toEqual([undefined, undefined, 'blocker', 'note', 'warning', 'blocker']);
+    // The peak keeps the highest grade the records ever gave, so a lowered thread can get it back.
+    expect(state.previousFindings.map(f => f.peakGrade)).toEqual([undefined, undefined, 'blocker', 'warning', 'warning', 'blocker']);
+    expect(state.previousFindings.map(f => threadBlocks(f))).toEqual([true, true, true, false, true, true]);
+    // Only a thread that still blocks needs someone other than the PR author to clear it.
+    expect(state.previousFindings.map(f => isGuarded(f))).toEqual([true, true, true, false, true, true]);
   });
 
   it('uses the latest non-bot reply when multiple human replies exist', async () => {
@@ -817,7 +896,7 @@ describe('fetchRecapState', () => {
           nodes: [
             {
               body: '<!-- manki:required:Bug --> \u{1F6AB} **Required**: Bug found\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
             },
             {
               body: 'Fixed, done.',
@@ -832,7 +911,7 @@ describe('fetchRecapState', () => {
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].authorReplyText).toBe('Actually, disagree -- reverting.');
   });
 
@@ -845,7 +924,7 @@ describe('fetchRecapState', () => {
           nodes: [
             {
               body: '<!-- manki:required:Bug --> \u{1F6AB} **Required**: Bug found\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
             },
             {
               body: 'Follow-up bot reply from the App identity.',
@@ -853,17 +932,79 @@ describe('fetchRecapState', () => {
             },
             {
               body: 'Another follow-up from the Actions identity.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
+            },
+            {
+              body: 'GraphQL reports the App without the `[bot]` suffix.',
+              author: { login: 'manki-review' },
             },
           ],
         },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].authorReplyText).toBeUndefined();
     expect(state.previousFindings[1].authorReplyText).toBeUndefined();
     expect(state.previousFindings[1].status).toBe('open');
+  });
+
+  it('reads every page of review threads and every comment of a long thread', async () => {
+    const threads = Array.from({ length: 150 }, (_, i) => makeThread({ id: `t${i}`, line: i + 1 }));
+    const longThread = threads[149];
+    const botReplies = Array.from({ length: 9 }, (_, i) => ({ body: `Bot follow-up ${i}`, author: { login: 'manki-review[bot]' } }));
+    threads[149] = {
+      ...longThread,
+      comments: { ...longThread.comments, pageInfo: { hasNextPage: true, endCursor: 'c1' }, nodes: [...longThread.comments.nodes, ...botReplies] },
+    } as typeof longThread;
+    let threadCommentsError: Error | null = null;
+    const graphql = jest.fn(async (_query: string, vars: { cursor: string | null; threadId?: string }) => {
+      if (vars.threadId) {
+        if (threadCommentsError) throw threadCommentsError;
+        return { node: { comments: { pageInfo: LAST_PAGE, nodes: [{ body: 'Final answer.', author: { login: 'developer' } }] } } };
+      }
+      const firstPage = vars.cursor === null;
+      return {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: firstPage ? { hasNextPage: true, endCursor: 'p2' } : LAST_PAGE,
+              nodes: (firstPage ? threads.slice(0, 100) : threads.slice(100))
+                .map(t => ({ ...t, comments: { pageInfo: LAST_PAGE, ...t.comments, nodes: [...t.comments.nodes] } })),
+            },
+          },
+        },
+      };
+    });
+    const octokit = { ...mockOctokit([]), graphql } as unknown as ReturnType<typeof mockOctokit>;
+
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+
+    expect(state.previousFindings).toHaveLength(150);
+    expect(state.previousFindings[149]).toMatchObject({ status: 'replied', authorReplyText: 'Final answer.' });
+    expect(graphql.mock.calls.map(([, vars]) => vars)).toEqual([
+      expect.objectContaining({ cursor: null }),
+      expect.objectContaining({ cursor: 'p2' }),
+      { threadId: 't149', cursor: 'c1' },
+    ]);
+
+    threadCommentsError = new Error('network down');
+    const partial = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+
+    expect(partial.openThreadsState).toBe('fetched');
+    expect(partial.previousFindings).toHaveLength(150);
+    expect(partial.previousFindings[149]).toMatchObject({ status: 'open', authorReplyText: undefined });
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('review thread t149, using the first 10: Error: network down'));
+
+    // A maintainer's reply among the comments read backs Manki's resolve only when no later reply can be missing.
+    const backed = async (pageInfo: { hasNextPage: boolean; endCursor: string | null }) => {
+      const nodes = [...makeThread().comments.nodes, { body: 'Every caller checks it.', author: { login: 'bob' } }];
+      const cut = mockOctokit([makeThread({ id: 'tb', isResolved: true, resolvedBy: { login: 'manki-review[bot]' }, comments: { pageInfo, nodes } })]);
+      Object.assign(cut.rest, { repos: { getCollaboratorPermissionLevel: jest.fn(async () => ({ data: { permission: 'write', user: { type: 'User' } } })) } });
+      return (await fetchRecapState(cut, TEST_BOT, 'owner', 'repo', 1, 'author')).previousFindings.map(f => [f.status, !!f.authorReplyMayClear]);
+    };
+    expect(await backed(LAST_PAGE)).toEqual([['auto-resolved', true]]);
+    expect(await backed({ hasNextPage: true, endCursor: 'c1' })).toEqual([['replied', false]]);
   });
 
   it('populates lineStart from startLine when present for multi-line annotations', async () => {
@@ -871,7 +1012,7 @@ describe('fetchRecapState', () => {
       makeThread({ id: 't1', line: 44, startLine: 40 }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].line).toBe(44);
     expect(state.previousFindings[0].lineStart).toBe(40);
   });
@@ -881,160 +1022,8 @@ describe('fetchRecapState', () => {
       makeThread({ id: 't1', line: 42, startLine: null }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].lineStart).toBe(42);
-  });
-
-  it('builds recap context with only resolved findings', async () => {
-    const octokit = mockOctokit([
-      makeThread({ id: 't1', isResolved: true }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.recapContext).toContain('Resolved (1 findings');
-    expect(state.recapContext).not.toContain('Still Open');
-  });
-
-  it('builds recap context with only open findings', async () => {
-    const octokit = mockOctokit([
-      makeThread({ id: 't1', isResolved: false }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.recapContext).not.toContain('Resolved');
-    expect(state.recapContext).toContain('Still Open (1 findings');
-  });
-
-  it('includes replied+agree findings from the PR author in the resolved section of recapContext', async () => {
-    const octokit = mockOctokit([
-      makeThread({
-        id: 't1',
-        isResolved: false,
-        comments: {
-          nodes: [
-            {
-              body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
-            },
-            { body: 'Fixed, done.', author: { login: 'developer' } },
-          ],
-        },
-      }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1, 'developer');
-    expect(state.recapContext).toContain('### Resolved');
-    expect(state.recapContext).toContain('Unused variable');
-    expect(state.recapContext).not.toContain('### Still Open');
-  });
-
-  // Mirrors the prAuthorLogin gate in inPrSuppressionReasonFor: a third-party
-  // commenter replying "Fixed!" must not be able to promote a finding to the
-  // Resolved section of recapContext. Without this gate, agents would stop
-  // re-flagging the issue even though applyInPrSuppression would (correctly)
-  // refuse to suppress it. replied threads land in neither section by design,
-  // matching the existing replied+disagree behaviour.
-  it('omits replied+agree findings from a third-party commenter from the Resolved section of recapContext', async () => {
-    const octokit = mockOctokit([
-      makeThread({
-        id: 't1',
-        isResolved: false,
-        comments: {
-          nodes: [
-            {
-              body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
-            },
-            { body: 'Fixed!', author: { login: 'random-user' } },
-          ],
-        },
-      }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1, 'pr-author');
-    expect(state.previousFindings[0].status).toBe('replied');
-    expect(state.recapContext).not.toContain('### Resolved');
-    expect(state.recapContext).not.toContain('### Still Open');
-  });
-
-  // When prAuthorLogin is undefined (e.g. PR author cannot be determined),
-  // replied+agree findings are not promoted to Resolved. This matches the
-  // conservative posture of inPrSuppressionReasonFor.
-  it('omits replied+agree findings from the Resolved section when prAuthorLogin is undefined', async () => {
-    const octokit = mockOctokit([
-      makeThread({
-        id: 't1',
-        isResolved: false,
-        comments: {
-          nodes: [
-            {
-              body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
-            },
-            { body: 'Fixed, done.', author: { login: 'developer' } },
-          ],
-        },
-      }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.previousFindings[0].status).toBe('replied');
-    expect(state.recapContext).not.toContain('### Resolved');
-    expect(state.recapContext).not.toContain('### Still Open');
-  });
-
-  // Locks in the invariant that open-status findings (no human reply yet) stay in
-  // 'Still Open' and are not promoted to Resolved. Only replied+agree threads are
-  // promoted; `applyInPrSuppression` handles any post-LLM suppression separately.
-  it('keeps open findings (no human reply) in Still Open section of recapContext (not Resolved)', async () => {
-    const octokit = mockOctokit([
-      makeThread({
-        id: 't1',
-        isResolved: false,
-        path: 'src/foo.ts',
-        line: 10,
-        comments: {
-          nodes: [
-            {
-              body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
-            },
-          ],
-        },
-      }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.previousFindings[0].status).toBe('open');
-    expect(state.recapContext).toContain('### Still Open');
-    expect(state.recapContext).toContain('Unused variable');
-    expect(state.recapContext).not.toContain('### Resolved');
-  });
-
-  // Locks in the invariant that replied+disagree (and replied+partial) findings
-  // appear in neither the Resolved nor the Still Open section of recapContext.
-  // They remain pending human resolution; surfacing them again would re-bias agents.
-  it('omits replied+disagree findings from both Resolved and Still Open sections of recapContext', async () => {
-    const octokit = mockOctokit([
-      makeThread({
-        id: 't1',
-        isResolved: false,
-        comments: {
-          nodes: [
-            {
-              body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
-            },
-            { body: 'I disagree, keeping as-is.', author: { login: 'developer' } },
-          ],
-        },
-      }),
-    ]);
-
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-    expect(state.previousFindings[0].status).toBe('replied');
-    expect(state.recapContext).not.toContain('### Resolved');
-    expect(state.recapContext).not.toContain('### Still Open');
   });
 
   it('captures authorReplyLogin from the latest non-bot reply', async () => {
@@ -1046,7 +1035,7 @@ describe('fetchRecapState', () => {
           nodes: [
             {
               body: '<!-- manki:suggestion:unused-var --> 💡 **Suggestion**: Unused variable\n\nDesc.',
-              author: { login: 'github-actions[bot]' },
+              author: { login: 'manki-review[bot]' },
             },
             { body: 'Working on it.', author: { login: 'someone-else' } },
             { body: 'Fixed, done.', author: { login: 'pr-author' } },
@@ -1055,7 +1044,7 @@ describe('fetchRecapState', () => {
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].authorReplyLogin).toBe('pr-author');
     expect(state.previousFindings[0].authorReplyText).toBe('Fixed, done.');
   });
@@ -1080,13 +1069,51 @@ describe('fetchRecapState', () => {
       makeThread({
         id: 't1',
         isResolved: false,
-        comments: { nodes: [{ body, author: { login: 'github-actions[bot]' } }] },
+        comments: { nodes: [{ body, author: { login: 'manki-review[bot]' } }] },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].description).toBe('The pointer is dereferenced without a prior null check.');
     expect(state.previousFindings[0].suggestedFix).toBe('Add null check before dereferencing ptr.');
+  });
+
+  it('recovers the title, `description` and `suggestedFix` from a comment posted by `formatFindingComment`', async () => {
+    const body = formatFindingComment({
+      severity: 'warning',
+      title: 'Null pointer dereference',
+      file: 'src/a.ts',
+      line: 4,
+      description: 'The pointer is dereferenced without a prior null check.',
+      suggestedFix: 'if (!ptr) return;',
+      reviewers: ['SecurityReviewer'],
+    }, TEST_LINKS);
+    const octokit = mockOctokit([
+      makeThread({
+        id: 't1',
+        isResolved: false,
+        comments: { nodes: [{ body, author: { login: 'manki-review[bot]' } }] },
+      }),
+    ]);
+
+    const [finding] = (await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1)).previousFindings;
+    expect(finding).toMatchObject({
+      title: 'Null pointer dereference',
+      severity: 'warning',
+      markerSlug: 'Null-pointer-dereference',
+      description: 'The pointer is dereferenced without a prior null check.…(truncated)',
+      suggestedFix: 'if (!ptr) return;',
+    });
+
+    // The labels, a prose fix and the line saying nothing was checked are not read back as description.
+    const unchecked = formatFindingComment({ severity: 'warning', title: 'Unchecked', file: 'src/a.ts', line: 4, description: 'It goes wrong.', suggestedFix: 'Handle the `None` case separately.', reviewers: ['SecurityReviewer'] }, TEST_LINKS);
+    expect(unchecked).toContain('**What goes wrong:** It goes wrong.\n\n<!-- manki-checks -->\n<details>\n<summary>How to fix it · not checked against the code</summary>');
+    const readBack = async (comment: string) => (await fetchRecapState(mockOctokit([makeThread({ id: 't2', isResolved: false, comments: { nodes: [{ body: comment, author: { login: 'manki-review[bot]' } }] } })]), TEST_BOT, 'owner', 'repo', 1)).previousFindings[0];
+    expect((await readBack(unchecked)).description).toBe('It goes wrong.');
+    // A fix given in words is read back as words, never as the code fix.
+    const advised = await readBack(formatFindingComment({ severity: 'warning', title: 'Advised', file: 'src/a.ts', line: 4, description: 'It goes wrong.', howToFix: 'Return early when it is missing', reviewers: ['SecurityReviewer'] }, TEST_LINKS));
+    expect(advised).toMatchObject({ description: 'It goes wrong.', howToFix: 'Return early when it is missing' });
+    expect(advised.suggestedFix).toBeUndefined();
   });
 
   it('skips `suggestedFix` when AI context JSON is malformed, still recovers `description`', async () => {
@@ -1108,11 +1135,11 @@ describe('fetchRecapState', () => {
       makeThread({
         id: 't1',
         isResolved: false,
-        comments: { nodes: [{ body, author: { login: 'github-actions[bot]' } }] },
+        comments: { nodes: [{ body, author: { login: 'manki-review[bot]' } }] },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].description).toBe('Cast lacks a type guard.');
     expect(state.previousFindings[0].suggestedFix).toBeUndefined();
   });
@@ -1137,11 +1164,11 @@ describe('fetchRecapState', () => {
       makeThread({
         id: 't1',
         isResolved: false,
-        comments: { nodes: [{ body, author: { login: 'github-actions[bot]' } }] },
+        comments: { nodes: [{ body, author: { login: 'manki-review[bot]' } }] },
       }),
     ]);
 
-    const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+    const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
     expect(state.previousFindings[0].description).toBe('The variable name is misleading.');
     expect(state.previousFindings[0].suggestedFix).toBeUndefined();
   });
@@ -1159,21 +1186,16 @@ describe('fetchRecapState', () => {
         config: { reviewLevel: 'medium', memoryEnabled: false },
         diff: { lines: 100, additions: 60, deletions: 40, filesReviewed: 3, fileTypes: { '.ts': 3 } },
         models: { reviewer: 'r', judge: 'j' },
-        planner: { source: 'disabled', used: false, coreAgentInjections: [], priorRoundEffortDowngrades: [] },
+        planner: { source: 'disabled', used: false },
         reviewers: { agents: ['Correctness'] },
         judge: { summary: 'ok' },
         dedup: {},
         memory: {},
-        findings: { count: 0, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, entries: [] },
+        findings: { count: 0, severityCounts: { blocker: 0, warning: 0, note: 0 }, entries: [] },
         usage: {},
         verdict: 'COMMENT',
       };
       return { ...base, ...overrides, meta: { ...base.meta, ...(overrides.meta ?? {}), round } };
-    }
-
-    function detailsBlock(ctx: RoundContext): string {
-      const json = JSON.stringify(ctx, null, 2).replace(/`/g, '\\u0060');
-      return `<details>\n<summary>Manki context</summary>\n\n\`\`\`json\n${json}\n\`\`\`\n</details>`;
     }
 
     function htmlCommentBlock(ctx: RoundContext): string {
@@ -1187,107 +1209,25 @@ describe('fetchRecapState', () => {
 
     it('returns empty priorRounds when no review summary comments exist', async () => {
       const octokit = mockOctokit([], []);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
+      expect(state).not.toHaveProperty('lastApprovalAt');
     });
 
-    it('parses a single details-wrapper context block', async () => {
-      const ctx = makeRoundContext(1);
-      const octokit = mockOctokit([], [
-        { id: 100, body: `Header\n\n${detailsBlock(ctx)}\n`, user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].meta.round).toBe(1);
-      expect(state.priorRounds[0].meta.mankiVersion).toBe('4.7.0');
-    });
-
-    it('parses a single HTML-comment context block', async () => {
+    it('parses HTML-comment context blocks, and finds the last auto-approval', async () => {
       const ctx = makeRoundContext(2);
       const octokit = mockOctokit([], [
-        { id: 200, body: `Public summary\n${htmlCommentBlock(ctx)}\n`, user: { login: BOT_LOGIN } },
+        { id: 199, body: `✅ **Approved.** All blocking threads are resolved.\n\n<!-- manki -->\n${AUTO_APPROVE_MARKER}`, user: { login: BOT_LOGIN }, submitted_at: '2026-01-01T01:00:00Z' },
+        { id: 200, body: `✅ **Approved.**\n${htmlCommentBlock(ctx)}\n`, user: { login: BOT_LOGIN }, submitted_at: '2026-01-01T02:00:00Z' },
+        { id: 201, body: '✅ **Approved.** No change to this PR since the reviewed commit `abc1234`.\n\n<!-- manki-bot -->', user: { login: BOT_LOGIN }, submitted_at: '2026-01-01T03:00:00Z' },
+        { id: 202, body: `Quoting it: ${AUTO_APPROVE_MARKER}`, user: { login: 'alice' }, submitted_at: '2026-01-01T04:00:00Z' },
+        { id: 203, body: `✅ **Approved.** The finding text echoes ${AUTO_APPROVE_MARKER}\n${htmlCommentBlock(makeRoundContext(3))}`, user: { login: BOT_LOGIN }, submitted_at: '2026-01-01T05:00:00Z' },
+        { id: 204, body: `🔴 **Changes requested:** 1 blocker.\n\nThe finding text echoes ${AUTO_APPROVE_MARKER}`, user: { login: BOT_LOGIN }, submitted_at: '2026-01-01T06:00:00Z' },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].meta.round).toBe(2);
-    });
-
-    it.each([
-      ['feature', 'feat'],
-      ['bugfix', 'fix'],
-      ['rename', 'refactor'],
-    ])('migrates legacy planner.prType `%s` to canonical `%s` on read', async (legacy, canonical) => {
-      const ctx = makeRoundContext(1, {
-        planner: { source: 'planner', used: true, teamSize: 3, reviewerEffort: 'medium', judgeEffort: 'medium', prType: legacy, coreAgentInjections: [], priorRoundEffortDowngrades: [] },
-      });
-      const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].planner.prType).toBe(canonical);
-    });
-
-    it('passes a canonical Conventional Commits prType through unchanged', async () => {
-      const ctx = makeRoundContext(1, {
-        planner: { source: 'planner', used: true, teamSize: 2, reviewerEffort: 'low', judgeEffort: 'low', prType: 'docs', coreAgentInjections: [], priorRoundEffortDowngrades: [] },
-      });
-      const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds[0].planner.prType).toBe('docs');
-    });
-
-    it.each<[string, 'planner' | 'heuristic' | 'heuristic_fallback', string | undefined]>([
-      ['planner ran', 'planner', undefined],
-      ['no planner and no fallbackReason', 'heuristic', undefined],
-      ['no planner with fallbackReason', 'heuristic_fallback', 'timeout'],
-    ])('migrates pre-5.2.0 context without `source` correctly when %s', async (_label, expectedSource, fallbackReason) => {
-      const base = makeRoundContext(1);
-      const legacy = {
-        ...base,
-        planner: {
-          used: expectedSource === 'planner',
-          coreAgentInjections: [],
-          priorRoundEffortDowngrades: [],
-          ...(fallbackReason ? { fallbackReason } : {}),
-        },
-      } as unknown as RoundContext;
-      const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(legacy), user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].planner.source).toBe(expectedSource);
-    });
-
-    it('seeds `coreAgentInjections` and `priorRoundEffortDowngrades` to [] when absent in pre-5.2.0 context', async () => {
-      const base = makeRoundContext(1);
-      const legacy = {
-        ...base,
-        planner: { used: false },
-      } as unknown as RoundContext;
-      const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(legacy), user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].planner.coreAgentInjections).toEqual([]);
-      expect(state.priorRounds[0].planner.priorRoundEffortDowngrades).toEqual([]);
-    });
-
-    it('ignores HTML-comment block when a details block is present in the same review', async () => {
-      const ctxDetails = makeRoundContext(1, { judge: { summary: 'from details' } });
-      const ctxHtml = makeRoundContext(2, { judge: { summary: 'from html comment' } });
-      const body = `${detailsBlock(ctxDetails)}\n${htmlCommentBlock(ctxHtml)}`;
-      const octokit = mockOctokit([], [
-        { id: 100, body, user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toHaveLength(1);
-      expect(state.priorRounds[0].meta.round).toBe(1);
-      expect(state.priorRounds[0].judge.summary).toBe('from details');
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(state.priorRounds.map(r => r.meta.round)).toEqual([2, 3]);
+      // A reposted standing verdict, a quote of the marker, and a review that only echoes the marker are not auto-approvals.
+      expect(state.lastApprovalAt).toBe('2026-01-01T01:00:00Z');
     });
 
     it('round-trips findings.entries with specialist, suggestedFix, and title fields', async () => {
@@ -1299,14 +1239,404 @@ describe('fetchRecapState', () => {
         title: 'Misleading variable name',
       };
       const ctx = makeRoundContext(1, {
-        findings: { count: 1, severityCounts: { blocker: 0, warning: 1, suggestion: 0, nitpick: 0 }, entries: [entry] },
+        findings: { count: 1, severityCounts: { blocker: 0, warning: 1, note: 0 }, entries: [entry] },
       });
       const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].findings.entries).toEqual([entry]);
+    });
+
+    it('attaches each prior to its Manki thread by marker, file and nearest line', async () => {
+      const prior = (file: string, line: number, slug: string, severity: 'warning' | 'blocker' = 'warning') => ({
+        fingerprint: { file, lineStart: line, lineEnd: line, slug },
+        severity,
+        title: slug.replace(/-/g, ' '),
+      });
+      const entries = [
+        prior('src/foo.ts', 10, 'Old-issue', 'blocker'),
+        prior('src/foo.ts', 30, 'Other-issue'),
+        prior('src/body.ts', 5, 'Old-issue', 'blocker'),
+        prior('src/bar.ts', 77, 'File-issue', 'blocker'),
+      ];
+      const ctx = makeRoundContext(1, {
+        findings: { count: 4, severityCounts: { blocker: 3, warning: 1, note: 0 }, entries },
+      });
+      const thread = (id: string, isResolved: boolean, slug: string, originalLine: number) => makeThread({
+        id,
+        isResolved,
+        line: null,
+        originalLine,
+        comments: { nodes: [{ body: `**Warning**: x\n\n<!-- manki:warning:${slug} -->`, author: { login: BOT_LOGIN } }] },
+      });
+      const octokit = mockOctokit([
+        thread('T_FAR', false, 'Old-issue', 40),
+        thread('T_RESOLVED', true, 'Old-issue', 12),
+        thread('T_OTHER', false, 'Other-issue', 60),
+        makeThread({
+          id: 'T_FILE',
+          isResolved: true,
+          path: 'src/bar.ts',
+          line: null,
+          originalLine: null,
+          comments: { nodes: [{ body: '**Blocker**: x\n\n<!-- manki:blocker:File-issue -->', author: { login: BOT_LOGIN } }] },
+        }),
+      ], [
+        { id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
+      ]);
+
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      const attached = state.priorRounds[0].findings.entries;
+      expect(attached.map(e => e.threadId)).toEqual(['T_RESOLVED', undefined, undefined, 'T_FILE']);
+
+      // The resolved threads, line or file-level, retire their blockers, and the warning too far from its thread blocks
+      // nothing, though thread `T_OTHER` is still open. Only the body-only blocker keeps blocking, whatever the PR changes.
+      const openThreads = state.previousFindings
+        .filter(f => f.status === 'open')
+        .map(f => ({ threadId: f.threadId!, title: f.title, file: f.file, line: f.line, severity: f.severity }));
+      const unresolved = (priors: typeof attached) => determineOutcome([], priors, openThreads, collectResolvedThreadIds(state.previousFindings)).verdictTrace.unresolvedPriors.map(p => p.file);
+      expect(unresolved(attached)).toEqual(['src/body.ts']);
+      expect(unresolved(attached.map(({ threadId: _threadId, ...rest }) => rest))).toEqual(['src/foo.ts', 'src/body.ts', 'src/bar.ts']);
+    });
+
+    it('matches a blocker posted on a fallback line to its thread by the line its finding data names', async () => {
+      const title = 'Auto-approve still approves unread files';
+      const slug = titleToSlug(title);
+      const entry = { fingerprint: { file: 'src/state.ts', lineStart: 512, lineEnd: 512, slug }, severity: 'blocker' as const, title };
+      const ctx = makeRoundContext(12, { findings: { count: 1, severityCounts: { blocker: 1, warning: 0, note: 0 }, entries: [entry] } });
+      // Line 512 was not in that round's diff, so the thread went on line 1 and only its finding data names 512.
+      const data = JSON.stringify({ file: 'src/state.ts', line: 512, severity: 'blocker', title });
+      const octokit = mockOctokit([
+        makeThread({
+          id: 'T_FALLBACK',
+          isResolved: true,
+          path: 'src/state.ts',
+          line: 1,
+          originalLine: 1,
+          comments: { nodes: [{ body: `\u{1F6AB} **Blocker**: ${title}\n\nDesc.\n\n<!-- manki:blocker:${slug} -->\n<!-- manki-finding: ${data} -->`, author: { login: BOT_LOGIN } }] },
+        }),
+      ], [{ id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } }]);
+
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      const priors = state.priorRounds[0].findings.entries;
+      expect(priors.map(e => e.threadId)).toEqual(['T_FALLBACK']);
+      expect(state.previousFindings[0]).toMatchObject({ line: 1, findingLine: 512 });
+      // The resolved thread backs its blocker, so the next round ends without `prior_unaddressed`.
+      const { outcome, verdictReason } = determineOutcome([], priors, [], collectResolvedThreadIds(state.previousFindings));
+      expect({ outcome, verdictReason }).toEqual({ outcome: 'READY', verdictReason: 'only_notes' });
+      // A finding raised again on line 512 matches the thread as well, in dedup and in the in-PR suppressions.
+      const again = makeFinding({ title, file: 'src/state.ts', line: 512, severity: 'warning' });
+      expect(deduplicateFindings([again], state.previousFindings).duplicates).toHaveLength(1);
+      expect(collectInPrSuppressions(state.previousFindings).map(s => s.fingerprint)).toEqual([expect.objectContaining({ lineStart: 512, lineEnd: 512 })]);
+      // GitHub moves a thread with the code. A normal thread is matched where it sits now, and a thread on a fallback
+      // line keeps its gap to the finding's own line.
+      const moved = (line: number, originalLine: number, findingLine: number) => ({
+        ...state.previousFindings[0], status: 'resolved' as const, line, originalLine, findingLine,
+      });
+      const at = (line: number) => makeFinding({ title, file: 'src/state.ts', line, severity: 'warning' });
+      expect(deduplicateFindings([at(40)], [moved(40, 10, 10)]).duplicates).toHaveLength(1);
+      expect(deduplicateFindings([at(10)], [moved(40, 10, 10)]).duplicates).toHaveLength(0);
+      expect(deduplicateFindings([at(520)], [moved(9, 1, 512)]).duplicates).toHaveLength(1);
+      expect(collectInPrSuppressions([moved(9, 1, 512)]).map(s => s.fingerprint)).toEqual([expect.objectContaining({ lineStart: 520, lineEnd: 520 })]);
+
+      // Without the finding data the thread stays unmatched and the blocker keeps blocking, as before.
+      const bare = mockOctokit([
+        makeThread({ id: 'T_BARE', isResolved: true, path: 'src/state.ts', line: 1, originalLine: 1, comments: { nodes: [{ body: `**Blocker**: ${title}\n\n<!-- manki:blocker:${slug} -->`, author: { login: BOT_LOGIN } }] } }),
+      ], [{ id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } }]);
+      const bareState = await fetchRecapState(bare, TEST_BOT, 'owner', 'repo', 1);
+      expect(bareState.priorRounds[0].findings.entries.map(e => e.threadId)).toEqual([undefined]);
+    });
+
+    it('reads where a thread\'s finding sits from its finding data and the place GitHub reports', async () => {
+      const entry = (title: string, file: string, line: number) => ({ fingerprint: { file, lineStart: line, lineEnd: line, slug: titleToSlug(title) }, severity: 'blocker' as const, title, posted: 'thread' as const });
+      const entries = [entry('Persisters miss the lock', 'src/store.ts', 30), entry('The design drops retries', '', 0), entry('Named without the flag', 'src/old.ts', 7)];
+      const ctx = makeRoundContext(12, { findings: { count: 3, severityCounts: { blocker: 3, warning: 0, note: 0 }, entries } });
+      // Each thread sits on the first changed file. Only a flagged one takes its place from its finding data.
+      const posted = (id: string, title: string, data?: Record<string, unknown>, line = 1, originalLine = 1) => makeThread({
+        id, path: 'src/first.ts', line, originalLine,
+        comments: { nodes: [{ body: `\u{1F6AB} **Blocker**: ${title}\n\nDesc.\n\n<!-- manki:blocker:${titleToSlug(title)} -->${data ? `\n<!-- manki-finding: ${JSON.stringify({ ...data, severity: 'blocker', title })} -->` : ''}`, author: { login: BOT_LOGIN } }] },
+      });
+      const octokit = mockOctokit([
+        posted('T_FILE', 'Persisters miss the lock', { file: 'src/store.ts', line: 30, detached: true }),
+        posted('T_NONE', 'The design drops retries', { file: '', line: 0, detached: true }),
+        posted('T_OLD', 'Named without the flag', { file: 'src/old.ts', line: 7 }),
+        // On the finding's own file: a file-level thread for a finding without a line, a line thread whose code moved
+        // down by four lines, and a thread from before the finding data.
+        posted('T_WHOLE', 'The file has no owner', { file: 'src/first.ts', line: 0 }),
+        posted('T_MOVED', 'The retry never stops', { file: 'src/first.ts', line: 40 }, 44, 40),
+        posted('T_BARE', 'Written without finding data'),
+      ], [{ id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } }]);
+
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(state.previousFindings.map(f => [f.threadId, f.file, f.findingLine])).toEqual([
+        ['T_FILE', 'src/store.ts', 30],
+        ['T_NONE', '', undefined],
+        ['T_OLD', 'src/first.ts', undefined],
+        ['T_WHOLE', 'src/first.ts', undefined],
+        ['T_MOVED', 'src/first.ts', 40],
+        ['T_BARE', 'src/first.ts', undefined],
+      ]);
+      // GitHub reports a file-level thread on line 1. A flagged thread takes the line its data names, and none when it names none.
+      // So does a file-level thread whose finding names no line. Any other thread keeps the line GitHub reports.
+      expect(state.previousFindings.map(currentFindingLine)).toEqual([30, 0, 1, 0, 44, 1]);
+      expect(state.previousFindings.map(f => [f.line, f.originalLine, f.detached])).toEqual([
+        [30, undefined, true], [0, undefined, true], [1, 1, undefined], [0, undefined, undefined], [44, 40, undefined], [1, 1, undefined],
+      ]);
+      // So the round record's blocker finds its thread, and the thread from before the flag stays on GitHub's path.
+      expect(state.priorRounds[0].findings.entries.map(e => e.threadId)).toEqual(['T_FILE', 'T_NONE', undefined]);
+    });
+
+    it('counts a thread Manki resolved as dismissed only when the judge marked it addressed', async () => {
+      const title = 'Missing null check';
+      const slug = titleToSlug(title);
+      const files = { human: 'src/human.ts', bot: 'src/bot.ts', judge: 'src/judge.ts', unknown: 'src/unknown.ts', bare: 'src/bare.ts' };
+      const entries = Object.values(files).map(file => ({
+        fingerprint: { file, lineStart: 10, lineEnd: 10, slug },
+        severity: 'blocker' as const,
+        title,
+      }));
+      const ctx = makeRoundContext(1, {
+        findings: { count: 5, severityCounts: { blocker: 5, warning: 0, note: 0 }, entries },
+        judge: { summary: 'ok', threadEvaluations: [{ threadId: 'T_JUDGE', status: 'addressed', reason: 'fixed' }] },
+      });
+      const thread = (id: string, path: string, resolver: string | null) => makeThread({
+        id,
+        isResolved: true,
+        resolvedBy: resolver === null ? null : { login: resolver },
+        path,
+        line: 10,
+        comments: { nodes: [{ body: `**Blocker**: ${title}\n\n<!-- manki:blocker:${slug} -->`, author: { login: BOT_LOGIN } }] },
+      });
+      // Manki's own resolve settles a blocker only after the latest reply by a person came from someone with write access.
+      const settled = thread('T_BOT', files.bot, 'manki-review');
+      // A later comment by another bot is no reply by a person, so alice's reply stays the latest one.
+      settled.comments.nodes.push({ body: 'The caller checks this.', author: { login: 'alice' } }, { body: 'Coverage is unchanged.', author: { login: 'ci-app', __typename: 'Bot' } });
+      const withWriter = (octokit: ReturnType<typeof mockOctokit>) => {
+        Object.assign(octokit.rest, { repos: { getCollaboratorPermissionLevel: jest.fn(async ({ username }: { username: string }) => ({ data: { permission: username === 'alice' ? 'write' : 'none', user: { type: 'User' } } })) } });
+        return octokit;
+      };
+      const octokit = withWriter(mockOctokit([
+        thread('T_HUMAN', files.human, 'alice'),
+        settled,
+        thread('T_JUDGE', files.judge, BOT_LOGIN),
+        thread('T_UNKNOWN', files.unknown, null),
+        thread('T_BARE', files.bare, BOT_LOGIN),
+      ], [
+        { id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
+      ]));
+
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(state.previousFindings.map(f => f.status)).toEqual(['resolved', 'auto-resolved', 'resolved', 'open', 'open']);
+
+      // Manki reopens a thread the PR author resolved, and resolves it itself once a maintainer clears it. Its status is the same.
+      const cleared = thread('T_BOT', files.bot, BOT_LOGIN);
+      cleared.comments.nodes.push(
+        { body: `<!-- manki -->\n${REOPENED_MARKER}\nReopened.`, author: { login: BOT_LOGIN } },
+        { body: 'The caller checks this.', author: { login: 'alice' } },
+        { body: '**Withdrawn.** The caller checks it.\n\n<!-- manki -->', author: { login: BOT_LOGIN } },
+      );
+      const afterClear = await fetchRecapState(withWriter(mockOctokit([cleared], [{ id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } }])), TEST_BOT, 'owner', 'repo', 1, 'author');
+      expect(afterClear.previousFindings.map(f => [f.status, f.reopen ?? false])).toEqual([['auto-resolved', false]]);
+
+      // A later round that found the thread open again takes the earlier `addressed` away, so Manki's resolve has nothing
+      // to back it. A warning thread Manki resolved on an `addressed` record counts as resolved and fixed.
+      const laterCtx = makeRoundContext(2, { judge: { summary: 'ok', threadEvaluations: [
+        { threadId: 'T_JUDGE', status: 'not_addressed', reason: 'The check is gone again.' }, { threadId: 'T_WARN', status: 'addressed', reason: 'fixed' },
+      ] } });
+      const warning = makeThread({
+        id: 'T_WARN', isResolved: true, resolvedBy: { login: BOT_LOGIN }, path: 'src/warn.ts', line: 10,
+        comments: { nodes: [{ body: `**Warning**: ${title}\n\n<!-- manki:warning:${slug} -->`, author: { login: BOT_LOGIN } }] },
+      });
+      const later = await fetchRecapState(mockOctokit(
+        [thread('T_JUDGE', files.judge, BOT_LOGIN), warning],
+        [ctx, laterCtx].map((record, i) => ({ id: 100 + i, body: htmlCommentBlock(record), user: { login: BOT_LOGIN } })),
+      ), TEST_BOT, 'owner', 'repo', 1);
+      expect(later.previousFindings.map(f => [f.status, f.fixed ?? false])).toEqual([['open', false], ['resolved', true]]);
+      expect(state.previousFindings.map(f => f.fixed ?? false)).toEqual([false, false, true, false, false]);
+
+      const newFindings = Object.values(files).map(file => makeFinding({ title, file, line: 10 }));
+      const { unique } = deduplicateFindings(newFindings, state.previousFindings);
+      expect(unique.map(f => f.file)).toEqual([files.bot, files.judge, files.unknown, files.bare]);
+      expect(unique[1].resemblesFixed).toEqual({ title, file: files.judge, line: 10 });
+      expect(collectInPrSuppressions(state.previousFindings).map(s => s.fingerprint.file)).toEqual([files.human]);
+      const resolvedThreadIds = collectResolvedThreadIds(state.previousFindings);
+      expect(resolvedThreadIds).toEqual(new Set(['T_HUMAN', 'T_JUDGE']));
+      const ratcheted = applyCrossRoundSuppression(newFindings, state.priorRounds, { resolvedThreadIds, suppressResolvedThreads: true });
+      expect(ratcheted.findings.filter(f => f.severity !== 'ignore').map(f => f.file)).toEqual([files.bot, files.unknown, files.bare]);
+
+      const judgePrior = state.priorRounds[0].findings.entries.filter(e => e.threadId === 'T_JUDGE');
+      expect(judgePrior).toHaveLength(1);
+      expect(determineOutcome([], judgePrior, [], resolvedThreadIds).outcome).toBe('READY');
+    });
+
+    it('keeps a blocking or security finding blocking until someone other than the PR author dismisses it', async () => {
+      const title = 'Token leaks into logs';
+      const slug = titleToSlug(title);
+      type Case = { resolver?: string; reply?: { login: string; association: string; text?: string }; reopened?: boolean; foundAgain?: boolean; dismissed?: boolean; security: boolean; blocker?: boolean; blocks: boolean };
+      const bounded = 'Every caller bounds both inputs.';
+      const cases: Record<string, Case> = {
+        // A Manki reply that quotes the fix does not count as a reopen.
+        'src/author-resolved.ts': { resolver: 'author', foundAgain: true, security: true, blocks: true },
+        // A recorded override counts only once GitHub confirms the PR author's role, since a Manki reply can echo any text.
+        'src/author-dismissed.ts': { resolver: BOT_LOGIN, dismissed: true, security: true, blocks: true },
+        'src/bot-resolved.ts': { resolver: BOT_LOGIN, security: true, blocks: true },
+        'src/author-resolved-again.ts': { resolver: 'author', reopened: true, security: true, blocks: true },
+        'src/author-agreed.ts': { reply: { login: 'author', association: 'OWNER' }, security: true, blocks: true },
+        'src/outsider-agreed.ts': { reply: { login: 'carol', association: 'CONTRIBUTOR' }, security: true, blocks: true },
+        'src/collaborator-resolved.ts': { resolver: 'alice', security: true, blocks: false },
+        'src/collaborator-agreed.ts': { reply: { login: 'bob', association: 'MEMBER' }, security: true, blocks: false },
+        'src/collaborator-dismissed.ts': { resolver: BOT_LOGIN, reply: { login: 'bob', association: 'MEMBER', text: '@manki dismiss' }, security: true, blocks: false },
+        // Manki's own resolve settles a security thread only after a reply from someone who may clear it, whatever the reply says.
+        'src/collaborator-settled.ts': { resolver: BOT_LOGIN, reply: { login: 'bob', association: 'MEMBER', text: bounded }, security: true, blocks: false },
+        'src/author-settled.ts': { resolver: BOT_LOGIN, reply: { login: 'author', association: 'OWNER', text: bounded }, security: true, blocks: true },
+        'src/reader-settled.ts': { resolver: BOT_LOGIN, reply: { login: 'dave', association: 'MEMBER', text: bounded }, security: true, blocks: true },
+        // Such a reply does not make the PR author's own resolve count.
+        'src/author-resolved-after-reply.ts': { resolver: 'author', reopened: true, reply: { login: 'bob', association: 'MEMBER', text: bounded }, security: true, blocks: true },
+        // `MEMBER` covers an org member with read access, so write access comes from the API.
+        'src/reader-agreed.ts': { reply: { login: 'dave', association: 'MEMBER' }, security: true, blocks: true },
+        // A private org member shows as `NONE`.
+        'src/private-member-agreed.ts': { reply: { login: 'erin', association: 'NONE' }, security: true, blocks: false },
+        'src/judge-addressed.ts': { resolver: BOT_LOGIN, security: true, blocks: false },
+        // The record backs only Manki's own resolve, so the PR author resolving the thread later does not clear it.
+        'src/judge-addressed-author-resolved.ts': { resolver: 'author', security: true, blocks: true },
+        'src/plain-author-resolved.ts': { resolver: 'author', security: false, blocks: false },
+        'src/plain-author-agreed.ts': { reply: { login: 'author', association: 'NONE' }, security: false, blocks: false },
+        'src/blocker-author-resolved.ts': { resolver: 'author', security: false, blocker: true, blocks: true },
+        'src/blocker-author-agreed.ts': { reply: { login: 'author', association: 'OWNER' }, security: false, blocker: true, blocks: true },
+        'src/blocker-collaborator-resolved.ts': { resolver: 'alice', security: false, blocker: true, blocks: false },
+        // A blocker thread follows the same rule as a security thread: Manki's own resolve alone settles nothing.
+        'src/blocker-bot-resolved.ts': { resolver: BOT_LOGIN, security: false, blocker: true, blocks: true },
+        'src/blocker-collaborator-settled.ts': { resolver: BOT_LOGIN, reply: { login: 'bob', association: 'MEMBER', text: bounded }, security: false, blocker: true, blocks: false },
+        // GraphQL types every resolver as `User`. Only the permission lookup tells that a workflow token is no person,
+        // under either login GitHub could name it by.
+        'src/workflow-resolved.ts': { resolver: 'github-actions[bot]', security: true, blocks: true },
+        'src/blocker-workflow-resolved.ts': { resolver: 'github-actions[bot]', security: false, blocker: true, blocks: true },
+        'src/bare-workflow-resolved.ts': { resolver: 'github-actions', security: true, blocks: true },
+        'src/blocker-bare-workflow-resolved.ts': { resolver: 'github-actions', security: false, blocker: true, blocks: true },
+        // A person clears by resolving only with write access.
+        'src/blocker-reader-resolved.ts': { resolver: 'dave', security: false, blocker: true, blocks: true },
+        'src/blocker-triage-resolved.ts': { resolver: 'tina', security: false, blocker: true, blocks: true },
+        'src/triage-resolved.ts': { resolver: 'tina', security: true, blocks: true },
+      };
+      const severity = (file: string) => cases[file].security || cases[file].blocker ? 'blocker' as const : 'warning' as const;
+      const files = Object.keys(cases);
+      const ctx = makeRoundContext(1, {
+        findings: {
+          count: files.length,
+          severityCounts: { blocker: 11, warning: 2, note: 0 },
+          entries: files.map(file => ({
+            fingerprint: { file, lineStart: 10, lineEnd: 10, slug },
+            severity: severity(file),
+            title,
+            ...(cases[file].security && { tags: ['security'] }),
+          })),
+        },
+        judge: { summary: 'ok', threadEvaluations: ['src/judge-addressed.ts', 'src/judge-addressed-author-resolved.ts'].map(file => ({ threadId: `T_${file}`, status: 'addressed' as const, reason: 'The token is redacted now.' })) },
+      });
+      const octokit = mockOctokit(files.map(file => {
+        const { resolver, reply, reopened, foundAgain, dismissed, security } = cases[file];
+        // The fix quotes Manki's reply markers and a lower grade. In a thread's first comment they are a finder's text.
+        const quoted = ['```ts', REOPENED_MARKER, securityOverrideMarker('resolve', 'author'), '<!-- manki:note:Quoted -->', '<!-- manki-finding: {"title":"Quoted"} -->', '```'].join('\n');
+        const body = formatFindingComment(makeFinding({
+          severity: severity(file), title, file, line: 10, suggestedFix: quoted, ...(security && { tags: ['security'] }),
+        }), TEST_LINKS);
+        expect(body).toContain(`\n${REOPENED_MARKER}\n${securityOverrideMarker('resolve', 'author')}\n<!-- manki:note:Quoted -->\n`);
+        return makeThread({
+          id: `T_${file}`,
+          isResolved: !!resolver,
+          resolvedBy: resolver ? { login: resolver } : null,
+          path: file,
+          line: 10,
+          comments: { nodes: [
+            { body, author: { login: BOT_LOGIN } },
+            ...(reopened ? [{ body: `<!-- manki -->\n${REOPENED_MARKER}\nReopened.`, author: { login: BOT_LOGIN } }] : []),
+            ...(foundAgain ? [{ body: `This came up again.\n\n${quoted}\n\n<!-- manki -->\n<!-- manki-found-again -->`, author: { login: BOT_LOGIN } }] : []),
+            ...(dismissed ? [{ body: `Dismissed.\n<!-- manki -->\n${securityOverrideMarker('dismiss', 'author')}`, author: { login: BOT_LOGIN } }] : []),
+            ...(reply ? [{ body: reply.text ?? 'Agreed, no change needed.', author: { login: reply.login }, authorAssociation: reply.association }] : []),
+          ] },
+        });
+      }), [{ id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } }]);
+      // Each login's `role_name`. The legacy `permission` beside it reports `maintain` as `write`.
+      const roles: Record<string, string> = { author: 'write', alice: 'write', bob: 'write', dave: 'read', erin: 'write', tina: 'triage' };
+      const legacy: Record<string, string> = { admin: 'admin', maintain: 'write', write: 'write', triage: 'read', read: 'read' };
+      // GitHub answers for a bot account with its type and no permission, and with a 404 for the bare `github-actions`.
+      const permission = jest.fn(async ({ username }: { username: string }) => {
+        if (username === 'github-actions') throw new Error('github-actions is not a user');
+        if (username.endsWith('[bot]')) return { data: { permission: 'none', role_name: '', user: { type: 'Bot' } } };
+        return { data: roles[username] ? { permission: legacy[roles[username]], role_name: roles[username], user: { type: 'User' } } : { permission: 'none' } };
+      });
+      Object.assign(octokit.rest, { repos: { getCollaboratorPermissionLevel: permission } });
+
+      // The author can push, which is below the default level `maintain`, so their own resolve clears nothing.
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1, 'author', 'maintain');
+      expect(state.previousFindings.filter(f => f.reopen).map(f => f.file)).toEqual(['src/author-resolved.ts', 'src/judge-addressed-author-resolved.ts', 'src/blocker-author-resolved.ts']);
+      expect(state.previousFindings.filter(f => f.securityOverride)).toEqual([]);
+      // A thread someone with write access agreed away stays `replied`. Once Manki resolved it for such a person it is
+      // `auto-resolved`: neither open nor dismissed.
+      expect(state.previousFindings.filter(f => f.authorReplyMayClear).map(f => [f.file, f.status, replyClassOf(f)])).toEqual([
+        ['src/collaborator-agreed.ts', 'replied', 'agree'], ['src/collaborator-dismissed.ts', 'auto-resolved', 'agree'],
+        ['src/collaborator-settled.ts', 'auto-resolved', 'none'], ['src/author-resolved-after-reply.ts', 'replied', 'none'],
+        ['src/private-member-agreed.ts', 'replied', 'agree'], ['src/blocker-collaborator-settled.ts', 'auto-resolved', 'none'],
+      ]);
+      const openThreads = state.previousFindings
+        .filter(f => f.status === 'open' || f.status === 'replied')
+        .map(f => ({ threadId: f.threadId!, title: f.title, file: f.file, line: f.line, severity: f.severity }));
+      const resolvedThreadIds = collectResolvedThreadIds(state.previousFindings);
+      const blocking = state.priorRounds[0].findings.entries
+        .filter(e => determineOutcome([], [e], openThreads, resolvedThreadIds).outcome === 'ADDRESS_FIRST')
+        .map(e => e.fingerprint.file);
+      expect(blocking).toEqual(files.filter(file => cases[file].blocks));
+
+      const reRaised = files.map(file => makeFinding({ severity: 'blocker', title, file, line: 10 }));
+      // A settled thread suppresses nothing, since nobody agreed its finding away: a finding raised again is posted.
+      expect(collectInPrSuppressions(state.previousFindings, 'author').map(s => s.fingerprint.file))
+        .toEqual(files.filter(file => !cases[file].blocks && file !== 'src/judge-addressed.ts' && !file.endsWith('collaborator-settled.ts')));
+      // Dedup drops a blocker only on a resolved blocking or security thread not confirmed fixed. An agreed thread is dropped by the in-PR suppressions above.
+      expect(deduplicateFindings(reRaised, state.previousFindings).unique.map(f => f.file))
+        .toEqual(files.filter(file => cases[file].blocks || cases[file].reply || severity(file) === 'warning' || file === 'src/judge-addressed.ts'));
+
+      // With the PR author unknown, any human resolver has write access, so a human resolution clears the thread.
+      const unknownAuthor = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(unknownAuthor.previousFindings.filter(f => f.isSecurity && f.status === 'resolved').map(f => f.file))
+        .toEqual(['src/author-resolved.ts', 'src/author-resolved-again.ts', 'src/collaborator-resolved.ts', 'src/author-resolved-after-reply.ts', 'src/judge-addressed.ts', 'src/judge-addressed-author-resolved.ts']);
+
+      // A reply from someone with write access agrees a security thread away under the same fallback.
+      expect(collectInPrSuppressions(unknownAuthor.previousFindings).filter(s => s.reason === 'agree-reply').map(s => s.fingerprint.file))
+        .toEqual(['src/author-agreed.ts', 'src/collaborator-agreed.ts', 'src/collaborator-dismissed.ts', 'src/private-member-agreed.ts', 'src/blocker-author-agreed.ts']);
+
+      // An author with the `maintain` role clears their own resolved threads at that level. Nothing is reopened, and the override waits for Manki's reply.
+      // Permissions are cached per client, so each lookup of a changed role needs a fresh one.
+      roles.author = 'maintain';
+      const admin = Object.create(octokit);
+      const adminState = await fetchRecapState(admin, TEST_BOT, 'owner', 'repo', 1, 'author', 'maintain');
+      expect(adminState.previousFindings.filter(f => f.reopen)).toEqual([]);
+      expect(adminState.previousFindings.filter(f => f.securityOverride).map(f => [f.file, f.securityOverride])).toEqual([
+        ['src/author-resolved.ts', { login: 'author', via: 'resolve', role: 'maintain', announced: false }],
+        ['src/author-dismissed.ts', { login: 'author', via: 'dismiss', role: 'maintain', announced: true }],
+        ['src/author-resolved-again.ts', { login: 'author', via: 'resolve', role: 'maintain', announced: false }],
+        ['src/author-resolved-after-reply.ts', { login: 'author', via: 'resolve', role: 'maintain', announced: false }],
+        ['src/judge-addressed-author-resolved.ts', { login: 'author', via: 'resolve', role: 'maintain', announced: false }],
+        ['src/blocker-author-resolved.ts', { login: 'author', via: 'resolve', role: 'maintain', announced: false }],
+      ]);
+      // The same author clears nothing where the repository asks for `admin`, or where no level is known. The threads are reopened as for any author.
+      for (const level of ['admin', undefined] as const) {
+        const below = await fetchRecapState(Object.create(octokit), TEST_BOT, 'owner', 'repo', 1, 'author', level);
+        expect([level, below.previousFindings.filter(f => f.securityOverride), below.previousFindings.filter(f => f.reopen).map(f => f.file)])
+          .toEqual([level, [], ['src/author-resolved.ts', 'src/judge-addressed-author-resolved.ts', 'src/blocker-author-resolved.ts']]);
+      }
+      const adminOpen = adminState.previousFindings.filter(f => f.status === 'open' || f.status === 'replied')
+        .map(f => ({ threadId: f.threadId!, title: f.title, file: f.file, line: f.line, severity: f.severity }));
+      expect(adminState.priorRounds[0].findings.entries
+        .filter(e => determineOutcome([], [e], adminOpen, collectResolvedThreadIds(adminState.previousFindings)).outcome === 'ADDRESS_FIRST')
+        .map(e => e.fingerprint.file))
+        .toEqual(files.filter(file => cases[file].blocks && !['src/author-resolved.ts', 'src/author-dismissed.ts', 'src/author-resolved-again.ts', 'src/author-resolved-after-reply.ts', 'src/judge-addressed-author-resolved.ts', 'src/blocker-author-resolved.ts'].includes(file)));
+      // A second read on the same client does not ask GitHub again.
+      const lookups = permission.mock.calls.length;
+      await fetchRecapState(admin, TEST_BOT, 'owner', 'repo', 1, 'author', 'maintain');
+      expect(permission).toHaveBeenCalledTimes(lookups);
+      expect(permission).toHaveBeenCalledWith({ owner: 'owner', repo: 'repo', username: 'author' });
     });
 
     it('round-trips suggestedFix containing a literal \\u0060 escape sequence without parse error', async () => {
@@ -1321,12 +1651,12 @@ describe('fetchRecapState', () => {
         title: 'Parser unescapes \\u0060 incorrectly',
       };
       const ctx = makeRoundContext(1, {
-        findings: { count: 1, severityCounts: { blocker: 0, warning: 1, suggestion: 0, nitpick: 0 }, entries: [entry] },
+        findings: { count: 1, severityCounts: { blocker: 0, warning: 1, note: 0 }, entries: [entry] },
       });
       const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 100, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].findings.entries[0].suggestedFix).toBe(entry.suggestedFix);
     });
@@ -1334,18 +1664,18 @@ describe('fetchRecapState', () => {
     it('round-trips findings.entries through the HTML-comment wrapper', async () => {
       const entry = {
         fingerprint: { file: 'src/bar.ts', lineStart: 5, lineEnd: 5, slug: 'unused-import' },
-        severity: 'nitpick' as const,
+        severity: 'note' as const,
         specialist: 'Style',
         suggestedFix: 'Remove the unused `path` import.',
         title: 'Unused import',
       };
       const ctx = makeRoundContext(2, {
-        findings: { count: 1, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 1 }, entries: [entry] },
+        findings: { count: 1, severityCounts: { blocker: 0, warning: 0, note: 1 }, entries: [entry] },
       });
       const octokit = mockOctokit([], [
         { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].specialist).toBe('Style');
       expect(state.priorRounds[0].findings.entries[0].suggestedFix).toBe('Remove the unused `path` import.');
       expect(state.priorRounds[0].findings.entries[0].title).toBe('Unused import');
@@ -1356,20 +1686,20 @@ describe('fetchRecapState', () => {
       const c1 = makeRoundContext(1);
       const c2 = makeRoundContext(2);
       const octokit = mockOctokit([], [
-        { id: 11, body: detailsBlock(c3), user: { login: BOT_LOGIN } },
-        { id: 12, body: detailsBlock(c1), user: { login: BOT_LOGIN } },
+        { id: 11, body: htmlCommentBlock(c3), user: { login: BOT_LOGIN } },
+        { id: 12, body: htmlCommentBlock(c1), user: { login: BOT_LOGIN } },
         { id: 13, body: htmlCommentBlock(c2), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds.map(r => r.meta.round)).toEqual([1, 2, 3]);
     });
 
     it('skips a review with malformed JSON and emits core.warning', async () => {
-      const malformed = '<details>\n<summary>Manki context</summary>\n\n```json\n{not valid json}\n```\n</details>';
+      const malformed = '<!-- manki-context: {not valid json} -->';
       const octokit = mockOctokit([], [
         { id: 500, body: malformed, user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('https://github.com/owner/repo/pull/1#pullrequestreview-500'),
@@ -1382,7 +1712,7 @@ describe('fetchRecapState', () => {
       const octokit = mockOctokit([], [
         { id: 600, body, user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('meta.round'),
@@ -1393,10 +1723,10 @@ describe('fetchRecapState', () => {
       const earlier = makeRoundContext(1, { judge: { summary: 'first attempt' } });
       const later = makeRoundContext(1, { judge: { summary: 'final version' } });
       const octokit = mockOctokit([], [
-        { id: 10, body: detailsBlock(earlier), user: { login: BOT_LOGIN } },
-        { id: 20, body: detailsBlock(later), user: { login: BOT_LOGIN } },
+        { id: 10, body: htmlCommentBlock(earlier), user: { login: BOT_LOGIN } },
+        { id: 20, body: htmlCommentBlock(later), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].judge.summary).toBe('final version');
       expect(core.warning).toHaveBeenCalledWith(
@@ -1404,12 +1734,40 @@ describe('fetchRecapState', () => {
       );
     });
 
+    it('reads a PR with an incomplete round among complete ones like one with only the complete rounds', async () => {
+      const first = makeRoundContext(1, { findings: { count: 1, severityCounts: {}, entries: [makeFindingFingerprintEntry({ severity: 'warning', threadId: 'thread-1' })] } });
+      const second = makeRoundContext(2, { judge: { summary: 'second round' } });
+      // The incomplete round took the number the next complete round gets. Read as a round, it would raise and settle the thread.
+      const incomplete = (round: number) => makeRoundContext(round, {
+        meta: { prNumber: 1, commitSha: 'failed', round, timestamp: 't', mankiVersion: '7', outcome: 'INCOMPLETE', incomplete: true },
+        findings: { count: 1, severityCounts: {}, entries: [makeFindingFingerprintEntry({ severity: 'blocker', threadId: 'thread-1' })] },
+        judge: { summary: 'failed round', threadEvaluations: [{ threadId: 'thread-1', status: 'addressed', reason: 'fixed' }] },
+      });
+      const review = (id: number, ctx: RoundContext) => ({ id, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } });
+      const state = (reviews: ReturnType<typeof review>[]) => fetchRecapState(mockOctokit([makeThread()], reviews), TEST_BOT, 'owner', 'repo', 1);
+      const complete = await state([review(10, first), review(30, second)]);
+      expect(complete.priorRounds.map(r => [r.meta.round, r.meta.commitSha])).toEqual([[1, first.meta.commitSha], [2, second.meta.commitSha]]);
+
+      for (const reviews of [
+        [review(10, first), review(20, incomplete(2)), review(30, second)],
+        [review(5, incomplete(1)), review(10, first), review(30, second)],
+        // Posted last, under a number a complete round has or under the next one.
+        [review(10, first), review(30, second), review(40, incomplete(2))],
+        [review(10, first), review(30, second), review(40, incomplete(3))],
+      ]) {
+        expect(await state(reviews)).toEqual(complete);
+      }
+      // A skipped record is neither unread nor a duplicate.
+      expect(complete.priorRoundsIncomplete).toBeUndefined();
+      expect(core.warning).not.toHaveBeenCalled();
+    });
+
     it('skips a context block whose parsed value is null (not an object)', async () => {
-      const body = '<details>\n<summary>Manki context</summary>\n\n```json\nnull\n```\n</details>';
+      const body = '<!-- manki-context: null -->';
       const octokit = mockOctokit([], [
         { id: 700, body, user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('not an object'),
@@ -1422,7 +1780,7 @@ describe('fetchRecapState', () => {
       const octokit = mockOctokit([], [
         { id: 800, body, user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('missing meta'),
@@ -1435,7 +1793,7 @@ describe('fetchRecapState', () => {
       const octokit = mockOctokit([], [
         { id: 900, body, user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('meta.mankiVersion'),
@@ -1447,17 +1805,18 @@ describe('fetchRecapState', () => {
         graphql: jest.fn().mockResolvedValue({
           repository: {
             pullRequest: {
-              reviewThreads: { nodes: [] },
+              reviewThreads: { pageInfo: LAST_PAGE, nodes: [] },
             },
           },
         }),
+        paginate: jest.fn(paginateSinglePage),
         rest: {
           pulls: {
             listReviews: jest.fn().mockRejectedValue(new Error('API unavailable')),
           },
         },
       } as unknown as ReturnType<typeof import('@actions/github').getOctokit>;
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('Failed to fetch prior round contexts'),
@@ -1466,7 +1825,7 @@ describe('fetchRecapState', () => {
 
     it('skips a block when a non-SyntaxError is thrown from JSON.parse and emits core.warning', async () => {
       const sentinel = '"__sentinel_throw__"';
-      const body = `<details>\n<summary>Manki context</summary>\n\n\`\`\`json\n${sentinel}\n\`\`\`\n</details>`;
+      const body = `<!-- manki-context: ${sentinel} -->`;
       const octokit = mockOctokit([], [
         { id: 999, body, user: { login: BOT_LOGIN } },
       ]);
@@ -1475,7 +1834,7 @@ describe('fetchRecapState', () => {
         if (text.trim() === sentinel) throw new TypeError('unexpected mock error');
         return original(text);
       });
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       spy.mockRestore();
       expect(state.priorRounds).toEqual([]);
       expect(core.warning).toHaveBeenCalledWith(
@@ -1483,25 +1842,62 @@ describe('fetchRecapState', () => {
       );
     });
 
-    it('excludes reviews from non-bot users', async () => {
-      const ctx = makeRoundContext(1);
+    it('reads context only from reviews by the bot identity', async () => {
       const octokit = mockOctokit([], [
-        { id: 100, body: detailsBlock(ctx), user: { login: 'some-user' } },
+        { id: 100, body: htmlCommentBlock(makeRoundContext(1)), user: { login: 'some-user' } },
+        { id: 101, body: htmlCommentBlock(makeRoundContext(2)), user: { login: 'manki-review[bot]' } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds).toEqual([]);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(state.priorRounds.map(r => r.meta.round)).toEqual([2]);
+      const customApp = await fetchRecapState(octokit, { logins: ['acme-reviewer[bot]'] }, 'owner', 'repo', 1);
+      expect(customApp.priorRounds).toEqual([]);
     });
 
     it('skips malformed JSON block but still loads subsequent valid blocks', async () => {
       const ctx3 = makeRoundContext(3);
-      const malformed = '<details>\n<summary>Manki context</summary>\n\n```json\n{bad}\n```\n</details>';
-      const octokit = mockOctokit([], [
+      const malformed = '<!-- manki-context: {bad} -->';
+      const resolvedByAuthor = makeThread({
+        id: 'tw', isResolved: true, resolvedBy: { login: 'author' },
+        comments: { nodes: [{ body: '<!-- manki:warning:Bug --> **Warning**: Bug found\n\nDesc.', author: { login: BOT_LOGIN } }] },
+      });
+      const agreedByAuthor = makeThread({
+        id: 'ta', path: 'src/other.ts',
+        comments: { nodes: [
+          { body: '<!-- manki:warning:Bug --> **Warning**: Bug found\n\nDesc.', author: { login: BOT_LOGIN } },
+          { body: 'Agreed, no change needed.', author: { login: 'author' } },
+        ] },
+      });
+      const resolvedByCollaborator = makeThread({
+        id: 'tc', isResolved: true, resolvedBy: { login: 'alice' }, path: 'src/c.ts', line: 4,
+        comments: { nodes: [{ body: '<!-- manki:warning:Stale-cache --> **Warning**: Stale cache\n\nDesc.', author: { login: BOT_LOGIN } }] },
+      });
+      const resolvedByManki = makeThread({
+        id: 'tm', isResolved: true, resolvedBy: { login: BOT_LOGIN }, path: 'src/m.ts', line: 6,
+        comments: { nodes: [{ body: '<!-- manki:warning:Slow-loop --> **Warning**: Slow loop\n\nDesc.', author: { login: BOT_LOGIN } }] },
+      });
+      const octokit = mockOctokit([resolvedByAuthor, agreedByAuthor, resolvedByCollaborator, resolvedByManki], [
         { id: 500, body: malformed, user: { login: BOT_LOGIN } },
-        { id: 501, body: detailsBlock(ctx3), user: { login: BOT_LOGIN } },
+        { id: 501, body: htmlCommentBlock(ctx3), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1, 'author');
+      // The skipped record may have raised the threads, so neither the PR author's resolution nor agreement clears them,
+      // and neither does Manki's own resolve with nothing to back it, as in the approval check.
+      expect(state.previousFindings.map(f => [f.status, f.reopen, f.gradeUnknown])).toEqual([['open', true, true], ['replied', undefined, true], ['resolved', undefined, true], ['open', undefined, true]]);
+      expect(collectInPrSuppressions(state.previousFindings, 'author').map(s => s.fingerprint.file)).toEqual(['src/c.ts']);
+      // An unknown grade never makes a resolution count as someone else's, so a new blocker there still reaches the judge.
+      const repeat = makeFinding({ severity: 'blocker', title: 'Stale cache', file: 'src/c.ts', line: 4 });
+      expect(deduplicateFindings([repeat], state.previousFindings).unique).toHaveLength(1);
+
+      // An author whose role allows it still clears their own resolved thread, as with a blocker.
+      const admin = Object.create(octokit);
+      Object.assign(admin, { rest: { ...octokit.rest, repos: { getCollaboratorPermissionLevel: jest.fn(async () => ({ data: { permission: 'admin', role_name: 'admin', user: { type: 'User' } } })) } } });
+      const adminState = await fetchRecapState(admin, TEST_BOT, 'owner', 'repo', 1, 'author', 'maintain');
+      expect(adminState.previousFindings.map(f => [f.status, !!f.reopen, f.securityOverride?.login])).toEqual([['resolved', false, 'author'], ['replied', false, undefined], ['resolved', false, undefined], ['open', false, undefined]]);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].meta.round).toBe(3);
+      // A skipped record could hold a thread's grade, so the recap says the rounds are incomplete, and which review it skipped.
+      expect(state.priorRoundsIncomplete).toBe(true);
+      expect(state.unreadRecords).toEqual(['https://github.com/owner/repo/pull/1#pullrequestreview-500']);
       expect(core.warning).toHaveBeenCalledWith(
         expect.stringContaining('https://github.com/owner/repo/pull/1#pullrequestreview-500'),
       );
@@ -1510,9 +1906,9 @@ describe('fetchRecapState', () => {
     it('round-trips a field containing backticks through the details wrapper', async () => {
       const ctx = makeRoundContext(9, { judge: { summary: 'use `foo()` here' } });
       const octokit = mockOctokit([], [
-        { id: 400, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 400, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].judge.summary).toBe('use `foo()` here');
     });
@@ -1522,43 +1918,33 @@ describe('fetchRecapState', () => {
       const octokit = mockOctokit([], [
         { id: 300, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds).toHaveLength(1);
       expect(state.priorRounds[0].judge.summary).toBe('Verdict --> pass');
     });
 
-    it('warns when listReviews returns exactly 100 reviews', async () => {
-      const reviews = Array.from({ length: 100 }, (_, i) => ({
+    it('reads context from every page of reviews', async () => {
+      const reviews = Array.from({ length: 150 }, (_, i) => ({
         id: i + 1,
-        body: detailsBlock(makeRoundContext(i + 1)),
+        body: htmlCommentBlock(makeRoundContext(i + 1)),
         user: { login: BOT_LOGIN },
       }));
-      const octokit = mockOctokit([], reviews);
-      await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(core.warning).toHaveBeenCalledWith(
-        expect.stringContaining('pagination not implemented'),
-      );
-    });
-
-    it('parses two context blocks from a single review body', async () => {
-      const c1 = makeRoundContext(1);
-      const c2 = makeRoundContext(2);
-      const body = `${detailsBlock(c1)}\n${detailsBlock(c2)}`;
-      const octokit = mockOctokit([], [
-        { id: 100, body, user: { login: BOT_LOGIN } },
-      ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
-      expect(state.priorRounds.map(r => r.meta.round)).toEqual([1, 2]);
+      const octokit = mockOctokit([], reviews.slice(0, 100));
+      jest.mocked(octokit.paginate).mockResolvedValueOnce(reviews);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
+      expect(octokit.paginate).toHaveBeenCalledWith(octokit.rest.pulls.listReviews, expect.objectContaining({ per_page: 100 }));
+      expect(state.priorRounds).toHaveLength(150);
+      expect(core.warning).not.toHaveBeenCalled();
     });
 
     it('re-derives authorReplyClass from current thread state, overriding the stale emit-time cache', async () => {
       const ctx = makeRoundContext(1, {
         findings: {
           count: 1,
-          severityCounts: { blocker: 1 },
+          severityCounts: { warning: 1 },
           entries: [{
             fingerprint: { file: 'src/foo.ts', lineStart: 10, lineEnd: 10, slug: 'Null-check' },
-            severity: 'blocker',
+            severity: 'warning',
             threadId: 'thread-1',
             authorReplyClass: 'none',
             title: 'Null check',
@@ -1569,15 +1955,15 @@ describe('fetchRecapState', () => {
         id: 'thread-1',
         comments: {
           nodes: [
-            { body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Null check\n\nDescription.', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:warning:Null-check --> **Warning**: Null check\n\nDescription.', author: { login: 'manki-review[bot]' } },
             { body: 'Fixed in latest push', author: { login: 'author' } },
           ],
         },
       });
       const octokit = mockOctokit([thread], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].authorReplyClass).toBe('agree');
     });
 
@@ -1598,15 +1984,15 @@ describe('fetchRecapState', () => {
         id: undefined,
         comments: {
           nodes: [
-            { body: '<!-- manki:warning:Null-check --> ⚠️ **Warning**: Null check\n\nDescription.', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:warning:Null-check --> ⚠️ **Warning**: Null check\n\nDescription.', author: { login: 'manki-review[bot]' } },
             { body: 'Agreed, will fix', author: { login: 'author' } },
           ],
         },
       });
       const octokit = mockOctokit([thread], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].authorReplyClass).toBe('agree');
     });
 
@@ -1624,9 +2010,9 @@ describe('fetchRecapState', () => {
         },
       });
       const octokit = mockOctokit([], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].authorReplyClass).toBe('none');
     });
 
@@ -1645,9 +2031,9 @@ describe('fetchRecapState', () => {
         },
       });
       const octokit = mockOctokit([], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].authorReplyClass).toBe('none');
     });
 
@@ -1669,15 +2055,15 @@ describe('fetchRecapState', () => {
         id: 'thread-disagree',
         comments: {
           nodes: [
-            { body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Null check\n\nDescription.', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:blocker:Null-check --> \u{1F6AB} **Blocker**: Null check\n\nDescription.', author: { login: 'manki-review[bot]' } },
             { body: 'I disagree with this finding, the code is correct', author: { login: 'author' } },
           ],
         },
       });
       const octokit = mockOctokit([thread], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.priorRounds[0].findings.entries[0].authorReplyClass).toBe('disagree');
     });
 
@@ -1685,11 +2071,11 @@ describe('fetchRecapState', () => {
       const ctx = makeRoundContext(1, {
         findings: {
           count: 2,
-          severityCounts: { blocker: 1, warning: 1 },
+          severityCounts: { warning: 2 },
           entries: [
             {
               fingerprint: { file: 'src/foo.ts', lineStart: 10, lineEnd: 10, slug: 'Null-check' },
-              severity: 'blocker',
+              severity: 'warning',
               threadId: 'thread-agree',
               authorReplyClass: 'none',
               title: 'Null check',
@@ -1708,7 +2094,7 @@ describe('fetchRecapState', () => {
         id: 'thread-agree',
         comments: {
           nodes: [
-            { body: '<!-- manki:blocker:Null-check --> **Blocker**: Null check', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:warning:Null-check --> **Warning**: Null check', author: { login: 'manki-review[bot]' } },
             { body: 'Agreed, will fix', author: { login: 'author' } },
           ],
         },
@@ -1717,14 +2103,14 @@ describe('fetchRecapState', () => {
         id: 'thread-no-change',
         comments: {
           nodes: [
-            { body: '<!-- manki:warning:Other --> **Warning**: Other', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:warning:Other --> **Warning**: Other', author: { login: 'manki-review[bot]' } },
           ],
         },
       });
       const octokit = mockOctokit([threadAgree, threadNoChange], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.reclassifiedPriorCount).toBe(1);
       expect(state.reclassifiedPriors).toEqual([{ threadId: 'thread-agree', from: 'none', to: 'agree' }]);
     });
@@ -1748,22 +2134,22 @@ describe('fetchRecapState', () => {
         line: 10,
         comments: {
           nodes: [
-            { body: '<!-- manki:warning:Null-check --> **Warning**: Null check', author: { login: 'github-actions[bot]' } },
+            { body: '<!-- manki:warning:Null-check --> **Warning**: Null check', author: { login: 'manki-review[bot]' } },
             { body: 'Agreed, will fix', author: { login: 'author' } },
           ],
         },
       });
       const octokit = mockOctokit([thread], [
-        { id: 200, body: detailsBlock(ctx), user: { login: BOT_LOGIN } },
+        { id: 200, body: htmlCommentBlock(ctx), user: { login: BOT_LOGIN } },
       ]);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.reclassifiedPriorCount).toBe(1);
       expect(state.reclassifiedPriors).toEqual([]);
     });
 
     it('returns zero reclassified count when no priors exist', async () => {
       const octokit = mockOctokit([], []);
-      const state = await fetchRecapState(octokit, 'owner', 'repo', 1);
+      const state = await fetchRecapState(octokit, TEST_BOT, 'owner', 'repo', 1);
       expect(state.reclassifiedPriorCount).toBe(0);
       expect(state.reclassifiedPriors).toEqual([]);
     });
@@ -1783,6 +2169,17 @@ describe('collectInPrSuppressions', () => {
       lineEnd: 10,
       slug: titleToSlug('Missing null check'),
     });
+    expect(collectInPrSuppressions([makePrevious({ title: 'Missing null check', file: 'src/a.ts', line: 10, status: 'resolved', fixed: true })])).toEqual([]);
+
+    // Only a thread the PR author alone could not clear is marked as guarded. An unread grade does not make it one.
+    const resolved = (threadId: string, overrides: Partial<PreviousFinding>) => makePrevious({ title: 'Missing null check', file: 'src/a.ts', line: 10, status: 'resolved', severity: 'warning', threadId, ...overrides });
+    const threads = [
+      resolved('plain', {}), resolved('blocker', { severity: 'blocker' }), resolved('security', { isSecurity: true }),
+      resolved('raised', { recordedGrade: 'blocker' }), resolved('unknown', { gradeUnknown: true }),
+    ];
+    expect(collectInPrSuppressions(threads).map(s => s.guarded ?? false)).toEqual([false, true, true, true, false]);
+    expect([...collectGuardedThreadIds(threads)]).toEqual(['blocker', 'security', 'raised']);
+    expect(collectGuardedThreadIds(undefined).size).toBe(0);
   });
 
   // Note: `fetchReviewThreads` always classifies a thread with at least one
@@ -1933,7 +2330,7 @@ describe('llmDeduplicateFindings', () => {
     ];
     const mockClient = {
       sendMessage: jest.fn().mockResolvedValue({
-        content: '[{ "index": 1, "matchedDismissed": 1 }]',
+        content: '[{ "index": 1, "matchedResolved": 1 }]',
       }),
     } as unknown as import('./providers').LLMClient;
 
@@ -1944,6 +2341,32 @@ describe('llmDeduplicateFindings', () => {
     expect(result.duplicates[0].finding.title).toBe('Missing null check');
     expect(result.duplicates[0].matchedTitle).toBe('Null safety issue');
     expect(result.duplicates[0].matchType).toBe('llm');
+
+    // A lockfile alert never reaches the model, so a match it would name can't drop it.
+    const alert = makeFinding({ title: 'lockfile-change: updated hey 0.4.3 -> 0.4.2: downgrade.', file: 'Cargo.lock', line: 44 });
+    jest.mocked(mockClient.sendMessage).mockClear();
+    const withAlert = await llmDeduplicateFindings([alert, ...findings], previous, mockClient);
+    expect([withAlert.unique.map(f => f.title), jest.mocked(mockClient.sendMessage).mock.calls[0][1]]).toEqual([[alert.title, 'Unused import'], expect.not.stringContaining('lockfile-change')]);
+
+    const fixed = makePrevious({ ...previous[0], fixed: true });
+    const kept = await llmDeduplicateFindings(findings, [fixed], mockClient);
+    expect(kept.duplicates).toHaveLength(0);
+    expect(kept.unique).toEqual([{ ...findings[0], resemblesFixed: { title: 'Null safety issue', file: 'src/foo.ts', line: 10 } }, findings[1]]);
+    jest.mocked(mockClient.sendMessage).mockResolvedValueOnce({ content: '[{ "index": 1, "matchedResolved": 1 }, { "index": 1, "matchedResolved": 2 }]' } as never);
+    const both = await llmDeduplicateFindings(findings, [fixed, previous[0]], mockClient);
+    expect(both.duplicates.map(d => d.finding.title)).toEqual(['Missing null check']);
+
+    // A blocker or a security finding is dropped only for a resolved blocking or security thread, since the PR author can resolve any other.
+    for (const raised of [{ ...findings[0], severity: 'blocker' as const }, { ...findings[0], severity: 'warning' as const, tags: [SECURITY_TAG] }]) {
+      const notWaived = await llmDeduplicateFindings([raised], previous, mockClient);
+      expect(notWaived).toEqual({ unique: [raised], duplicates: [] });
+      expect(deduplicateFindings([raised], [makePrevious({ ...previous[0], title: raised.title })])).toEqual({ unique: [raised], duplicates: [] });
+      for (const guarded of [{ severity: 'blocker' as const }, { isSecurity: true }]) {
+        const waived = await llmDeduplicateFindings([raised], [makePrevious({ ...previous[0], ...guarded })], mockClient);
+        expect(waived.duplicates.map(d => d.finding.title)).toEqual(['Missing null check']);
+        expect(deduplicateFindings([raised], [makePrevious({ ...previous[0], title: raised.title, ...guarded })]).duplicates).toHaveLength(1);
+      }
+    }
   });
 
   it('handles LLM returning no matches', async () => {
@@ -1978,9 +2401,52 @@ describe('llmDeduplicateFindings', () => {
     expect(result.duplicates).toHaveLength(0);
   });
 
+  it('catches a reworded repeat of a waived finding from its description and the line it names', async () => {
+    // Three wordings of one finding, each posted a round after the one before.
+    const memory = { file: 'src/memory.ts', severity: 'warning' as const };
+    const waived = makePrevious({
+      ...memory, severity: 'note', status: 'resolved', threadId: 'T1', line: 0, originalLine: 80, findingLine: 84, answer: 'Agreed. The move is the follow-up.',
+      title: 'Repos with `memory.enabled` and no `memory.repo` lose their existing memory silently',
+      description: "Before this change, an empty `memory.repo` meant `<owner>/review-memory` (the removed `resolveMemoryRepo`, called with the App's memory token). Now the same config goes to the central store, which starts empty for that repo.",
+    });
+    const second = makeFinding({
+      ...memory, line: 79,
+      title: 'Repos on the old default `<owner>/review-memory` quietly lose their stored memory',
+      description: 'Before this change, an empty `memory.repo` resolved to `<owner>/review-memory` (the removed `resolveMemoryRepo`). Now an empty `memory.repo` goes straight to the central store.',
+    });
+    const third = makeFinding({
+      ...memory, line: 79,
+      title: 'Repos on the old default `<owner>/review-memory` silently lose their memory and start writing to the central repository',
+      description: 'Before this change, an empty `memory.repo` resolved to `<owner>/review-memory` through `resolveMemoryRepo`. Now an empty `memory.repo` goes straight to `serviceMemoryStore`, with no warning or log line.',
+    });
+    const match = { sendMessage: jest.fn().mockResolvedValue({ content: '[{ "index": 1, "matchedResolved": 1 }]' }) } as unknown as import('./providers').LLMClient;
+
+    // The titles share too few words for the static match, so the model compares the descriptions on the line the
+    // finding names, not the line its outdated thread was posted on.
+    expect(deduplicateFindings([second], [waived]).unique).toEqual([second]);
+    expect(await llmDeduplicateFindings([second], [waived], match)).toEqual({ unique: [], duplicates: [{ finding: second, matchedTitle: waived.title, matchType: 'llm' }] });
+    const [, prompt] = jest.mocked(match.sendMessage).mock.calls[0];
+    expect(prompt).toContain('(src/memory.ts:84): "Before this change, an empty memory.repo meant');
+    expect(prompt).toContain('(src/memory.ts:79): "Before this change, an empty memory.repo resolved to');
+    // A finding or a thread that names no line is listed by its file alone.
+    const wholeFile = { ...waived, findingLine: undefined, originalLine: undefined };
+    await llmDeduplicateFindings([{ ...second, line: 0 }], [wholeFile], match);
+    const fileOnly = jest.mocked(match.sendMessage).mock.calls.at(-1)![1];
+    expect(fileOnly).not.toContain('src/memory.ts:');
+    expect(fileOnly.match(/\(src\/memory\.ts\): "/g)).toHaveLength(2);
+
+    // The static match sends the next wording to the judge with the answer in the thread of the one before.
+    const answered = makePrevious({ ...memory, status: 'replied', threadId: 'T2', line: 79, title: second.title, answer: 'Unverified. The move is not in this PR.' });
+    expect(deduplicateFindings([third], [answered]).unique).toEqual([{ ...third, answeredIn: { threadId: 'T2', answer: 'Unverified. The move is not in this PR.' } }]);
+
+    // The same problem in another file is another place, so a model match there changes nothing.
+    const elsewhere = { ...second, file: 'src/index.ts' };
+    expect(await llmDeduplicateFindings([elsewhere], [waived], match)).toEqual({ unique: [elsewhere], duplicates: [] });
+  });
+
   it('does not treat replied findings as dismissed', async () => {
     const findings = [makeFinding({ title: 'Missing null check', file: 'src/foo.ts', line: 10 })];
-    const previous = [makePrevious({ title: 'Missing null check', status: 'replied' })];
+    const previous = [makePrevious({ title: 'Missing null check', status: 'replied', threadId: 'T1', answer: 'Kept. `id` can be null here.' })];
     const mockClient = { sendMessage: jest.fn() } as unknown as import('./providers').LLMClient;
 
     const result = await llmDeduplicateFindings(findings, previous, mockClient);
@@ -1999,7 +2465,7 @@ describe('llmDeduplicateFindings', () => {
     ];
     const mockClient = {
       sendMessage: jest.fn().mockResolvedValue({
-        content: '```json\n[{ "index": 1, "matchedDismissed": 1 }]\n```',
+        content: '```json\n[{ "index": 1, "matchedResolved": 1 }]\n```',
       }),
     } as unknown as import('./providers').LLMClient;
 
@@ -2011,7 +2477,7 @@ describe('llmDeduplicateFindings', () => {
     expect(result.duplicates[0].matchedTitle).toBe('Null safety issue');
   });
 
-  it('keeps finding in unique when matchedDismissed index is out of bounds', async () => {
+  it('keeps finding in unique when matchedResolved index is out of bounds', async () => {
     const findings = [
       makeFinding({ title: 'Null check missing', file: 'src/foo.ts', line: 10 }),
     ];
@@ -2021,7 +2487,7 @@ describe('llmDeduplicateFindings', () => {
     ];
     const mockClient = {
       sendMessage: jest.fn().mockResolvedValue({
-        content: '[{ "index": 1, "matchedDismissed": 99 }]',
+        content: '[{ "index": 1, "matchedResolved": 99 }]',
       }),
     } as unknown as import('./providers').LLMClient;
 
@@ -2039,6 +2505,65 @@ const makeCommentBody = (description: string, aiContextJson?: string): string =>
 };
 
 describe('parseFindingFromComment', () => {
+  it('extracts the description of a not-blocking or unconfirmed comment from `formatFindingComment`', () => {
+    const body = formatFindingComment({ severity: 'note', title: 'Extract helper', file: 'src/a.ts', line: 2, description: 'The logic is duplicated.', reviewers: [] }, TEST_LINKS);
+    expect(parseFindingFromComment(body)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+    const unconfirmed = formatFindingComment({ severity: 'warning', title: 'Extract helper', file: 'src/a.ts', line: 2, description: 'The logic is duplicated.', reviewers: [], checkStatus: 'unconfirmed' }, TEST_LINKS);
+    expect(unconfirmed).toContain('_Manki could not confirm this, so please check it._');
+    expect(parseFindingFromComment(unconfirmed)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+    // The sentence on a warning an earlier round missed is not part of the description either, alone or after the other one.
+    for (const checkStatus of [undefined, 'unconfirmed' as const]) {
+      const late = formatFindingComment({ severity: 'warning', title: 'Extract helper', file: 'src/a.ts', line: 2, description: 'The logic is duplicated.', reviewers: [], origin: 'reviewed', tags: ['follow-up'], checkStatus }, TEST_LINKS);
+      expect(late).toContain('_An earlier round already reviewed these lines and missed this, and it doesn\'t block this PR._');
+      expect(parseFindingFromComment(late)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+    }
+    // The issue box, and the link that replaces it once ticked, are not part of the description.
+    expect(body).toContain('Create an issue for this');
+    const filed = body.replace(/- \[ \] Create an issue for this[^\n]*/, 'Issue #12 created by @bob');
+    expect(parseFindingFromComment(filed)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+    const toolBody = formatFindingComment({ severity: 'warning', title: 'js/sql-injection: Query built from user input', file: 'src/a.ts', line: 2, description: 'The query uses `name`.', reviewers: ['CodeQL'], toolSource: 'CodeQL (1.2)', category: 'security', effort: 'quick' }, TEST_LINKS);
+    expect(parseFindingFromComment(toolBody)).toEqual({ description: 'The query uses `name`.', suggestedFix: undefined });
+    // A tool name cannot pass as the end of a title line, and a line of the description cannot pass as the fix label.
+    const oddTool = formatFindingComment({ severity: 'warning', title: 'Query built from user input', file: 'src/a.ts', line: 2, description: 'The query uses `name`.', reviewers: ['CodeQL'], toolSource: 'CodeQL (1.2):: beta' }, TEST_LINKS);
+    expect(oddTool.split('\n')[0]).toContain('(CodeQL (1.2) beta)');
+    expect(parseFindingFromComment(oddTool)).toEqual({ description: 'The query uses `name`.', suggestedFix: undefined });
+    const fixLine = formatFindingComment({ severity: 'note', title: 'Extract helper', file: 'src/a.ts', line: 2, description: 'The logic is duplicated.\n**Fix:** move it.', reviewers: [], howToFix: 'Move it to a helper.' }, TEST_LINKS);
+    expect(fixLine).toContain('\n**Fix:** Move it to a helper.');
+    expect(parseFindingFromComment(fixLine)).toEqual({ description: 'The logic is duplicated.\n**Fix**: move it.', suggestedFix: undefined, howToFix: 'Move it to a helper.' });
+    // A thread posted on another file opens with a note on where the finding is, which is no part of the description.
+    // The note is read by its place, so it is skipped whatever the highlighting of the diff's identifiers makes of it.
+    const identifiers = new Set(['This', 'Comments', 'thread', 'posted', 'here', 'src/store.ts', '_store_file_', 'src/_store_file_.ts']);
+    // A file name is finder text in that note, so one that reads like a label of Manki's layout is still only part of the note.
+    for (const file of ['src/store.ts', 'src/_store_file_.ts', 'src/a*b*.ts', 'src/**Warning**: x.ts', 'src/**Blocker** y.ts', 'src/**What goes wrong:** z.ts', '']) {
+      // With no other note under it, the line below the note is the description itself.
+      for (const checkStatus of [undefined, 'unconfirmed' as const]) {
+        const detached = formatFindingComment({ severity: 'blocker', title: 'Extract helper', file, line: 2, description: 'The logic is duplicated.', reviewers: [], checkStatus }, TEST_LINKS, 'detached');
+        expect(detached).toContain(`so the thread is posted here.\n\n${checkStatus ? '_Manki could not confirm this' : '**What goes wrong:** The logic is duplicated.'}`);
+        for (const posted of [detached, highlightCode(detached, identifiers)]) {
+          expect(parseFindingFromComment(posted)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+        }
+      }
+    }
+    // A late warning on such a thread has all three notes under its title. The first is the one on where the finding is, and the other two are skipped in either order.
+    const late = formatFindingComment({ severity: 'warning', title: 'Extract helper', file: 'src/store.ts', line: 2, description: 'The logic is duplicated.', reviewers: [], tags: ['follow-up'], checkStatus: 'unconfirmed', origin: 'reviewed' }, TEST_LINKS, 'detached');
+    const notes = late.match(/(This is in [^\n]+)\n\n(_Manki could not confirm[^\n]+)\n\n(_An earlier round already reviewed[^\n]+)\n\n/);
+    expect(notes).not.toBeNull();
+    for (const order of [[1, 2, 3], [1, 3, 2]]) {
+      const body = late.replace(notes![0], `${order.map(i => notes![i]).join('\n\n')}\n\n`);
+      expect(parseFindingFromComment(body)).toEqual({ description: 'The logic is duplicated.', suggestedFix: undefined });
+    }
+    // When the title line is not at the top, the layout is not Manki's own, and no line is dropped on the word of the finding data.
+    const edited = `Edited by hand.\n\n${formatFindingComment({ severity: 'blocker', title: 'Extract helper', file: 'src/**Warning**: x.ts', line: 2, description: 'The logic is duplicated.', reviewers: [] }, TEST_LINKS, 'detached')}`;
+    expect(parseFindingFromComment(edited).description).toBe('The logic is duplicated.');
+    // The title is the line under the header, so a label in the description is part of the description.
+    const labelled = 'It reads **Warning**: not a title, and then goes on.';
+    expect(parseFindingFromComment(formatFindingComment({ severity: 'warning', title: 'Extract helper', file: 'src/a.ts', line: 2, description: labelled, reviewers: [] }, TEST_LINKS)).description).toBe(labelled);
+    // The first line is skipped only on a thread whose finding data says it is posted elsewhere.
+    const sentence = 'This is not tied to a file or line. Comments are only possible on changed files, so the thread is posted here.';
+    const quoted = formatFindingComment({ severity: 'note', title: 'Extract helper', file: 'src/a.ts', line: 2, description: sentence, reviewers: [] }, TEST_LINKS);
+    expect(parseFindingFromComment(quoted).description).toBe(sentence);
+  });
+
   it('extracts description up to the <details> stop marker', () => {
     const body = makeCommentBody('The variable is never checked for null.');
     const result = parseFindingFromComment(body);
@@ -2058,7 +2583,7 @@ describe('parseFindingFromComment', () => {
   });
 
   it('extracts suggestedFix from AI context JSON', () => {
-    const body = makeCommentBody('Desc.', '{"fix":"Add null check before access","severity":"suggestion","confidence":"high","flaggedBy":["Correctness"]}');
+    const body = makeCommentBody('Desc.', '{"fix":"Add null check before access","severity":"note","confidence":"high","flaggedBy":["Correctness"]}');
     const result = parseFindingFromComment(body);
     expect(result.suggestedFix).toBe('Add null check before access');
   });
@@ -2071,7 +2596,7 @@ describe('parseFindingFromComment', () => {
   });
 
   it('returns undefined suggestedFix when fix key is absent from valid JSON', () => {
-    const body = makeCommentBody('Desc.', '{"severity":"suggestion","confidence":"high","flaggedBy":["Correctness"]}');
+    const body = makeCommentBody('Desc.', '{"severity":"note","confidence":"high","flaggedBy":["Correctness"]}');
     const result = parseFindingFromComment(body);
     expect(result.description).toBe('Desc.');
     expect(result.suggestedFix).toBeUndefined();
@@ -2104,7 +2629,7 @@ describe('parseFindingFromComment', () => {
 
   it('caps suggestedFix at 300 chars and appends ellipsis', () => {
     const longFix = 'y'.repeat(400);
-    const body = makeCommentBody('Desc.', `{"fix":"${longFix}","severity":"suggestion"}`);
+    const body = makeCommentBody('Desc.', `{"fix":"${longFix}","severity":"note"}`);
     const result = parseFindingFromComment(body);
     expect(result.suggestedFix).toHaveLength(303);
     expect(result.suggestedFix).toMatch(/\.\.\.$/);
@@ -2179,12 +2704,12 @@ describe('refreshAuthorReplyClass', () => {
       config: { reviewLevel: 'medium', memoryEnabled: false },
       diff: { lines: 0, additions: 0, deletions: 0, filesReviewed: 0, fileTypes: {} },
       models: { reviewer: 'r', judge: 'j' },
-      planner: { source: 'disabled', used: false, coreAgentInjections: [], priorRoundEffortDowngrades: [] },
+      planner: { source: 'disabled', used: false },
       reviewers: { agents: [] },
       judge: { summary: '' },
       dedup: {},
       memory: {},
-      findings: { count: entries.length, severityCounts: { blocker: 0, warning: 0, suggestion: 0, nitpick: 0 }, entries },
+      findings: { count: entries.length, severityCounts: { blocker: 0, warning: 0, note: 0 }, entries },
       usage: {},
       verdict: 'COMMENT',
     };
@@ -2193,7 +2718,7 @@ describe('refreshAuthorReplyClass', () => {
   function makeEntry(overrides: Partial<FindingFingerprintEntry> = {}): FindingFingerprintEntry {
     return {
       fingerprint: { file: 'src/foo.ts', slug: 'test-finding', lineStart: 10, lineEnd: 10 },
-      severity: 'suggestion',
+      severity: 'note',
       authorReplyClass: 'none',
       ...overrides,
     };
@@ -2210,7 +2735,7 @@ describe('refreshAuthorReplyClass', () => {
     const entry = makeEntry({ threadId: 'T1', authorReplyClass: 'none' });
     const rounds = [makeRound([entry])];
     const previousFindings: PreviousFinding[] = [
-      { title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'suggestion', status: 'resolved', threadId: 'T1', authorReplyText: 'LGTM fixed' },
+      { title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'note', status: 'resolved', threadId: 'T1', authorReplyText: 'LGTM fixed' },
     ];
 
     const result = refreshAuthorReplyClass(rounds, previousFindings);
@@ -2223,7 +2748,7 @@ describe('refreshAuthorReplyClass', () => {
     const entry = makeEntry({ threadId: undefined, fingerprint: { file: 'src/foo.ts', slug: 'Test-finding', lineStart: 10, lineEnd: 10 }, authorReplyClass: 'none' });
     const rounds = [makeRound([entry])];
     const previousFindings: PreviousFinding[] = [
-      { title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'suggestion', status: 'resolved', authorReplyText: 'fixed' },
+      { title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'note', status: 'resolved', authorReplyText: 'fixed' },
     ];
 
     const result = refreshAuthorReplyClass(rounds, previousFindings);
@@ -2231,14 +2756,14 @@ describe('refreshAuthorReplyClass', () => {
     expect(result.reclassifiedPriors).toHaveLength(0);
   });
 
-  it('caps entries at 50 when flips exceed the limit', () => {
+  it('records every flip', () => {
     const entries = Array.from({ length: 55 }, (_, i) => makeEntry({ threadId: `T${i}`, authorReplyClass: 'none' }));
     const previousFindings: PreviousFinding[] = entries.map((e, i) => ({
-      title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'suggestion' as const, status: 'resolved' as const, threadId: `T${i}`, authorReplyText: 'fixed',
+      title: 'Test finding', file: 'src/foo.ts', line: 10, severity: 'note' as const, status: 'resolved' as const, threadId: `T${i}`, authorReplyText: 'fixed',
     }));
 
     const result = refreshAuthorReplyClass([makeRound(entries)], previousFindings);
     expect(result.reclassifiedPriorCount).toBe(55);
-    expect(result.reclassifiedPriors).toHaveLength(50);
+    expect(result.reclassifiedPriors).toHaveLength(55);
   });
 });

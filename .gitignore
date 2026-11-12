@@ -1,4 +1,5 @@
 node_modules/
+dist/
 *.js.map
 *.d.ts.map
 .idea/
@@ -7,3 +8,6 @@ node_modules/
 .env
 .claude/
 coverage/
+bench/results/
+bench/.matcher-cache.json
+bench/drafts/

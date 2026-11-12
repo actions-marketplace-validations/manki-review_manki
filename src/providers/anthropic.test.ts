@@ -1,8 +1,15 @@
 import { spawn } from 'child_process';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import Anthropic from '@anthropic-ai/sdk';
 import * as core from '@actions/core';
 
-import { AnthropicClient, buildAnthropicAuth, extractAnthropicCLIUsage, resetCLIInstallPromise, sanitizeLogOutput, STALE_TIMEOUT_MS } from './anthropic';
+import { AnthropicClient, buildAnthropicAuth, CLAUDE_CLI_VERSION, extractAnthropicCLIUsage, readClaudeLimits, sanitizeLogOutput, STALE_TIMEOUT_MS } from './anthropic';
+import { runnerDiagnostics } from '../run-diagnostics';
+import { installPinned } from '../tool-install';
+import { RelatedRepoTools } from '../types';
+import { QuotaError, RefusalError, SendMessageOptions } from './types';
 
 jest.mock('child_process', () => ({
   execFile: jest.fn(),
@@ -10,6 +17,9 @@ jest.mock('child_process', () => ({
 }));
 
 jest.mock('@anthropic-ai/sdk');
+
+jest.mock('../tool-install', () => ({ ...jest.requireActual('../tool-install'), installPinned: jest.fn() }));
+const mockInstallPinned = installPinned as jest.MockedFunction<typeof installPinned>;
 
 // Container for the execFileAsync mock — must be a plain object so the
 // hoisted jest.mock factory can capture a reference to it before const
@@ -94,6 +104,24 @@ describe('sendMessage effort option (CLI path)', () => {
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     expect(spawnArgs).toContain('--effort');
     expect(spawnArgs[spawnArgs.indexOf('--effort') + 1]).toBe('high');
+
+    // The run's diagnostics count the CLI processes running at once: one has ended, then two run together.
+    const before = runnerDiagnostics().peakCliProcesses;
+    expect(before).toBeGreaterThanOrEqual(1);
+    await Promise.all([client.sendMessage('system', 'user'), client.sendMessage('system', 'user')]);
+    expect(runnerDiagnostics().peakCliProcesses).toBe(Math.max(before, 2));
+  });
+
+  it('passes xhigh only to a model that takes it, and high to an earlier one', async () => {
+    for (const [model, expected] of [['claude-opus-5-5', 'xhigh'], ['claude-opus-4-7', 'xhigh'], ['claude-opus-4-6', 'high'], ['claude-sonnet-4-5-20250929', 'high']]) {
+      mockSpawn.mockClear();
+      setupSpawnMock('response text');
+      const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model });
+      await client.sendMessage('system', 'user', { effort: 'xhigh' });
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs[spawnArgs.indexOf('--effort') + 1]).toBe(expected);
+      expect(client.sentEffort('xhigh')).toBe(expected);
+    }
   });
 
   it('omits --effort flag when no options provided', async () => {
@@ -118,69 +146,83 @@ describe('sendMessage effort option (CLI path)', () => {
 });
 
 describe('sendMessage effort option (API path)', () => {
-  let mockCreate: jest.Mock;
+  let mockStream: jest.Mock;
+  let mockFinalMessage: jest.Mock;
 
   beforeEach(() => {
-    mockCreate = jest.fn().mockResolvedValue({
+    mockFinalMessage = jest.fn().mockResolvedValue({
       content: [{ type: 'text', text: 'response' }],
     });
+    mockStream = jest.fn(() => ({ finalMessage: mockFinalMessage, on: jest.fn() }));
     (Anthropic as unknown as jest.Mock).mockImplementation(() => ({
-      messages: { create: mockCreate },
+      messages: { stream: mockStream },
     }));
   });
 
-  it('includes thinking param when effort is high', async () => {
-    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
+  async function sentParams(model: string, effort?: SendMessageOptions['effort']): Promise<Record<string, unknown>> {
+    mockStream.mockClear();
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model });
+    await client.sendMessage('system', 'user', effort ? { effort } : undefined);
+    return mockStream.mock.calls[0][0];
+  }
 
-    await client.sendMessage('system', 'user', { effort: 'high' });
-
-    const params = mockCreate.mock.calls[0][0];
-    expect(params.thinking).toEqual({ type: 'enabled', budget_tokens: 10000 });
-    expect(params.max_tokens).toBe(32768);
+  it('sends adaptive thinking with the native effort level on models after the 4.5 generation', async () => {
+    const models = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1', 'claude-future-9'];
+    for (const model of models) {
+      for (const effort of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+        const params = await sentParams(model, effort);
+        expect(params.thinking).toEqual({ type: 'adaptive' });
+        // `xhigh` arrived with Opus 4.7, so the 4.6 generation gets `high`, never more than asked.
+        expect(params.output_config).toEqual({ effort: effort === 'xhigh' && model.endsWith('4-6') ? 'high' : effort });
+        expect(params.output_config).toEqual({ effort: new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model }).sentEffort(effort) });
+        expect(params.max_tokens).toBe(32768);
+      }
+    }
   });
 
-  it('includes thinking param when effort is max', async () => {
-    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
-
-    await client.sendMessage('system', 'user', { effort: 'max' });
-
-    const params = mockCreate.mock.calls[0][0];
-    expect(params.thinking).toEqual({ type: 'enabled', budget_tokens: 16000 });
-    expect(params.max_tokens).toBe(32768);
+  it('sends budget_tokens on the 4.5 generation', async () => {
+    const models = ['claude-opus-4-5', 'claude-opus-4-5-20251101', 'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'];
+    for (const model of models) {
+      expect((await sentParams(model, 'medium')).thinking).toEqual({ type: 'enabled', budget_tokens: 5000 });
+      expect((await sentParams(model, 'high')).thinking).toEqual({ type: 'enabled', budget_tokens: 10000 });
+      expect((await sentParams(model, 'xhigh')).thinking).toEqual({ type: 'enabled', budget_tokens: 13000 });
+      const params = await sentParams(model, 'max');
+      expect(params.thinking).toEqual({ type: 'enabled', budget_tokens: 16000 });
+      expect(params.output_config).toBeUndefined();
+      expect(params.max_tokens).toBe(32768);
+      // Each tier has a budget of its own, so none is reported as a lower one.
+      const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model });
+      expect((['low', 'medium', 'high', 'xhigh', 'max'] as const).map(effort => client.sentEffort(effort))).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    }
   });
 
-  it('includes thinking param when effort is medium', async () => {
-    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
-
-    await client.sendMessage('system', 'user', { effort: 'medium' });
-
-    const params = mockCreate.mock.calls[0][0];
-    expect(params.thinking).toEqual({ type: 'enabled', budget_tokens: 5000 });
-    expect(params.max_tokens).toBe(32768);
-  });
-
-  it('omits thinking param when effort is low', async () => {
-    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
-
-    await client.sendMessage('system', 'user', { effort: 'low' });
-
-    const params = mockCreate.mock.calls[0][0];
-    expect(params.thinking).toBeUndefined();
-    expect(params.max_tokens).toBe(16384);
-  });
-
-  it('omits thinking param when no options provided', async () => {
-    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
-
+  it('bounds the API call with an abort signal only when `timeoutMs` is set', async () => {
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-5-5' });
+    await client.sendMessage('system', 'user', { timeoutMs: 300_000 });
     await client.sendMessage('system', 'user');
 
-    const params = mockCreate.mock.calls[0][0];
+    expect(mockStream.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(mockStream.mock.calls[1][1]).toBeUndefined();
+  });
+
+  it('omits thinking on the 4.5 generation when effort is low', async () => {
+    const params = await sentParams('claude-sonnet-4-5', 'low');
     expect(params.thinking).toBeUndefined();
+    expect(params.output_config).toBeUndefined();
     expect(params.max_tokens).toBe(16384);
+  });
+
+  it('omits thinking and effort when no options provided', async () => {
+    for (const model of ['claude-opus-4-7', 'claude-sonnet-4-5']) {
+      const params = await sentParams(model);
+      expect(params.thinking).toBeUndefined();
+      expect(params.output_config).toBeUndefined();
+      expect(params.max_tokens).toBe(16384);
+    }
   });
 
   it('concatenates multiple text blocks', async () => {
-    mockCreate.mockResolvedValue({
+    mockFinalMessage.mockResolvedValue({
       content: [
         { type: 'thinking', thinking: 'hmm' },
         { type: 'text', text: 'first' },
@@ -211,7 +253,6 @@ describe('sendMessage effort option (API path)', () => {
 describe('sendViaOAuth — error paths', () => {
   beforeEach(() => {
     mockSpawn.mockReset();
-    resetCLIInstallPromise();
   });
 
   function setupSpawnMock(opts: {
@@ -263,10 +304,11 @@ describe('sendViaOAuth — error paths', () => {
     );
   });
 
-  it('surfaces stdout tail, <empty stderr>, and parsed result event when exit-1 has no stderr', async () => {
+  it('leads with the CLI error text and keeps the diagnostics when exit-1 has no stderr', async () => {
+    const cliError = 'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access';
     const streamWithResultError = [
       JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial thinking emitted right before exit' } }),
-      JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Maximum tokens exceeded' }),
+      JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: cliError }),
       '',
     ].join('\n');
     setupSpawnMock({
@@ -278,14 +320,98 @@ describe('sendViaOAuth — error paths', () => {
     const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
-    await expect(client.sendMessage('sys', 'user')).rejects.toThrow(/Claude CLI invocation failed/);
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error?.message.startsWith(`Claude CLI error: ${cliError}. `)).toBe(true);
+    expect(error?.message).toContain('claude setup-token');
+    expect(error?.message).toMatch(/Claude CLI invocation failed \(exit 1: <empty stderr>/);
     const allWarnings = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(allWarnings).toContain(`Claude CLI error: ${cliError}`);
     expect(allWarnings).toContain('Claude CLI failed');
     expect(allWarnings).toContain('<empty stderr>');
     expect(allWarnings).toContain('stderrChars=0');
     expect(allWarnings).toContain('is_error=true');
     expect(allWarnings).toContain('subtype=error_during_execution');
-    expect(allWarnings).toContain('Maximum tokens exceeded');
+    warnSpy.mockRestore();
+  });
+
+  it('leads with a non-auth CLI error without the token hint', async () => {
+    const cliError = 'Prompt is too long: 250000 tokens > 200000 maximum';
+    setupSpawnMock({
+      exitCode: 1,
+      stderr: '',
+      stdout: `${JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: cliError })}\n`,
+      rawStdout: true,
+    });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error?.message.startsWith(`Claude CLI error: ${cliError}. Claude CLI invocation failed`)).toBe(true);
+    expect(error?.message).not.toContain('claude setup-token');
+    expect(error).not.toBeInstanceOf(RefusalError);
+    warnSpy.mockRestore();
+  });
+
+  it.each([
+    ['exits 1', 1],
+    ['exits 0 with `is_error`', 0],
+  ])('throws a `QuotaError` with the reset time when the subscription limit is used up and the CLI %s', async (_case, exitCode) => {
+    const limitText = "You've hit your weekly limit · resets Nov 6, 8pm (UTC)";
+    const limitEvent = JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', unifiedWindows: { seven_day: { utilization: 1, resetsAt: 1794600000 } } } });
+    setupSpawnMock({ exitCode, stderr: '', stdout: `${limitEvent}\n${JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: limitText })}\n`, rawStdout: true });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-sonnet-5-5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(QuotaError);
+    expect(error).toMatchObject({ limit: 'Claude subscription limit reached', resetsAt: 'Nov 6, 8pm (UTC)', credential: 'token' });
+    expect(error?.message).toContain(limitText);
+    // The failed call still reports the limit that ran out, so the round can warn about it.
+    expect(error).toMatchObject({ limits: [{ account: 'Claude subscription', window: 'weekly', usedPercent: 100, resetsAt: 1794600000 }] });
+    warnSpy.mockRestore();
+  });
+
+  const safeguardsText = "API Error: Opus 5.5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations.";
+  const refusedAssistant = JSON.stringify({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'text', text: safeguardsText }], stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'reasoning_extraction', explanation: null } },
+  });
+  it.each<[string, string[], string]>([
+    ['the assistant event names the category', [refusedAssistant, JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: safeguardsText })], 'refusal (reasoning_extraction)'],
+    ['only the result event carries the stop reason', [JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: safeguardsText, stop_reason: 'refusal' })], 'refusal'],
+  ])('throws a `RefusalError` when %s', async (_case, lines, reason) => {
+    setupSpawnMock({ exitCode: 1, stderr: '', stdout: `${lines.join('\n')}\n`, rawStdout: true });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(RefusalError);
+    expect((error as RefusalError).reason).toBe(reason);
+    expect(error?.message).toContain(`Claude CLI error: ${safeguardsText}`);
+    warnSpy.mockRestore();
+  });
+
+  it('ignores a refused attempt when the CLI run still succeeds', async () => {
+    setupSpawnMock({ stdout: `${refusedAssistant}\n${JSON.stringify({ type: 'result', subtype: 'success', result: 'answer', stop_reason: 'end_turn' })}\n`, rawStdout: true });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    await expect(client.sendMessage('sys', 'user')).resolves.toMatchObject({ content: 'answer' });
+  });
+
+  it('throws a plain error when the run fails after recovering from a refused attempt', async () => {
+    const authError = 'Invalid API key · Please run /login';
+    const lines = [
+      refusedAssistant,
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: authError }], stop_reason: 'stop_sequence', stop_details: null } }),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: authError }),
+    ];
+    setupSpawnMock({ exitCode: 1, stderr: '', stdout: `${lines.join('\n')}\n`, rawStdout: true });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error?.message).toContain(authError);
+    expect(error).not.toBeInstanceOf(RefusalError);
     warnSpy.mockRestore();
   });
 
@@ -303,7 +429,7 @@ describe('sendViaOAuth — error paths', () => {
     const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
-    await expect(client.sendMessage('sys', 'user')).rejects.toThrow(/Claude CLI invocation failed/);
+    await expect(client.sendMessage('sys', 'user')).rejects.toThrow(/^Claude CLI invocation failed/);
     const allWarnings = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(allWarnings).toContain('<no result event>');
     expect(allWarnings).not.toContain('is_error=');
@@ -325,17 +451,39 @@ describe('sendViaOAuth — error paths', () => {
     expect(result.content).toBe('hello world');
   });
 
-  it('sets CLAUDE_CODE_OAUTH_TOKEN in spawn env', async () => {
+  it('sets CLAUDE_CODE_OAUTH_TOKEN and caps output at the API path\'s limit in spawn env', async () => {
+    const ambient = {
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+      CLAUDE_CODE_OAUTH_TOKEN: 'ambient-oauth-token',
+      GITHUB_TOKEN: 'ghs_workflow',
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://pipelines.actions.githubusercontent.com/oidc',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'oidc-request',
+      INPUT_GITHUB_TOKEN: 'ghs_input',
+    };
+    const saved = Object.fromEntries(Object.keys(ambient).map((name) => [name, process.env[name]]));
+    Object.assign(process.env, ambient);
     setupSpawnMock({ stdout: 'ok' });
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'my-oauth-token' }, model: 'claude-opus-4-6' });
 
-    await client.sendMessage('sys', 'user');
+    try {
+      await client.sendMessage('sys', 'user');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
 
     const spawnOpts = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
     expect(spawnOpts.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('my-oauth-token');
+    expect(spawnOpts.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('32768');
+    expect(spawnOpts.env.PATH).toBe(process.env.PATH);
+    for (const name of ['GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'INPUT_GITHUB_TOKEN']) {
+      expect(spawnOpts.env).not.toHaveProperty(name);
+    }
   });
 
-  it('passes --verbose, --output-format stream-json, and --include-partial-messages to CLI', async () => {
+  it('passes the output and isolation flags and runs the CLI in an empty temp directory', async () => {
     setupSpawnMock({ stdout: 'ok' });
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
@@ -347,6 +495,128 @@ describe('sendViaOAuth — error paths', () => {
     expect(spawnArgs[fmtIdx + 1]).toBe('stream-json');
     expect(spawnArgs).toContain('--verbose');
     expect(spawnArgs).toContain('--include-partial-messages');
+    expect(spawnArgs[spawnArgs.indexOf('--tools') + 1]).toBe('');
+    expect(spawnArgs).toContain('--strict-mcp-config');
+    expect(spawnArgs).toContain('--model=claude-opus-4-6');
+    expect(spawnArgs).not.toContain('--mcp-config');
+    expect(spawnArgs).not.toContain('--restricted');
+    expect(spawnArgs[spawnArgs.indexOf('--setting-sources') + 1]).toBe('');
+    const { cwd } = mockSpawn.mock.calls[0][2] as { cwd: string };
+    expect(cwd.startsWith(join(tmpdir(), 'manki-cli-'))).toBe(true);
+    expect(readdirSync(cwd)).toEqual([]);
+  });
+
+  it('gives the CLI read-only tools on the repository and Manki\'s tool server when asked for them, and reports the tool steps and files read', async () => {
+    const toolUse = (id: string, name: string, input: object = {}) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
+    const toolResult = (id: string) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'x' }] } });
+    const events = [
+      toolUse('t1', 'Read', { file_path: '/work/repo/src/a.rs' }), toolResult('t1'),
+      toolUse('t2', 'mcp__manki__git_history', { path: 'src/b.rs' }), toolResult('t2'),
+      toolUse('t3', 'Read', { file_path: '/work/repo/src/a.rs', offset: 400 }), toolResult('t3'),
+      toolUse('t4', 'mcp__manki__read_file', { repo: 'dashpay/dash', path: 'src/net.cpp' }), toolResult('t4'),
+      { type: 'result', result: '[]' },
+    ];
+    setupSpawnMock({ stdout: `${events.map(e => JSON.stringify(e)).join('\n')}\n`, rawStdout: true });
+    const spawnProc = mockSpawn.getMockImplementation()!;
+    let systemPromptFile = '';
+    let mcpConfig: { mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> } | undefined;
+    mockSpawn.mockImplementationOnce((...args: Parameters<typeof spawnProc>) => {
+      const cliArgs = args[1] as string[];
+      systemPromptFile = readFileSync(cliArgs[cliArgs.indexOf('--system-prompt-file') + 1], 'utf-8');
+      mcpConfig = JSON.parse(readFileSync(cliArgs[cliArgs.indexOf('--mcp-config') + 1], 'utf-8'));
+      // The tool server keeps its related repo reads in the file the CLI is given, which the call reads back.
+      const serverArgs = mcpConfig!.mcpServers.manki.args;
+      writeFileSync(serverArgs[serverArgs.indexOf('--reads-file') + 1], JSON.stringify({ 'dashpay/dash': 3, 'dashpay/platform': 'many' }));
+      return spawnProc(...args);
+    });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+    expect(client.repoTools).toBe(true);
+    expect(new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'claude-opus-5-5' }).repoTools).toBe(false);
+
+    const related: RelatedRepoTools = {
+      repos: [{ repo: 'dashpay/dash', kind: 'reference', ref: 'v23.0.0', paths: ['src/'] }, { repo: 'dashpay/platform', kind: 'consumer' }],
+      cacheDir: '/runner/temp/manki-related-repos',
+      stateDir: '/runner/temp/manki-related-1',
+    };
+    const savedApiUrl = process.env.GITHUB_API_URL;
+    process.env.GITHUB_API_URL = 'https://ghe.example/api/v3';
+    const response = await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15, related } })
+      .finally(() => { if (savedApiUrl === undefined) delete process.env.GITHUB_API_URL; else process.env.GITHUB_API_URL = savedApiUrl; });
+
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    const valueOf = (flag: string) => spawnArgs[spawnArgs.indexOf(flag) + 1];
+    expect(spawnArgs).toEqual(expect.arrayContaining(['--restricted', '--strict-mcp-config']));
+    expect([valueOf('--permission-mode'), valueOf('--tools'), valueOf('--add-dir'), valueOf('--allowedTools'), valueOf('--max-turns')])
+      .toEqual(['dontAsk', 'Read,Grep,Glob', '/work/repo', 'mcp__manki__git_history,mcp__manki__ast_grep,mcp__manki__repo_info,mcp__manki__read_file,mcp__manki__grep,mcp__manki__glob', '20']);
+    const hook = JSON.parse(valueOf('--settings')).hooks.PreToolUse;
+    expect(hook).toEqual([{ matcher: '*', hooks: [{ type: 'command', command: expect.stringMatching(/ 'step-hook' '[^']+\/steps' '15'$/) }] }]);
+    expect(hook[0].hooks[0].command.startsWith(`'${process.execPath}' '${process.argv[1]}' `)).toBe(true);
+    expect(valueOf('--setting-sources')).toBe('');
+    expect(mcpConfig!.mcpServers.manki).toEqual({
+      type: 'stdio', command: process.execPath, args: [process.argv[1], 'mcp-server', '/work/repo', '--related-repos', JSON.stringify(related), '--reads-file', expect.stringMatching(/\/related-reads\.json$/)],
+      env: { CLAUDE_CODE_OAUTH_TOKEN: '', GITHUB_API_URL: 'https://ghe.example/api/v3' },
+    });
+    expect(Object.keys(mcpConfig!.mcpServers)).toEqual(['manki']);
+    expect(systemPromptFile).toMatch(/^Review the diff\.\n\n## Tools\n\nThe PR's head commit is checked out at `\/work\/repo`\./);
+    expect(systemPromptFile).toContain('You have 15 tool steps, and each tool call takes one. When 3 are left, a note from Manki');
+    expect(systemPromptFile).toContain('Use the tools to follow every path the change affects: the callers of changed code, the code it calls, and other routes to the same outcome.');
+    expect(systemPromptFile).not.toContain('not to explore');
+    expect(systemPromptFile).toContain('`repo_info` tells whether a GitHub repository, named as `owner/name`, exists and is public, archived or a fork');
+    expect(systemPromptFile).toContain([
+      '## Related repos',
+      '',
+      '`read_file`, `grep`, `glob` and `ast_grep` read one of these repos instead when you name it in `repo`:',
+      '',
+      '- `dashpay/dash` at `v23.0.0`, reference: a codebase this one implements or ports. Only `src/` is fetched.',
+      '- `dashpay/platform`, consumer: a codebase that depends on this one.',
+    ].join('\n'));
+    expect(systemPromptFile).toContain('- Read a **reference** whenever the PR title, description or changed code says the change matches it, or follows its spec or proposal: open the code the claim names and compare it with the change.');
+    expect(systemPromptFile).toContain('- Read a **reference** when the changed code implements or mirrors it, such as a spec, a file or wire format, another implementation or an API this code talks to. Compare both directions of each contract: what this code produces against what the reference accepts, and the reverse, along with limits, field order, field types and versions.');
+    expect(systemPromptFile).toContain('A change that breaks a consumer is a `warning` that lists the consumer\'s call sites');
+    expect(response.toolSteps?.map(step => step.tool)).toEqual(['Read', 'mcp__manki__git_history', 'Read', 'mcp__manki__read_file']);
+    expect(response.filesRead).toEqual(['src/a.rs', 'dashpay/dash:src/net.cpp']);
+    expect(response.relatedReads).toEqual({ 'dashpay/dash': 3 });
+
+    // A call that fails still reports the reads it made, on its error.
+    setupSpawnMock({ exitCode: 1, stderr: 'Error: something broke' });
+    const failingSpawn = mockSpawn.getMockImplementation()!;
+    mockSpawn.mockImplementationOnce((...args: Parameters<typeof failingSpawn>) => {
+      const cliArgs = args[1] as string[];
+      const serverArgs = (JSON.parse(readFileSync(cliArgs[cliArgs.indexOf('--mcp-config') + 1], 'utf-8')) as { mcpServers: { manki: { args: string[] } } }).mcpServers.manki.args;
+      writeFileSync(serverArgs[serverArgs.indexOf('--reads-file') + 1], JSON.stringify({ 'dashpay/platform': 2 }));
+      return failingSpawn(...args);
+    });
+    const failure = await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15, related } }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ relatedReads: { 'dashpay/platform': 2 } });
+  });
+
+  it('fails when the CLI uses all its turns before it answers', async () => {
+    setupSpawnMock({ stdout: `${JSON.stringify({ type: 'result', subtype: 'error_max_turns', is_error: true, num_turns: 16 })}\n`, rawStdout: true, exitCode: 1 });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    await expect(client.sendMessage('sys', 'user', { repoTools: { root: '/work/repo', steps: 15 } })).rejects.toThrow('Claude CLI used all its turns before it answered');
+  });
+
+  it('sends the system prompt as the CLI system prompt and only the user message on stdin', async () => {
+    setupSpawnMock({ stdout: 'ok' });
+    const spawnProc = mockSpawn.getMockImplementation()!;
+    let systemPromptFile = '';
+    let stdinWrite: jest.Mock | undefined;
+    mockSpawn.mockImplementationOnce((...args: Parameters<typeof spawnProc>) => {
+      const promptArgs = args[1] as string[];
+      systemPromptFile = readFileSync(promptArgs[promptArgs.indexOf('--system-prompt-file') + 1], 'utf-8');
+      const proc = spawnProc(...args);
+      stdinWrite = (proc.stdin as unknown as { write: jest.Mock }).write;
+      return proc;
+    });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    await client.sendMessage('You give the final verdict.', 'the diff');
+
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(systemPromptFile).toBe('You give the final verdict.');
+    expect(existsSync(spawnArgs[spawnArgs.indexOf('--system-prompt-file') + 1])).toBe(false);
+    expect(stdinWrite!.mock.calls.map(c => String(c[0])).join('')).toBe('the diff');
   });
 
   it('extracts text from content_block_delta events', async () => {
@@ -375,6 +645,62 @@ describe('sendViaOAuth — error paths', () => {
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('final answer');
+  });
+
+  it('reports the newest reading of each limit window the CLI sent', async () => {
+    const limitEvent = (unifiedWindows: object) => JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows } });
+    const streamOutput = [
+      limitEvent({ five_hour: { utilization: 0.3, resetsAt: 1794000000 }, seven_day: { utilization: 0.81, resetsAt: 1794600000 } }),
+      limitEvent({ five_hour: { utilization: 0.37, resetsAt: 1794000000 } }),
+      JSON.stringify({ type: 'result', result: 'final answer' }),
+      '',
+    ].join('\n');
+    setupSpawnMock({ stdout: streamOutput, rawStdout: true });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.limits).toEqual([
+      { account: 'Claude subscription', window: '5-hour', usedPercent: 37, resetsAt: 1794000000 },
+      { account: 'Claude subscription', window: 'weekly', usedPercent: 81, resetsAt: 1794600000 },
+    ]);
+  });
+
+  it.each<[string | undefined, boolean]>([
+    ['max_tokens', true],
+    ['end_turn', false],
+    [undefined, false],
+  ])('reports truncated for result event stop_reason %s', async (stopReason, expected) => {
+    const streamOutput = [
+      JSON.stringify({ type: 'result', subtype: 'success', result: '[', stop_reason: stopReason }),
+      '',
+    ].join('\n');
+    setupSpawnMock({ stdout: streamOutput, rawStdout: true });
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.truncated).toBe(expected);
+  });
+
+  it('returns an empty truncated reply when the CLI run fails at the output limit', async () => {
+    const cliError = "API Error: Claude's response exceeded the 32768 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
+    const delta = (text: string) => JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } });
+    const lines = [
+      delta('x'.repeat(3000)),
+      delta('Let me walk through every file, token ghp_abcdefghijklmnop, then'),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: cliError, api_error: 'max_output_tokens', usage: { output_tokens: 32768 } }),
+    ];
+    setupSpawnMock({ exitCode: 1, stdout: `${lines.join('\n')}\n`, rawStdout: true });
+    const warnSpy = jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-5-5' });
+
+    const result = await client.sendMessage('sys', 'user');
+    expect(result).toMatchObject({ content: '', truncated: true, usage: { outputTokens: 32768 } });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('32768-token output limit'));
+    const tailWarning = warnSpy.mock.calls.map(c => String(c[0])).find(w => w.startsWith('Claude CLI reply ended with: '));
+    expect(tailWarning).toBeDefined();
+    expect(tailWarning!.endsWith('Let me walk through every file, token [REDACTED], then')).toBe(true);
+    expect(tailWarning!.length).toBeLessThanOrEqual('Claude CLI reply ended with: '.length + 2000);
+    warnSpy.mockRestore();
   });
 
   it('silently skips non-JSON lines (e.g. verbose debug output)', async () => {
@@ -490,7 +816,10 @@ describe('sendViaOAuth — error paths', () => {
     }
   });
 
-  it('rejects with plain 1200s timeout when stderr is empty', async () => {
+  it.each<[number | undefined, number]>([
+    [undefined, 1200],
+    [300_000, 300],
+  ])('rejects with plain timeout when stderr is empty (timeoutMs %s)', async (timeoutMs, limitSeconds) => {
     jest.useFakeTimers();
     try {
       const proc = {
@@ -515,20 +844,22 @@ describe('sendViaOAuth — error paths', () => {
       mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
       const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
-      const promise = client.sendMessage('sys', 'user');
+      const promise = client.sendMessage('sys', 'user', { timeoutMs });
 
       await jest.advanceTimersByTimeAsync(0);
 
-      // Keep stdout alive to prevent the stale checker from firing
-      for (let i = 0; i < 14; i++) {
+      // Keep stdout alive to prevent the stale checker from firing, stopping one step before the limit.
+      for (let i = 0; i < Math.ceil(limitSeconds / 80) - 1; i++) {
         await jest.advanceTimersByTimeAsync(80_000);
         stdoutCb!(Buffer.from(`keepalive-${i}`));
       }
+      expect(proc.kill).not.toHaveBeenCalled();
 
       await jest.advanceTimersByTimeAsync(80_000);
+      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
       closeCb!(null, 'SIGTERM');
 
-      await expect(promise).rejects.toThrow('Claude CLI timed out after 1200s');
+      await expect(promise).rejects.toThrow(`Claude CLI timed out after ${limitSeconds}s`);
     } finally {
       jest.useRealTimers();
     }
@@ -596,6 +927,36 @@ describe('sendViaOAuth — error paths', () => {
     closeCb!(null, 'SIGTERM');
 
     await expect(promise).rejects.toThrow('Claude CLI output exceeded 50MB limit');
+  });
+
+  it('kills the CLI and rejects with the reason when the caller\'s signal aborts, and spawns none once it has aborted', async () => {
+    const proc = {
+      stdin: { write: jest.fn().mockReturnValue(true), end: jest.fn(), on: jest.fn() },
+      stdout: { on: jest.fn() },
+      stderr: { on: jest.fn() },
+      on: jest.fn(),
+      kill: jest.fn(),
+    };
+    let closeCb: ((code: number | null, signal: string | null) => void) | undefined;
+    proc.on.mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+      if (event === 'close') closeCb = cb as typeof closeCb;
+    });
+    mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
+    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+    const controller = new AbortController();
+    const reason = new Error('head moved');
+
+    const promise = client.sendMessage('sys', 'user', { signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 0));
+    controller.abort(reason);
+
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    closeCb!(null, 'SIGTERM');
+    await expect(promise).rejects.toBe(reason);
+
+    mockSpawn.mockClear();
+    await expect(client.sendMessage('sys', 'user', { signal: controller.signal })).rejects.toBe(reason);
+    expect(mockSpawn).not.toHaveBeenCalled();
   });
 
   it('flushes remaining decoder bytes in close handler', async () => {
@@ -738,7 +1099,7 @@ describe('ensureCLI — install path', () => {
   beforeEach(() => {
     mockSpawn.mockReset();
     mockExecFileAsync.mockReset();
-    resetCLIInstallPromise();
+    mockInstallPinned.mockReset();
   });
 
   function setupSpawnForSuccess(stdout: string): void {
@@ -765,30 +1126,59 @@ describe('ensureCLI — install path', () => {
     mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
   }
 
-  it('installs CLI when which fails, then succeeds', async () => {
-    // First call: which claude fails; second call: npm install succeeds; third call: which claude succeeds
-    mockExecFileAsync
-      .mockRejectedValueOnce(new Error('not found'))
-      .mockResolvedValueOnce({ stdout: '' }) // npm install
-      .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude\n' }); // which after install
+  it('installs the pinned build of the Claude CLI when it is not on the path, and runs no other command', async () => {
+    mockExecFileAsync.mockRejectedValueOnce(new Error('not found'));
+    mockInstallPinned.mockResolvedValueOnce('/runner/temp/manki-pinned');
 
     setupSpawnForSuccess('installed ok');
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('installed ok');
+    const name = `claude-code-${process.platform}-${process.arch}`;
+    expect(mockInstallPinned).toHaveBeenCalledWith({
+      url: `https://registry.npmjs.org/@anthropic-ai/${name}/-/${name}-${CLAUDE_CLI_VERSION}.tgz`,
+      integrity: expect.stringMatching(/^sha512-[A-Za-z0-9+/]{86}==$/),
+    });
+    expect(mockExecFileAsync.mock.calls).toEqual([['which', ['claude']]]);
+    expect(mockSpawn.mock.calls[0][0]).toBe(join('/runner/temp/manki-pinned', 'package', process.platform === 'win32' ? 'claude.exe' : 'claude'));
+
+    // A musl system such as Alpine reports no glibc version and gets the musl build.
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    const report = jest.spyOn(process.report, 'getReport').mockReturnValue({ header: {} } as ReturnType<typeof process.report.getReport>);
+    try {
+      mockExecFileAsync.mockRejectedValueOnce(new Error('not found'));
+      mockInstallPinned.mockResolvedValueOnce('/runner/temp/manki-pinned');
+      await new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' }).sendMessage('sys', 'user');
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      report.mockRestore();
+    }
+    expect(mockInstallPinned.mock.calls[1][0].url).toBe(`https://registry.npmjs.org/@anthropic-ai/claude-code-linux-${process.arch}-musl/-/claude-code-linux-${process.arch}-musl-${CLAUDE_CLI_VERSION}.tgz`);
   });
 
-  it('throws when CLI install fails (which still fails after install)', async () => {
-    mockExecFileAsync
-      .mockRejectedValueOnce(new Error('not found'))
-      .mockResolvedValueOnce({ stdout: '' }) // npm install
-      .mockRejectedValueOnce(new Error('still not found')); // which after install
+  it('throws when the install fails or no build is pinned for the platform, and installs again on the next call', async () => {
+    mockExecFileAsync.mockRejectedValue(new Error('not found'));
+    mockInstallPinned.mockRejectedValueOnce(new Error('download does not match its pinned sha512 digest'));
+    setupSpawnForSuccess('installed later');
 
-    setupSpawnForSuccess('should not reach');
-    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
+    await expect(new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' }).sendMessage('sys', 'user'))
+      .rejects.toThrow('Failed to install Claude CLI: download does not match its pinned sha512 digest');
 
-    await expect(client.sendMessage('sys', 'user')).rejects.toThrow('Failed to install Claude CLI');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'aix' });
+    try {
+      await expect(new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' }).sendMessage('sys', 'user'))
+        .rejects.toThrow(`Failed to install Claude CLI: no pinned Claude CLI build for aix-${process.arch}`);
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+
+    mockInstallPinned.mockResolvedValueOnce('/runner/temp/manki-pinned');
+    const result = await new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' }).sendMessage('sys', 'retry');
+    expect(result.content).toBe('installed later');
+    expect(mockInstallPinned).toHaveBeenCalledTimes(2);
   });
 
   it('reuses cached CLI path on second call', async () => {
@@ -803,34 +1193,13 @@ describe('ensureCLI — install path', () => {
     expect(mockExecFileAsync).toHaveBeenCalledTimes(1);
     expect(mockSpawn).toHaveBeenCalledTimes(2);
   });
-
-  it('clears install promise on install failure so retry is possible', async () => {
-    // First attempt: which fails, npm install fails
-    mockExecFileAsync
-      .mockRejectedValueOnce(new Error('not found'))
-      .mockResolvedValueOnce({ stdout: '' }) // npm install
-      .mockRejectedValueOnce(new Error('still not found')); // which after install
-
-    setupSpawnForSuccess('should not reach');
-    const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
-
-    await expect(client.sendMessage('sys', 'first')).rejects.toThrow('Failed to install Claude CLI');
-
-    // Second attempt: which succeeds (cliInstallPromise was cleared)
-    mockExecFileAsync.mockResolvedValue({ stdout: '/usr/local/bin/claude\n' });
-
-    // Need a fresh client since cachedCLIPath is instance-level
-    const client2 = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
-    const result = await client2.sendMessage('sys', 'retry');
-    expect(result.content).toBe('should not reach');
-  });
 });
 
 describe('warmupCLI', () => {
   beforeEach(() => {
     mockSpawn.mockReset();
     mockExecFileAsync.mockReset();
-    resetCLIInstallPromise();
+    mockInstallPinned.mockReset();
   });
 
   it('invokes ensureCLI once for OAuth auth', async () => {
@@ -845,16 +1214,15 @@ describe('warmupCLI', () => {
     expect(mockExecFileAsync).toHaveBeenCalledWith('which', ['claude']);
   });
 
-  it('triggers npm install when CLI is missing', async () => {
-    mockExecFileAsync
-      .mockRejectedValueOnce(new Error('not found'))
-      .mockResolvedValueOnce({ stdout: '' })
-      .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude\n' });
+  it('installs the pinned build when the CLI is missing', async () => {
+    mockExecFileAsync.mockRejectedValueOnce(new Error('not found'));
+    mockInstallPinned.mockResolvedValueOnce('/runner/temp/manki-pinned');
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await client.warmupCLI();
 
-    expect(mockExecFileAsync).toHaveBeenNthCalledWith(2, 'npm', ['install', '-g', '@anthropic-ai/claude-code'], expect.any(Object));
+    expect(mockInstallPinned).toHaveBeenCalledTimes(1);
+    expect(mockExecFileAsync).toHaveBeenCalledTimes(1);
   });
 
   it('is a no-op for API-key auth', async () => {
@@ -866,10 +1234,8 @@ describe('warmupCLI', () => {
   });
 
   it('propagates ensureCLI errors when install fails', async () => {
-    mockExecFileAsync
-      .mockRejectedValueOnce(new Error('not found'))
-      .mockResolvedValueOnce({ stdout: '' })
-      .mockRejectedValueOnce(new Error('still not found'));
+    mockExecFileAsync.mockRejectedValueOnce(new Error('not found'));
+    mockInstallPinned.mockRejectedValueOnce(new Error('download failed with HTTP 503'));
     const client = new AnthropicClient({ auth: { kind: 'oauth', token: 'token' }, model: 'claude-opus-4-6' });
 
     await expect(client.warmupCLI()).rejects.toThrow('Failed to install Claude CLI');
@@ -881,7 +1247,6 @@ describe('sendViaOAuth — stale process detection', () => {
     jest.resetAllMocks();
     mockExecFileAsync.mockResolvedValue({ stdout: '/usr/bin/claude' });
     _execMock.fn = mockExecFileAsync;
-    resetCLIInstallPromise();
   });
 
   it('kills process when no stdout for 90s', async () => {
@@ -1324,28 +1689,52 @@ describe('buildAnthropicAuth', () => {
   });
 });
 
+describe('readClaudeLimits', () => {
+  it('names every unified window and reads its utilization as a percentage', () => {
+    expect(readClaudeLimits({
+      rateLimitType: 'seven_day',
+      unifiedWindows: { seven_day_opus: { utilization: 0.046 }, overage_extra: { utilization: 1, resetsAt: 5 } },
+    })).toEqual([
+      { account: 'Claude subscription', window: 'weekly Opus', usedPercent: 5 },
+      { account: 'Claude subscription', window: 'overage extra', usedPercent: 100, resetsAt: 5 },
+    ]);
+  });
+
+  it('reads the top-level window without unified windows, and only with a utilization', () => {
+    expect(readClaudeLimits({ rateLimitType: 'five_hour', utilization: 0.72, resetsAt: 9 })).toEqual([{ account: 'Claude subscription', window: '5-hour', usedPercent: 72, resetsAt: 9 }]);
+    expect(readClaudeLimits({ rateLimitType: 'five_hour', status: 'allowed' })).toEqual([]);
+  });
+
+  it('skips malformed info and windows', () => {
+    expect(readClaudeLimits(null)).toEqual([]);
+    expect(readClaudeLimits('allowed')).toEqual([]);
+    expect(readClaudeLimits({ unifiedWindows: { five_hour: null, seven_day: { utilization: '0.5' }, seven_day_sonnet: { utilization: Number.NaN } } })).toEqual([]);
+  });
+});
+
 describe('extractAnthropicCLIUsage', () => {
-  it('lifts standard usage fields from a result event', () => {
+  it('lifts standard usage fields from a result event, counting cache writes and reads as input', () => {
     expect(
       extractAnthropicCLIUsage({
         type: 'result',
         usage: {
-          input_tokens: 1234,
+          input_tokens: 3,
           output_tokens: 56,
+          cache_creation_input_tokens: 1200,
           cache_read_input_tokens: 999,
         },
       }),
-    ).toEqual({ inputTokens: 1234, outputTokens: 56, cachedTokens: 999, reasoningTokens: 0 });
+    ).toEqual({ inputTokens: 2202, outputTokens: 56, cacheReadTokens: 999, cacheWriteTokens: 1200, reasoningTokens: 0 });
   });
 
   it('coerces string-valued counters to integers', () => {
     expect(
       extractAnthropicCLIUsage({ usage: { input_tokens: '7', output_tokens: '13' } }),
-    ).toEqual({ inputTokens: 7, outputTokens: 13, cachedTokens: 0, reasoningTokens: 0 });
+    ).toEqual({ inputTokens: 7, outputTokens: 13, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 });
   });
 
   it('returns ZERO_USAGE when the event is missing or malformed', () => {
-    const zero = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 };
+    const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
     expect(extractAnthropicCLIUsage(null)).toEqual(zero);
     expect(extractAnthropicCLIUsage({})).toEqual(zero);
     expect(extractAnthropicCLIUsage({ usage: null })).toEqual(zero);
@@ -1354,31 +1743,77 @@ describe('extractAnthropicCLIUsage', () => {
 });
 
 describe('AnthropicClient API-path usage', () => {
-  let mockCreate: jest.Mock;
+  let mockFinalMessage: jest.Mock;
 
   beforeEach(() => {
-    mockCreate = jest.fn();
+    mockFinalMessage = jest.fn();
     (Anthropic as unknown as jest.Mock).mockImplementation(() => ({
-      messages: { create: mockCreate },
+      messages: { stream: () => ({ finalMessage: mockFinalMessage, on: jest.fn() }) },
     }));
   });
 
   it('lifts usage and measures latency on the SDK path', async () => {
-    mockCreate.mockResolvedValue({
+    mockFinalMessage.mockResolvedValue({
       content: [{ type: 'text', text: 'response' }],
       usage: { input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 10 },
     });
     const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
     const result = await client.sendMessage('sys', 'user');
-    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 25, cachedTokens: 10, reasoningTokens: 0 });
+    expect(result.usage).toEqual({ inputTokens: 110, outputTokens: 25, cacheReadTokens: 10, cacheWriteTokens: 0, reasoningTokens: 0 });
     expect(typeof result.latencyMs).toBe('number');
     expect(result.latencyMs).toBeGreaterThanOrEqual(0);
   });
 
-  it('returns zero usage when the SDK omits the usage block', async () => {
-    mockCreate.mockResolvedValue({ content: [{ type: 'text', text: 'response' }] });
+  it.each<[string | undefined, boolean]>([
+    ['max_tokens', true],
+    ['end_turn', false],
+    [undefined, false],
+  ])('reports truncated for stop_reason %s', async (stopReason, expected) => {
+    mockFinalMessage.mockResolvedValue({ content: [{ type: 'text', text: '[' }], stop_reason: stopReason });
     const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
     const result = await client.sendMessage('sys', 'user');
-    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 });
+    expect(result.truncated).toBe(expected);
+  });
+
+  it('throws a `RefusalError` on `stop_reason: "refusal"`', async () => {
+    mockFinalMessage.mockResolvedValue({
+      content: [],
+      stop_reason: 'refusal',
+      stop_details: { type: 'refusal', category: 'cyber', explanation: 'This request was declined because it could enable cyber harm.' },
+    });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-5-5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(RefusalError);
+    expect((error as RefusalError).reason).toBe('refusal (cyber)');
+    expect(error?.message).toBe('Claude API declined the request: refusal (cyber). This request was declined because it could enable cyber harm.');
+  });
+
+  it.each<[string, object, object]>([
+    ['a 429', { status: 429, type: 'rate_limit_error' }, { limit: 'Anthropic API rate limit reached', credential: 'key' }],
+    ['a streamed `rate_limit_error`', { status: undefined, type: 'rate_limit_error' }, { limit: 'Anthropic API rate limit reached', credential: 'key' }],
+    ['an overload', { status: 529, type: 'overloaded_error' }, { limit: 'Anthropic API is overloaded', credential: undefined }],
+  ])('throws a `QuotaError` on %s', async (_case, fields, expected) => {
+    mockFinalMessage.mockRejectedValue(Object.assign(new Error('429 limited'), fields));
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-5-5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(QuotaError);
+    expect(error).toMatchObject(expected);
+  });
+
+  it('passes any other SDK error through unchanged', async () => {
+    const failure = Object.assign(new Error('bad request'), { status: 400, type: 'invalid_request_error' });
+    mockFinalMessage.mockRejectedValue(failure);
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-5-5' });
+
+    await expect(client.sendMessage('sys', 'user')).rejects.toBe(failure);
+  });
+
+  it('returns zero usage when the SDK omits the usage block', async () => {
+    mockFinalMessage.mockResolvedValue({ content: [{ type: 'text', text: 'response' }] });
+    const client = new AnthropicClient({ auth: { kind: 'apiKey', key: 'sk-key' }, model: 'claude-opus-4-6' });
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 });
   });
 });

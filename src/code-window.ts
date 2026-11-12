@@ -29,3 +29,65 @@ export function extractCurrentCodeWindow(
   }
   return out.join('\n');
 }
+
+// A line shorter than this, such as `}`, recurs too often to anchor anything on its own.
+const MIN_LOCATABLE_CHARS = 4;
+// How many lines of the posted window must line up at one place in the head before the code counts as found there.
+const MIN_MATCHING_LINES = 3;
+
+/**
+ * Returns where line `line` of `posted` sits in `current`: the place where the most lines of the posted window around
+ * it line up again, the one nearest `line` when several tie, or `undefined` when fewer than `MIN_MATCHING_LINES` do.
+ * One generic line, such as `return result;`, never places the code on its own.
+ */
+export function locatePostedLine(posted: string, line: number, current: string): number | undefined {
+  const old = posted.split('\n');
+  const now = current.split('\n');
+  // Indexed in one pass, and only lines long enough to vote, so a file of repeated short lines stays linear.
+  const at = new Map<string, number[]>();
+  now.forEach((l, i) => {
+    const text = l.trim();
+    if (text.length < MIN_LOCATABLE_CHARS) return;
+    const lines = at.get(text);
+    if (lines) lines.push(i + 1);
+    else at.set(text, [i + 1]);
+  });
+  const votes = new Map<number, number>();
+  for (let d = -OPEN_THREAD_CODE_WINDOW; d <= OPEN_THREAD_CODE_WINDOW; d++) {
+    const text = old[line - 1 + d]?.trim() ?? '';
+    if (text.length < MIN_LOCATABLE_CHARS) continue;
+    for (const i of at.get(text) ?? []) votes.set(i - d, (votes.get(i - d) ?? 0) + 1);
+  }
+  let best: number | undefined;
+  for (const [anchor, n] of votes) {
+    if (n < MIN_MATCHING_LINES || anchor < 1 || anchor > now.length) continue;
+    const bestVotes = best === undefined ? 0 : votes.get(best)!;
+    if (n > bestVotes || (n === bestVotes && Math.abs(anchor - line) < Math.abs(best! - line))) best = anchor;
+  }
+  return best;
+}
+
+/** Whether the code around line `line` of `posted` differs from the code around line `now` of `current`. Indentation does not count. */
+function postedCodeChanged(posted: string, line: number, current: string, now: number): boolean {
+  const old = posted.split('\n');
+  const cur = current.split('\n');
+  for (let d = -OPEN_THREAD_CODE_WINDOW; d <= OPEN_THREAD_CODE_WINDOW; d++) {
+    const was = old[line - 1 + d];
+    if (was !== undefined && was.trim() !== (cur[now - 1 + d] ?? '').trim()) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns the one file of `files`, each a path with its content, that holds the whole posted window around line `line`
+ * of `posted` unchanged, and the line there. Returns `undefined` when no file does or several do, since the code's
+ * place is then not certain.
+ */
+export function locatePostedFile(posted: string, line: number, files: Iterable<readonly [string, string]>): { file: string; line: number } | undefined {
+  const held: { file: string; line: number }[] = [];
+  for (const [file, content] of files) {
+    const at = locatePostedLine(posted, line, content);
+    if (at !== undefined && !postedCodeChanged(posted, line, content, at)) held.push({ file, line: at });
+  }
+  return held.length === 1 ? held[0] : undefined;
+}

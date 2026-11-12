@@ -30,24 +30,30 @@ The `all` script runs all four in one command:
 npm run all
 ```
 
-## Building `dist/` before opening a PR
+## `dist/` is built at release time
 
-Manki follows the canonical TypeScript-Action release model: the compiled bundle in `dist/` is committed to `main` so consumers can pin to `manki-review/manki@v5` or `manki-review/manki@v5.x.y` and have a runnable action without any extra setup on their side.
+`main` holds source only. `dist/` is in `.gitignore`, so never commit it. For a release, the `Release` workflow builds `dist/` and commits it on top of the release commit on a `release/vX.Y.Z` branch. After an approval, the `Publish release` workflow points the `vX.Y.Z` tag and the floating `vX` tag at that build commit, see [`RELEASE.md`](RELEASE.md). Consumers pinned to `manki-review/manki@v7` or an exact `@v7.x.y` get a tree that contains `dist/`. Pinning to `@main` or a commit SHA on `main` is not supported.
 
-Any change under `src/` (or anything that affects the bundle output, including dependency bumps) requires a fresh `dist/`:
+Locally, `npm run build` writes `dist/` for testing. The repo's own `Manki dispatch` workflow builds it before running the action from the checkout.
+
+## Changing the blocker rubric
+
+A change to how the judge grades blockers can shift grades on real PRs in ways no unit test shows. Calibrate it per repository against a labelled set of real findings:
 
 ```sh
-npm run build
-git add dist/
-git commit
+npm run review-history -- <owner/repo> > history.jsonl
+npm run calibration -- history.jsonl --fix-rate fix-rate.jsonl --export set.jsonl > report.md
 ```
 
-The `.github/workflows/check-dist.yml` workflow is the backstop. It runs on every PR and on `push` to `main`, rebuilds `dist/`, and fails if the committed copy differs from the freshly built one. If you forget the rebuild, this check will tell you and upload the expected `dist/` as a workflow artifact for easy recovery.
+The report gives the blocker precision per repository (real blockers divided by blockers raised), the labels by severity and where they came from, and the findings graded below blocker that were fixed, which are candidate missed blockers. `--fix-rate` takes the repository's `metrics/fix-rate.jsonl` from the memory repo and is optional. `--export` writes up to 60 labelled findings (`--limit`) for a judge replay. The format and the first set are in [`src/judge.fixtures/calibration`](src/judge.fixtures/calibration).
 
-`dist/` is marked `linguist-generated=true` in `.gitattributes`, so GitHub collapses its diff in the PR Files view by default. Reviewers can expand it on demand. The minified `dist/index.js` is additionally marked `-diff` to skip the textual diff entirely.
+The rule for a rubric change:
+
+- Change the rubric only after 3 real cases that the change fixes.
+- Replay the judge over the repository's labelled set 3 times with the old and the new rubric, and compare blocker precision and the findings that changed grade. The target is a blocker precision of at least 80%.
 
 ## Commit and PR conventions
 
 - Commit messages and PR titles use [Conventional Commits](https://www.conventionalcommits.org/) (`feat`, `fix`, `refactor`, `build`, `ci`, `chore`, `docs`, `test`). PR titles are enforced by CI.
-- Add a CHANGELOG entry under `## [Unreleased]` for any user-visible change.
+- Do not edit `CHANGELOG.md` in a PR. CI fails any PR that does unless it bumps the `package.json` version, which only release PRs do. Give the PR a clear title and say in its body what changes for users. The release PR writes the changelog from the merged PRs.
 - Open the PR against `main`. CI must be green before merge.

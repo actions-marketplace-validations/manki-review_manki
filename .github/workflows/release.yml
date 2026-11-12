@@ -1,47 +1,99 @@
 name: Release
 
+# Builds `dist/` for a release and pushes it to the release branch. It never writes tags:
+# the `Publish release` workflow tags and publishes the build commit after an approval.
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - 'release/v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Check out the branch as it stands now, not the pushed commit, so a rerun after the
+      # build commit was pushed sees `dist/` and skips the rebuild.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          # `npm ci` runs dependency scripts, so only the push step gets the token.
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#release/v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Branch $GITHUB_REF_NAME is not release/vX.Y.Z"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the branch already has built dist/
+        id: check
+        run: |
+          if git ls-tree -r HEAD --name-only | grep -q '^dist/'; then
+            echo "has_dist=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dist=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.check.outputs.has_dist == 'false'
         with:
           node-version: '24'
           cache: 'npm'
 
-      - run: npm ci
-      - run: npm run build
-
-      - name: Update floating major tag
+      - name: Check the release commit
+        if: steps.check.outputs.has_dist == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          MAJOR=$(echo "$TAG" | grep -oE '^v[0-9]+')
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$GITHUB_REF_NAME must point at a commit on main"
+            exit 1
+          fi
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error file=package.json::package.json version $PKG_VERSION does not match $GITHUB_REF_NAME"
+            exit 1
+          fi
+          node scripts/check-changelog-version.js
+          PREV_VERSION=$(git show HEAD^:package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+          if [ "$PREV_VERSION" = "$VERSION" ]; then
+            echo "::error::$GITHUB_REF_NAME must point at the commit that bumps the version to $VERSION"
+            exit 1
+          fi
 
+      - if: steps.check.outputs.has_dist == 'false'
+        run: npm ci
+
+      - if: steps.check.outputs.has_dist == 'false'
+        run: npm run build
+
+      - name: Commit dist/ and push it to the release branch
+        if: steps.check.outputs.has_dist == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git tag -fa "$MAJOR" -m "Update $MAJOR tag to $TAG"
-          git push origin "$MAJOR" --force
-
-      - name: Create GitHub Release
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          if gh release view "$TAG" &>/dev/null; then
-            echo "Release $TAG already exists — updating"
-            gh release edit "$TAG" --title "$TAG" --latest
-          else
-            echo "Creating release $TAG"
-            gh release create "$TAG" --generate-notes
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
+          git add -f dist/
+          git commit -m "release: build artifacts for $TAG"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$GITHUB_REF_NAME"

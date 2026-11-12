@@ -1,54 +1,77 @@
 name: Manki
+run-name: 'Manki ${{ inputs.event }}.${{ inputs.action }} on #${{ inputs.pr }} (${{ inputs.delivery_id }})'
 
+# The Manki service starts this workflow for each event Manki handles.
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review]
-  pull_request_review:
-    types: [submitted, dismissed]
-  issue_comment:
-    types: [created, edited]
-  pull_request_review_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      event: { type: string, required: true }
+      action: { type: string, required: true }
+      pr: { type: string, required: true }
+      head_sha: { type: string, required: false }
+      comment_id: { type: string, required: false }
+      review_id: { type: string, required: false }
+      delivery_id: { type: string, required: false }
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
   id-token: write
-  # Required for cancelActiveReviewRun to cancel superseded review runs
-  actions: write
+  actions: read
 
 jobs:
   review:
-    # Bot login defined in src/github.ts as BOT_LOGIN — keep in sync
-    if: github.actor != 'manki-review[bot]'
-    concurrency:
-      group: manki-${{ (github.event_name == 'issue_comment' && github.event.comment.id) || format('pr-{0}', github.event.pull_request.number || github.event.issue.number) }}
-      cancel-in-progress: false
+    timeout-minutes: 30
+    # A dispatched run counts as the default branch, so a cache it saved would reach every branch.
+    cache-mode: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Manki reviews its own PRs with their own build of the action.
+      # Only a head in this repository is built. A fork's head, or an issue, gets the default branch.
+      # That build runs the head's code with every secret of this job and `id-token: write`, so it is
+      # safe only while everyone who can push a branch here is trusted.
+      - name: Find the commit to build
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          sha="$GITHUB_SHA"
+          if [[ "$PR" =~ ^[1-9][0-9]{0,15}$ ]]; then
+            if pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" 2>"$RUNNER_TEMP/pr-error"); then
+              if [ "$(jq -r '.head.repo.full_name' <<<"$pr")" = "$GITHUB_REPOSITORY" ]; then
+                sha=$(jq -r '.head.sha' <<<"$pr")
+              fi
+            elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/pr-error"; then
+              cat "$RUNNER_TEMP/pr-error" >&2
+              exit 1
+            fi
+          fi
+          echo "Building $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.head.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
       - run: npm run build
-      - name: Install Claude Code CLI
-        if: env.CLAUDE_CODE_OAUTH_TOKEN != ''
-        run: npm install -g @anthropic-ai/claude-code
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       - name: Install Codex CLI
         if: env.OPENAI_OAUTH_TOKEN != ''
         # Pin and `--ignore-scripts` mirror the runtime fallback in `src/providers/openai.ts`.
         # If you update `CODEX_CLI_VERSION` in `src/providers/openai.ts`, update the version here too.
-        run: npm install -g --ignore-scripts '@openai/codex@0.129.0'
+        run: npm install -g --ignore-scripts '@openai/codex@0.166.0'
         env:
           OPENAI_OAUTH_TOKEN: ${{ secrets.OPENAI_OAUTH_TOKEN }}
       - name: Install Gemini CLI
         if: env.GEMINI_OAUTH_TOKEN != ''
-        run: npm install -g @google/gemini-cli
+        # Pin and `--ignore-scripts` mirror the runtime fallback in `src/providers/gemini.ts`.
+        # If you update `GEMINI_CLI_VERSION` in `src/providers/gemini.ts`, update the version here too.
+        run: npm install -g --ignore-scripts '@google/gemini-cli@0.66.0'
         env:
           GEMINI_OAUTH_TOKEN: ${{ secrets.GEMINI_OAUTH_TOKEN }}
       - name: Manki Review
@@ -60,4 +83,3 @@ jobs:
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           gemini_oauth_token: ${{ secrets.GEMINI_OAUTH_TOKEN }}
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          memory_repo_token: ${{ secrets.REVIEW_MEMORY_TOKEN }}

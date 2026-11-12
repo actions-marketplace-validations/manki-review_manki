@@ -1,125 +1,277 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { createAppAuth } from '@octokit/auth-app';
-import { BOT_LOGIN } from './github';
+import { retry } from '@octokit/plugin-retry';
+import { throttling } from '@octokit/plugin-throttling';
+import { offerQueuedCheck, QueuedCheck } from './check-run';
+import { BOT_LOGIN, BotIdentity } from './github';
+import type { PrState, RunMode, StateReport, TokenServiceCall } from './types';
+import { redactSecretsDeep, registerSecret } from './utils';
 
 type Octokit = ReturnType<typeof github.getOctokit>;
 
+const RATE_LIMIT_RETRIES = 2;
+
+function onRateLimit(retryAfter: number, options: { method: string; url: string; request?: { signal?: AbortSignal } }, _octokit: unknown, retryCount: number): boolean {
+  // A request with a deadline of its own fails at once, since a wait would outlast that deadline and keep the run open.
+  if (options.request?.signal) {
+    core.warning(`GitHub rate limit on ${options.method} ${options.url}, not waiting for a request with its own deadline`);
+    return false;
+  }
+  if (retryCount >= RATE_LIMIT_RETRIES) {
+    core.warning(`GitHub rate limit on ${options.method} ${options.url}, giving up after ${RATE_LIMIT_RETRIES} retries`);
+    return false;
+  }
+  core.warning(`GitHub rate limit on ${options.method} ${options.url}, retrying in ${retryAfter}s`);
+  return true;
+}
+
+// Request options that route a request rather than carry its text.
+const ROUTING_OPTIONS = new Set(['method', 'url', 'baseUrl', 'headers', 'request', 'mediaType']);
+
+/** Octokit plugin that removes Manki's own secret values from every request, so nothing Manki posts can carry one. */
+function redactRequests(octokit: Pick<Octokit, 'hook'>): void {
+  octokit.hook.before('request', (options) => {
+    for (const key of Object.keys(options)) {
+      if (!ROUTING_OPTIONS.has(key)) options[key] = redactSecretsDeep(options[key]);
+    }
+  });
+}
+
+/** Octokit that retries 5xx responses, waits out primary and secondary rate limits and redacts Manki's secret values. */
+function createOctokit(token: string): Octokit {
+  return github.getOctokit(token, { throttle: { onRateLimit, onSecondaryRateLimit: onRateLimit } }, retry, throttling, redactRequests);
+}
+
 export interface AuthResult {
   octokit: Octokit;
-  resolvedToken: string;
-  identity: 'app' | 'actions';
+  bot: BotIdentity;
 }
 
 export interface TokenResult {
   token: string;
-  identity: 'app' | 'actions';
+  /** The queued `Manki` check the service created for this run's review, when it created one. */
+  queuedCheck?: QueuedCheck;
+}
+
+/** The token service gave no token, so the run cannot post as Manki. */
+export class TokenServiceError extends Error {
+  constructor(reason: string) {
+    super(`Could not get a token from the Manki token service (${reason}). Retry the run.`);
+    this.name = 'TokenServiceError';
+  }
+}
+
+const TOKEN_RETRY_DELAY_MS = 2000;
+
+const OIDC_AUDIENCE = 'manki-api.dustinface.me';
+
+interface TokenServiceResponse {
+  ok: boolean;
+  status: number;
+  data?: unknown;
+}
+
+/** The token service's `/token` URL. Its other endpoints sit next to it. */
+function tokenServiceUrl(): string {
+  return core.getInput('manki_token_url') || 'https://manki-api.dustinface.me/token';
+}
+
+const MAX_CALL_ERROR_CHARS = 200;
+
+/** Every call this run made to the token service, in order, for the round and reply records. */
+const serviceCalls: TokenServiceCall[] = [];
+
+/** Returns the token service calls this run has made so far. */
+export function tokenServiceCalls(): TokenServiceCall[] {
+  return [...serviceCalls];
+}
+
+/** Reads the service's `{ error, request_id }` from a refused call, which names the Worker's log line. */
+async function refusalOf(response: Response): Promise<Pick<TokenServiceCall, 'error' | 'requestId'>> {
+  const body = await response.json().catch(() => null) as { error?: unknown; request_id?: unknown } | null;
+  return {
+    ...(typeof body?.error === 'string' && { error: body.error.slice(0, MAX_CALL_ERROR_CHARS) }),
+    ...(typeof body?.request_id === 'string' && { requestId: body.request_id.slice(0, MAX_CALL_ERROR_CHARS) }),
+  };
 }
 
 /**
- * Auto-detect manki-review GitHub App installation and fetch an app token
- * from the token service. Falls back to the provided github_token on any failure.
+ * Posts `body` to the token service at `url` with the workflow's OIDC token, and reads the JSON reply of a 2xx response.
+ * The timeout covers the reply too. Returns `null` when the run has no OIDC token. Each call is logged under `endpoint`
+ * in `tokenServiceCalls`.
  */
-export async function resolveGitHubToken(
-  githubToken: string,
-  tokenUrl: string,
-  owner: string,
-  repo: string,
-): Promise<TokenResult> {
+async function postToTokenService(url: string, body: unknown, endpoint: string): Promise<TokenServiceResponse | null> {
+  const start = Date.now();
+  const logCall = (outcome: Omit<TokenServiceCall, 'endpoint' | 'durationMs'>) => serviceCalls.push({ endpoint, ...outcome, durationMs: Date.now() - start });
+  let oidcToken: string;
   try {
-    // Request OIDC token from GitHub Actions
-    let oidcToken: string;
-    try {
-      oidcToken = await core.getIDToken('manki-api.dustinface.me');
-    } catch {
-      core.info('OIDC token not available — using github-actions[bot] identity');
-      return { token: githubToken, identity: 'actions' };
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
-    const tokenResponse = await fetch(tokenUrl, {
+    oidcToken = await core.getIDToken(OIDC_AUDIENCE);
+  } catch {
+    logCall({ error: 'no OIDC token' });
+    return null;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${oidcToken}`,
-      },
-      body: JSON.stringify({ owner, repo }),
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${oidcToken}` },
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
-    clearTimeout(timeout);
-
-    if (!tokenResponse.ok) {
-      core.info(`Manki app not available for ${owner}/${repo} — using github-actions[bot] identity`);
-      return { token: githubToken, identity: 'actions' };
+    if (!response.ok) {
+      logCall({ status: response.status, ...await refusalOf(response) });
+      return { ok: false, status: response.status };
     }
-
-    const tokenData = await tokenResponse.json() as { token: string; expires_at: string };
-
-    if (!tokenData.token || typeof tokenData.token !== 'string') {
-      core.warning('Token service returned invalid response — falling back to github-actions[bot]');
-      return { token: githubToken, identity: 'actions' };
-    }
-
-    core.info(`Using ${BOT_LOGIN} identity (token expires ${tokenData.expires_at})`);
-    core.setSecret(tokenData.token);
-    return { token: tokenData.token, identity: 'app' };
+    const data: unknown = await response.json();
+    logCall({ status: response.status });
+    return { ok: true, status: response.status, data };
   } catch (error) {
-    core.info(`App token resolution failed: ${error} — using github-actions[bot] identity`);
-    return { token: githubToken, identity: 'actions' };
+    logCall({ error: String(error).slice(0, MAX_CALL_ERROR_CHARS) });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Posts `body` to the token service endpoint `path`, such as `state`, as `postToTokenService` does. */
+export function callTokenService(path: string, body: unknown): Promise<TokenServiceResponse | null> {
+  return postToTokenService(new URL(path, tokenServiceUrl()).href, body, path);
+}
+
+/**
+ * Fetches the manki-review App's token for the repo from the token service. A timeout, network error or 5xx is tried
+ * once more after a short wait. Throws `TokenServiceError` when no token comes back.
+ */
+export async function resolveGitHubToken(tokenUrl: string, owner: string, repo: string): Promise<TokenResult> {
+  let response: Awaited<ReturnType<typeof postToTokenService>> | undefined;
+  for (let attempt = 1; !response; attempt++) {
+    let failure: string;
+    try {
+      // `takes_over_check` tells the service that this run takes over the queued check the reply names.
+      const reply = await postToTokenService(tokenUrl, { owner, repo, takes_over_check: true }, 'token');
+      if (!reply) throw new TokenServiceError('no OIDC token, so the workflow needs `id-token: write`');
+      if (reply.ok || reply.status < 500) {
+        response = reply;
+        break;
+      }
+      failure = `HTTP ${reply.status}`;
+    } catch (error) {
+      if (error instanceof TokenServiceError) throw error;
+      failure = String(error);
+    }
+    if (attempt === 2) throw new TokenServiceError(failure);
+    core.info(`The token service failed (${failure}), trying again`);
+    await new Promise((resolve) => setTimeout(resolve, TOKEN_RETRY_DELAY_MS));
+  }
+  if (!response.ok) throw new TokenServiceError(`HTTP ${response.status}`);
+  const tokenData = response.data as { token?: unknown; expires_at?: unknown; check_run?: { id?: unknown; head_sha?: unknown } | null } | null;
+  if (!tokenData || !tokenData.token || typeof tokenData.token !== 'string') throw new TokenServiceError('a reply without a token');
+
+  core.info(`Using ${BOT_LOGIN} identity (token expires ${tokenData.expires_at})`);
+  registerSecret(tokenData.token);
+  const { id, head_sha: headSha } = tokenData.check_run ?? {};
+  const queued = typeof id === 'number' && Number.isSafeInteger(id) && id > 0 && typeof headSha === 'string';
+  return { token: tokenData.token, ...(queued && { queuedCheck: { id, headSha } }) };
+}
+
+const RUN_MODES: ReadonlySet<string> = new Set<RunMode>(['again', 'deeper', 'draft']);
+
+function modesOf(items: unknown, keep: (item: Record<string, unknown>) => boolean): Set<RunMode> {
+  const modes = new Set<RunMode>();
+  if (!Array.isArray(items)) return modes;
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || !keep(item) || !Array.isArray(item.modes)) continue;
+    for (const mode of item.modes) if (typeof mode === 'string' && RUN_MODES.has(mode)) modes.add(mode as RunMode);
+  }
+  return modes;
+}
+
+/**
+ * Reads the coordinator's state of PR `prNumber` from the token service, with the modes of run `runId`.
+ * Returns `null` with a warning when the run has no OIDC token or the service gives no state.
+ */
+export async function fetchPrState(owner: string, repo: string, prNumber: number, runId: number): Promise<PrState | null> {
+  try {
+    const response = await callTokenService('state', { owner, repo, pr: prNumber });
+    if (!response?.ok) {
+      core.warning(`The token service gave no PR state for #${prNumber} (${response ? response.status : 'no OIDC token'}), reviewing as not paused`);
+      return null;
+    }
+    const data = response.data as Record<string, unknown> | null;
+    const settings = data?.settings as Record<string, unknown> | undefined;
+    const reviewed = (data?.last_reviewed as Record<string, unknown> | null | undefined)?.commit;
+    return {
+      settings: { paused: settings?.paused === true },
+      ...(typeof reviewed === 'string' && /^[0-9a-f]+$/.test(reviewed) && { lastReviewed: reviewed }),
+      runModes: modesOf(data?.active, item => item.run_id === runId),
+      queuedModes: modesOf(data?.queue, () => true),
+    };
+  } catch (error) {
+    core.warning(`Could not read the PR state from the token service, reviewing as not paused: ${error}`);
+    return null;
+  }
+}
+
+/** The clients holding the token service's review token, which cannot resolve review threads itself. */
+const serviceClients = new WeakSet<Octokit>();
+
+/**
+ * Resolves or reopens review thread `threadId` through the token service's `/resolve` when `octokit` holds the token
+ * service's review token, since resolving needs `contents: write`, which only the service's one-call token holds.
+ * Returns false for any other client, which changes the thread itself. Throws when the service does not change it.
+ */
+export async function changeThreadThroughService(octokit: Octokit, threadId: string, resolved: boolean, reason?: string): Promise<boolean> {
+  if (!serviceClients.has(octokit)) return false;
+  const { owner, repo } = github.context.repo;
+  const body = { owner, repo, thread_id: threadId, resolved, ...(reason !== undefined && { reason }) };
+  const response = await callTokenService('resolve', body);
+  if (!response?.ok) {
+    throw new Error(`The token service did not ${resolved ? 'resolve' : 'reopen'} the thread (${response ? response.status : 'no OIDC token'})`);
+  }
+  return true;
+}
+
+/** Sends what this run posted on PR `prNumber` to the PR coordinator. A failure only warns, since the review on GitHub stands. */
+export async function reportPrState(owner: string, repo: string, prNumber: number, report: StateReport): Promise<void> {
+  try {
+    const response = await callTokenService('state/report', { owner, repo, pr: prNumber, ...report });
+    if (!response?.ok) {
+      core.warning(`The token service did not take the PR state of #${prNumber} (${response ? response.status : 'no OIDC token'})`);
+    }
+  } catch (error) {
+    core.warning(`Could not report the PR state to the token service: ${error}`);
   }
 }
 
 /**
- * Create an authenticated Octokit client.
- * Priority: explicit App credentials > auto-detect manki-review app > github_token.
+ * Create the client Manki reads and posts with: the custom App's when `github_app_id` and `github_app_private_key` are
+ * set, else the manki-review App's from the token service. Throws `TokenServiceError` when the token service fails.
  */
 export async function createAuthenticatedOctokit(): Promise<AuthResult> {
   const appId = core.getInput('github_app_id');
   const privateKey = core.getInput('github_app_private_key');
-  const githubToken = core.getInput('github_token');
 
   if (appId && privateKey) {
     core.info('Using GitHub App authentication for custom bot identity');
-    const token = await getInstallationToken(appId, privateKey);
-    return { octokit: github.getOctokit(token), resolvedToken: token, identity: 'app' };
+    const { token, slug } = await getInstallationToken(appId, privateKey);
+    return { octokit: createOctokit(token), bot: { logins: [`${slug}[bot]`] } };
   }
 
-  if (!githubToken) {
-    throw new Error('No authentication configured. Provide either github_token or both github_app_id and github_app_private_key.');
-  }
-
-  const tokenUrl = core.getInput('manki_token_url') || 'https://manki-api.dustinface.me/token';
   const { owner, repo: repoName } = github.context.repo;
-  const { token, identity } = await resolveGitHubToken(githubToken, tokenUrl, owner, repoName);
+  const { token, queuedCheck } = await resolveGitHubToken(tokenServiceUrl(), owner, repoName);
 
-  return { octokit: github.getOctokit(token), resolvedToken: token, identity };
-}
-
-/**
- * Returns a token suitable for memory repo operations.
- * Prefers memory_repo_token, falls back to github_token, returns null if neither is set.
- */
-export function getMemoryToken(resolvedToken: string | null): string | null {
-  // Explicit memory_repo_token takes priority
-  const memoryToken = core.getInput('memory_repo_token');
-  if (memoryToken) return memoryToken;
-
-  // Use the resolved app token (cross-repo access if app is installed on memory repo)
-  if (resolvedToken) return resolvedToken;
-
-  // Fall back to raw github_token
-  const githubToken = core.getInput('github_token');
-  if (githubToken) return githubToken;
-
-  return null;
+  const octokit = createOctokit(token);
+  serviceClients.add(octokit);
+  if (queuedCheck) offerQueuedCheck(octokit, queuedCheck);
+  return { octokit, bot: { logins: [BOT_LOGIN] } };
 }
 
 async function getInstallationToken(
   appId: string,
   privateKey: string,
-): Promise<string> {
+): Promise<{ token: string; slug: string }> {
   const appIdNum = parseInt(appId, 10);
   if (isNaN(appIdNum)) {
     throw new Error(`Invalid github_app_id: "${appId}" is not a number`);
@@ -131,26 +283,31 @@ async function getInstallationToken(
   });
 
   const appAuth = await auth({ type: 'app' });
-  core.setSecret(appAuth.token);
-  const appOctokit = github.getOctokit(appAuth.token);
+  registerSecret(appAuth.token);
+  const appOctokit = createOctokit(appAuth.token);
 
   const owner = github.context.repo.owner;
   const repo = github.context.repo.repo;
 
   try {
+    const { data: app } = await appOctokit.rest.apps.getAuthenticated();
+    if (!app?.slug) throw new Error('GET /app returned no slug');
+
     const { data: installation } = await appOctokit.rest.apps.getRepoInstallation({
       owner,
       repo,
     });
 
+    // Without `repositoryNames` the token would cover every repo of the installation.
     const installationAuth = await auth({
       type: 'installation',
       installationId: installation.id,
+      repositoryNames: [repo],
     });
 
-    core.setSecret(installationAuth.token);
-    core.info(`Authenticated as GitHub App (installation ${installation.id})`);
-    return installationAuth.token;
+    registerSecret(installationAuth.token);
+    core.info(`Authenticated as GitHub App ${app.slug}[bot] (installation ${installation.id})`);
+    return { token: installationAuth.token, slug: app.slug };
   } catch (error) {
     throw new Error(`GitHub App authentication failed: ${error}. Check that the app is installed on this repo and credentials are correct.`);
   }

@@ -1,4 +1,8 @@
-import { truncate, formatDuration, safeJsonParse, safeTruncate, sanitizeTokens } from './utils';
+import * as core from '@actions/core';
+
+import { truncate, formatDuration, isSecretName, mapWithConcurrency, ownMarker, redactSecrets, registerSecret, safeJsonParse, safeTruncate, sanitizeTokens, sendWithParseRetry, withMarkers } from './utils';
+
+jest.mock('@actions/core');
 
 describe('utils', () => {
   describe('truncate', () => {
@@ -51,6 +55,14 @@ describe('utils', () => {
       expect(formatDuration(60000)).toBe('1m 0s');
       expect(formatDuration(90000)).toBe('1m 30s');
       expect(formatDuration(125000)).toBe('2m 5s');
+      expect(formatDuration(3_599_400)).toBe('59m 59s');
+    });
+
+    it('formats an hour or more in hours and minutes, and rounds to the second', () => {
+      expect(formatDuration(3_600_000)).toBe('1h 0m');
+      expect(formatDuration(11_112_000)).toBe('3h 5m');
+      expect(formatDuration(1500)).toBe('2s');
+      expect(formatDuration(59_600)).toBe('1m 0s');
     });
 
     it('works with values passed through a helper', () => {
@@ -84,13 +96,75 @@ describe('utils', () => {
     });
   });
 
+  describe('isSecretName', () => {
+    it('matches a secret word as any part of the name, except the names that hold a path, an endpoint or a switch', () => {
+      for (const name of ['GITHUB_TOKEN', 'OPENAI_API_KEY_PROD', 'GOOGLE_CREDENTIALS_JSON', 'ANTHROPIC_CUSTOM_HEADERS', 'db_password', 'AUTH', 'AWS_SECRET_FILE_KEY', 'AWS_WEB_IDENTITY_TOKEN_FILE_2', 'INPUT_MANKI_TOKEN']) {
+        expect([name, isSecretName(name)]).toEqual([name, true]);
+      }
+      for (const name of [
+        'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+        'CLAUDE_CODE_SKIP_BEDROCK_AUTH', 'CLAUDE_CODE_SKIP_VERTEX_AUTH', 'INPUT_MANKI_TOKEN_URL',
+        'MAX_THINKING_TOKENS', 'KEYBOARD_LAYOUT', 'PATH', 'MONKEY_PATCH',
+      ]) {
+        expect([name, isSecretName(name)]).toEqual([name, false]);
+      }
+    });
+  });
+
+  describe('redactSecrets', () => {
+    afterEach(() => {
+      delete process.env.INPUT_OPENAI_API_KEY;
+      delete process.env.INPUT_CONFIG_PATH;
+      delete process.env.INPUT_GEMINI_API_KEY;
+      delete process.env.INPUT_MANKI_TOKEN_URL;
+    });
+
+    it('redacts registered values and secret action inputs, and masks registered values in the log', () => {
+      registerSecret('minted-app-token-1');
+      process.env.INPUT_OPENAI_API_KEY = 'sk-openai-input-key';
+      process.env.INPUT_CONFIG_PATH = '.github/manki-config.yml';
+      process.env.INPUT_MANKI_TOKEN_URL = 'https://manki-api.example/token';
+
+      expect(redactSecrets('a minted-app-token-1 b sk-openai-input-key c .github/manki-config.yml https://manki-api.example/token'))
+        .toBe('a [REDACTED] b [REDACTED] c .github/manki-config.yml https://manki-api.example/token');
+      expect(core.setSecret).toHaveBeenCalledWith('minted-app-token-1');
+    });
+
+    it('leaves values too short to tell from ordinary words', () => {
+      process.env.INPUT_GEMINI_API_KEY = 'short';
+      expect(redactSecrets('a short reply')).toBe('a short reply');
+    });
+
+    it('redacts each line of a multi-line value, but not the armor lines of a private key', () => {
+      registerSecret('-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAsecretline\n-----END RSA PRIVATE KEY-----');
+      expect(redactSecrets('the line MIIEpAIBAAKCAQEAsecretline leaked')).toBe('the line [REDACTED] leaked');
+      expect(redactSecrets('-----BEGIN RSA PRIVATE KEY-----')).toBe('-----BEGIN RSA PRIVATE KEY-----');
+    });
+
+    // Only the characters that also encode `x-access-token:`, the prefix or the token's last partial group are kept.
+    it.each([
+      ['', 'eC1hY2Nlc3MtdG9rZW46[REDACTED]ZW4='],
+      ['a', 'eC1hY2Nlc3MtdG9rZW46YW[REDACTED]'],
+      ['ab', 'eC1hY2Nlc3MtdG9rZW46YWJ[REDACTED]bg=='],
+    ])('redacts a value inside base64 text after the prefix %p', (prefix, expected) => {
+      registerSecret('ghs_checkoutHeaderToken');
+      const header = Buffer.from(`x-access-token:${prefix}ghs_checkoutHeaderToken`).toString('base64');
+      expect(redactSecrets(`AUTHORIZATION: basic ${header}`)).toBe(`AUTHORIZATION: basic ${expected}`);
+    });
+  });
+
   describe('sanitizeTokens', () => {
     it('redacts ghp_ tokens', () => {
       expect(sanitizeTokens('token: ghp_ABCDEF123')).toBe('token: [REDACTED]');
     });
 
-    it('redacts ghs_ tokens', () => {
+    it('redacts ghs_ tokens, including stateless JWT-format ones', () => {
       expect(sanitizeTokens('ghs_ABCDEF123')).toBe('[REDACTED]');
+      expect(sanitizeTokens('auth ghs_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjMifQ.c2ln-YXR1cmVfXw failed')).toBe('auth [REDACTED] failed');
+    });
+
+    it('redacts ghu_ and ghr_ tokens', () => {
+      expect(sanitizeTokens('ghu_ABCDEF123 ghr_ABCDEF456')).toBe('[REDACTED] [REDACTED]');
     });
 
     it('redacts gho_ tokens', () => {
@@ -113,5 +187,94 @@ describe('utils', () => {
       const result = sanitizeTokens('a=ghp_TOKEN1 b=ghs_TOKEN2');
       expect(result).toBe('a=[REDACTED] b=[REDACTED]');
     });
+  });
+
+  describe('withMarkers', () => {
+    it('keeps the body first and puts each marker on its own line after a blank line', () => {
+      expect(withMarkers('**Done.**', '<!-- a -->', '<!-- b -->')).toBe('**Done.**\n\n<!-- a -->\n<!-- b -->');
+    });
+  });
+});
+
+describe('ownMarker', () => {
+  it('reads the last line that starts with the opener, up to its first close', () => {
+    const body = ['Text quoting <!-- manki:note:mid-line -->', '```suggestion', '<!-- manki:note:quoted -->', '<!-- manki-finding: {"title":"quoted"} -->', '```', '',
+      '<!-- manki:blocker:own -->', '<!-- manki-finding: {"title":"<!-- manki:note:in-json --\\u003E","line":3} -->'].join('\n');
+    expect(ownMarker(body, '<!-- manki:')).toBe('blocker:own');
+    expect(ownMarker(body, '<!-- manki-finding: ')).toBe('{"title":"<!-- manki:note:in-json --\\u003E","line":3}');
+    expect(ownMarker(body.replace(/\n/g, '\r\n'), '<!-- manki:')).toBe('blocker:own');
+    expect(ownMarker('<!-- manki:blocker:own --> **Blocker**: with text after it', '<!-- manki:')).toBe('blocker:own');
+    // A thread comment has always ended with its marker, also in the layout from before the finding data, so a marker
+    // quoted in its fix is not the last one.
+    const old = ['\u{1F6AB} **Blocker**: Old title', '', 'Text.', '', '```suggestion', '<!-- manki:note:quoted -->', '```', '',
+      '<details>', '<summary>AI context</summary>', '', '```json', '{', '  "fix": "<!-- manki:note:quoted -->"', '}', '```', '</details>', '', '<!-- manki:blocker:Old-title -->'].join('\n');
+    expect(ownMarker(old, '<!-- manki:')).toBe('blocker:Old-title');
+    // A JSON value keeps its line and paragraph separators, which break no line.
+    expect(ownMarker('<!-- manki-finding: {"title":"a\u2028b\u2029c"} -->', '<!-- manki-finding: ')).toBe('{"title":"a\u2028b\u2029c"}');
+    // A reply can lack the marker, so with an anchor only the lines below the last anchor line are read.
+    const reply = ['This came up again.', '```', '<!-- manki -->', '<!-- manki-fixed:quoted -->', '```', '', '<!-- manki -->'];
+    expect(ownMarker(reply.join('\n'), '<!-- manki-fixed:')).toBe('quoted');
+    expect(ownMarker(reply.join('\n'), '<!-- manki-fixed:', '<!-- manki -->')).toBeUndefined();
+    expect(ownMarker([...reply, '<!-- manki-fixed:own -->'].join('\r\n'), '<!-- manki-fixed:', '<!-- manki -->')).toBe('own');
+    expect(ownMarker('<!-- manki-fixed:no-anchor -->', '<!-- manki-fixed:', '<!-- manki -->')).toBe('no-anchor');
+  });
+
+  it('finds no marker that is not on a line of its own or never closes', () => {
+    expect(ownMarker('Text <!-- manki:blocker:mid-line -->', '<!-- manki:')).toBeUndefined();
+    expect(ownMarker('<!-- manki:blocker:open', '<!-- manki:')).toBeUndefined();
+    expect(ownMarker('', '<!-- manki:')).toBeUndefined();
+  });
+});
+
+describe('sendWithParseRetry', () => {
+  it('sends the message again with a note naming the parse error, and returns the parsed second reply', async () => {
+    const send = jest.fn<Promise<string>, [string]>().mockResolvedValueOnce('**Verdict:** READY').mockResolvedValueOnce('{"ok":true}');
+    const onRetry = jest.fn();
+    const result = await sendWithParseRetry('Review this.', send, reply => JSON.parse(reply) as { ok: boolean }, onRetry);
+    expect(result).toEqual({ ok: true });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toBe('Review this.');
+    expect(send.mock.calls[1][0]).toMatch(/^Review this\.\n\nYour previous reply could not be used: Unexpected token '\*'/);
+    expect(send.mock.calls[1][0]).toMatch(/\n\nReply with only the JSON object the system prompt describes, with no text, markdown or code fence around it\.$/);
+  });
+
+  it('sends once when the first reply parses, cuts a long parse error, and throws a second failure', async () => {
+    const send = jest.fn<Promise<string>, [string]>().mockResolvedValue('{}');
+    await sendWithParseRetry('m', send, reply => reply, jest.fn());
+    expect(send).toHaveBeenCalledTimes(1);
+
+    send.mockReset().mockResolvedValue('nope');
+    const failing = () => { throw new Error('x'.repeat(1000)); };
+    await expect(sendWithParseRetry('m', send, failing, jest.fn())).rejects.toThrow('x'.repeat(1000));
+    expect(send.mock.calls[1][0]).toContain(`${'x'.repeat(300)}...\n\n`);
+    expect(send.mock.calls[1][0]).not.toContain('x'.repeat(301));
+  });
+});
+
+describe('mapWithConcurrency', () => {
+  it('keeps the order and runs at most `limit` calls at once', async () => {
+    let running = 0;
+    let peak = 0;
+    const results = await mapWithConcurrency([5, 1, 4, 2, 3, 0], 2, async n => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise(resolve => setTimeout(resolve, n));
+      running--;
+      return n * 10;
+    });
+    expect(results).toEqual([50, 10, 40, 20, 30, 0]);
+    expect(peak).toBe(2);
+    expect(await mapWithConcurrency([], 4, async n => n)).toEqual([]);
+  });
+
+  it('starts no further call after one rejects', async () => {
+    const started: number[] = [];
+    await expect(mapWithConcurrency([1, 2, 3, 4, 5], 2, async n => {
+      started.push(n);
+      if (n === 1) throw new Error('slice 1 failed');
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return n;
+    })).rejects.toThrow('slice 1 failed');
+    expect(started).toEqual([1, 2]);
   });
 });

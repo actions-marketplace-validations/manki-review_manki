@@ -1,68 +1,145 @@
 import * as core from '@actions/core';
-import * as fs from 'fs';
 import { parse as parseYaml } from 'yaml';
 
-import { buildAgentPool } from './agents';
-import { ReviewerAgent, ReviewConfig } from './types';
+import { LOCKFILES } from './binary-analyzers';
+import { parseModelSpec } from './providers';
+import { BUILT_IN_CLASSES, BUILT_IN_GROUPS, PATH_ALIASES, canonicalJson, floorShortfall, resolveRouting, routeClass } from './routing';
+import { ANALYZERS, AUTHOR_CLEAR_ROLES, PairedPin, RELATED_REPO_KINDS, ReviewConfig, StaticAnalysisConfig } from './types';
 
-export const MAX_LOCK_TTL_SECONDS = 3600;
+const MAX_WAIT_TIMEOUT_SECONDS = 3600;
+
+const HAIKU_MODEL = 'claude-haiku-5-5';
+const SONNET_MODEL = 'claude-sonnet-5-5';
+const OPUS_MODEL = 'claude-opus-5-5';
+
+/**
+ * The known package lockfiles that end in `.lock`: those osv-scanner reads, and others it does not. They are excluded by
+ * name, so any other `.lock` file, such as `.github/workflows/actions.lock`, is read as text.
+ */
+const PACKAGE_LOCKFILES = [...new Set([
+  ...[...LOCKFILES].filter(name => name.endsWith('.lock')),
+  'Podfile.lock', 'deno.lock', 'pixi.lock', 'paket.lock', 'shard.lock', 'rebar.lock', 'Berksfile.lock', 'Puppetfile.lock', 'MODULE.bazel.lock',
+  'Gopkg.lock', 'glide.lock', 'Chart.lock', 'stack.yaml.lock', 'requirements.lock', 'requirements-dev.lock', 'nimble.lock', 'spago.lock',
+])];
 
 export const DEFAULT_CONFIG: ReviewConfig = {
   auto_review: true,
   auto_approve: true,
-  exclude_paths: ['*.lock', 'dist/**', '*.generated.*'],
-  max_diff_lines: 50000,
+  author_clear_role: 'maintain',
+  exclude_paths: [...PACKAGE_LOCKFILES, 'dist/**', '*.generated.*'],
+  skip_labels: [],
+  skip_authors: [],
+  skip_branches: [],
+  max_diff_lines: 15000,
+  auto_review_max_lines: 8000,
+  slice_lines: 1500,
   reviewers: [],
   instructions: '',
-  review_level: 'auto',
-  review_thresholds: { small: 200, medium: 1000 },
+  project: '',
   models: {
-    planner: 'claude-haiku-4-5',
-    reviewer: 'claude-sonnet-4-6',
-    judge: 'claude-opus-4-7',
-    dedup: 'claude-haiku-4-5',
+    planner: HAIKU_MODEL,
+    reviewer: SONNET_MODEL,
+    judge: OPUS_MODEL,
+    dedup: HAIKU_MODEL,
   },
   planner: {
     enabled: true,
+    paired: 'auto',
+  },
+  judge: {
+    tool_steps: 0,
+    effort: 'auto',
+  },
+  static_analysis: {
+    checks: true,
+    code_scanning: true,
+    dependency_review: true,
+    wait_for_checks: [],
+    wait_timeout_seconds: 300,
+    analyzers: {},
   },
   memory: {
     enabled: false,
     repo: '',
   },
-  noise_level: 'low',
+  drafts: 'skip',
   review_passes: 1,
   convergence: {
-    max_auto_rounds: 5,
+    max_auto_rounds: 10,
+    rounds_after_restart: 3,
     test_path_patterns: ['**/*.test.*', '**/*.spec.*', '**/tests/**', '**/__tests__/**'],
     suppress_resolved_threads: true,
   },
-  stats: {
-    hidden: false,
-  },
-  concurrency_lock_ttl_seconds: 600,
+  related_repos: [],
 };
 
-const KNOWN_KEYS = new Set([
+const SKIP_KEYS = ['skip_labels', 'skip_authors', 'skip_branches'] as const;
+
+const LIMIT_KEYS = ['max_diff_lines', 'auto_review_max_lines', 'slice_lines'] as const;
+/** Smaller slices would multiply the model calls a review makes. */
+const MIN_SLICE_LINES = 200;
+
+export const KNOWN_KEYS: ReadonlySet<string> = new Set([
   'auto_review',
   'auto_approve',
+  'author_clear_role',
   'exclude_paths',
+  'skip_labels',
+  'skip_authors',
+  'skip_branches',
   'max_diff_lines',
+  'auto_review_max_lines',
+  'slice_lines',
   'reviewers',
   'instructions',
+  'project',
   'review_level',
   'review_thresholds',
   'memory',
   'models',
   'planner',
-  'nit_handling',
-  'noise_level',
+  'judge',
+  'review',
+  'static_analysis',
+  'related_repos',
+  'drafts',
   'review_passes',
   'convergence',
   'stats',
-  'concurrency_lock_ttl_seconds',
+  'metrics',
 ]);
 
+// Accepted so older configs keep loading, then dropped.
+const IGNORED_KEYS = new Set(['review_level', 'review_thresholds', 'stats']);
+
+const PAIRED_PINS: readonly PairedPin[] = ['auto', 'always', 'never'];
+const MAX_JUDGE_TOOL_STEPS = 100;
+
+export const MODEL_KEYS: ReadonlySet<string> = new Set(['planner', 'reviewer', 'reviewer_pair', 'judge', 'refuter_pair', 'dedup', 'fallback']);
+/** How many notes a review lists when `review.notes` is not set. */
+export const DEFAULT_NOTES = 3;
+
+export const REVIEW_KEYS: ReadonlySet<string> = new Set(['default_group', 'groups', 'classes', 'routing', 'allow_weaker', 'critical_paths', 'outside_input', 'examples', 'sweep', 'notes', 'rules']);
+export const GROUP_REVIEWER_KEYS: ReadonlySet<string> = new Set(['model', 'effort', 'focus', 'role']);
+const EFFORT_CHOICES = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'auto']);
+const TRIAGE_KEYS = new Set(['trivial', 'subtle', 'paired']);
+const REVIEWER_AGENT_KEYS: ReadonlySet<string> = new Set(['name', 'focus']);
+const PLANNER_KEYS: ReadonlySet<string> = new Set(['enabled', 'paired']);
+const JUDGE_KEYS: ReadonlySet<string> = new Set(['tool_steps', 'effort']);
+const STATIC_ANALYSIS_KEYS: ReadonlySet<string> = new Set(['checks', 'code_scanning', 'dependency_review', 'wait_for_checks', 'wait_timeout_seconds', 'analyzers']);
+const CONVERGENCE_KEYS: ReadonlySet<string> = new Set(['max_auto_rounds', 'rounds_after_restart', 'test_path_patterns', 'suppress_resolved_threads']);
+const METRICS_KEYS: ReadonlySet<string> = new Set(['fix_rate']);
+const MEMORY_KEYS: ReadonlySet<string> = new Set(['enabled', 'repo']);
+
 const REPO_FORMAT = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
+
+export const RELATED_REPO_KEYS: ReadonlySet<string> = new Set(['repo', 'kind', 'ref', 'paths']);
+const MAX_RELATED_REPOS = 10;
+const MAX_RELATED_REPO_PATHS = 20;
+// A ref is passed to `git fetch`, so it may not start with `-` or hold `..`.
+const RELATED_REPO_REF = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,255}$/;
+// `git fetch` reads an abbreviated commit hash as a ref name, which the server cannot resolve.
+const ABBREVIATED_COMMIT = /^[0-9a-f]{7,39}$/i;
 
 interface ConfigValidationResult {
   valid: boolean;
@@ -70,23 +147,9 @@ interface ConfigValidationResult {
   warnings: string[];
 }
 
-function validateConfig(config: Record<string, unknown>): ConfigValidationResult {
+export function validateConfig(config: Record<string, unknown>): ConfigValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
-
-  const customReviewers = Array.isArray(config.reviewers)
-    ? (config.reviewers as Array<Record<string, unknown>>)
-        .filter(r => r && typeof r === 'object' && typeof r.name === 'string' && typeof r.focus === 'string')
-        .map(r => ({ name: r.name as string, focus: r.focus as string }))
-    : [];
-  const knownAgentNames = new Set(buildAgentPool(customReviewers as ReviewerAgent[]).map(a => a.name));
-  const declaredReviewerNames = new Set(
-    Array.isArray(config.reviewers)
-      ? (config.reviewers as Array<Record<string, unknown>>)
-          .filter(r => r && typeof r === 'object' && typeof r.name === 'string' && (r.name as string).length > 0)
-          .map(r => r.name as string)
-      : [],
-  );
 
   for (const key of Object.keys(config)) {
     if (!KNOWN_KEYS.has(key)) {
@@ -94,10 +157,13 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     }
   }
 
-  if ('max_diff_lines' in config) {
-    if (typeof config.max_diff_lines !== 'number' || config.max_diff_lines <= 0) {
-      errors.push('`max_diff_lines` must be a positive number');
+  for (const key of LIMIT_KEYS) {
+    if (key in config && (typeof config[key] !== 'number' || !Number.isInteger(config[key]) || (config[key] as number) <= 0)) {
+      errors.push(`\`${key}\` must be a positive whole number`);
     }
+  }
+  if (typeof config.slice_lines === 'number' && Number.isInteger(config.slice_lines) && config.slice_lines > 0 && config.slice_lines < MIN_SLICE_LINES) {
+    errors.push(`\`slice_lines\` must be at least ${MIN_SLICE_LINES}`);
   }
 
   if ('auto_review' in config && typeof config.auto_review !== 'boolean') {
@@ -108,8 +174,16 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     errors.push('`auto_approve` must be a boolean');
   }
 
-  if ('instructions' in config && typeof config.instructions !== 'string') {
-    errors.push('`instructions` must be a string');
+  for (const key of ['instructions', 'project']) {
+    if (key in config && typeof config[key] !== 'string') {
+      errors.push(`\`${key}\` must be a string`);
+    }
+  }
+
+  for (const key of SKIP_KEYS) {
+    if (key in config && (!Array.isArray(config[key]) || !(config[key] as unknown[]).every(v => typeof v === 'string' && v.trim() !== ''))) {
+      errors.push(`\`${key}\` must be an array of non-empty strings`);
+    }
   }
 
   if ('exclude_paths' in config) {
@@ -125,30 +199,10 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
   }
 
   if ('review_level' in config) {
-    const valid = ['auto', 'small', 'medium', 'large'];
-    if (typeof config.review_level !== 'string' || !valid.includes(config.review_level)) {
-      errors.push('`review_level` must be one of: auto, small, medium, large');
-    }
+    warnings.push('`review_level` is deprecated and ignored. The planner triage now sets how many finders read each PR, from the nature of the change. To pin whether a second finder runs, use `planner.paired`.');
   }
-
   if ('review_thresholds' in config) {
-    const thresholds = config.review_thresholds as Record<string, unknown>;
-    if (!thresholds || typeof thresholds !== 'object' || Array.isArray(thresholds)) {
-      errors.push('`review_thresholds` must be an object');
-    } else {
-      if ('small' in thresholds && (typeof thresholds.small !== 'number' || thresholds.small <= 0)) {
-        errors.push('`review_thresholds.small` must be a positive number');
-      }
-      if ('medium' in thresholds && (typeof thresholds.medium !== 'number' || thresholds.medium <= 0)) {
-        errors.push('`review_thresholds.medium` must be a positive number');
-      }
-      if (
-        typeof thresholds.small === 'number' && typeof thresholds.medium === 'number' &&
-        thresholds.small >= thresholds.medium
-      ) {
-        errors.push('`review_thresholds.small` must be less than `review_thresholds.medium`');
-      }
-    }
+    warnings.push('`review_thresholds` is deprecated and ignored. Line counts no longer size the review: the planner triage sets how many finders read each PR, from the nature of the change.');
   }
 
   if ('reviewers' in config) {
@@ -160,6 +214,7 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
         if (!reviewer || typeof reviewer !== 'object') {
           errors.push(`\`reviewers[${i}]\` must be an object`);
         } else {
+          warnUnknownKeys(reviewer, REVIEWER_AGENT_KEYS, `reviewers[${i}]`, warnings);
           if (typeof reviewer.name !== 'string' || !reviewer.name) {
             errors.push(`\`reviewers[${i}].name\` must be a non-empty string`);
           }
@@ -182,32 +237,24 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
       if ('reviewer' in models && typeof models.reviewer !== 'string') {
         errors.push('`models.reviewer` must be a string');
       }
+      if ('reviewer_pair' in models && (typeof models.reviewer_pair !== 'string' || models.reviewer_pair === '')) {
+        errors.push('`models.reviewer_pair` must be a non-empty string');
+      }
       if ('judge' in models && typeof models.judge !== 'string') {
         errors.push('`models.judge` must be a string');
+      }
+      if ('refuter_pair' in models && (typeof models.refuter_pair !== 'string' || models.refuter_pair === '')) {
+        errors.push('`models.refuter_pair` must be a non-empty string');
       }
       if ('dedup' in models && typeof models.dedup !== 'string') {
         errors.push('`models.dedup` must be a string');
       }
-      if ('agents' in models) {
-        const agents = models.agents as Record<string, unknown>;
-        if (!agents || typeof agents !== 'object' || Array.isArray(agents)) {
-          errors.push('`models.agents` must be an object mapping agent names to model strings');
-        } else {
-          for (const [agentName, modelValue] of Object.entries(agents)) {
-            if (typeof modelValue !== 'string' || modelValue === '') {
-              errors.push(`\`models.agents.${agentName}\` must be a non-empty string`);
-              continue;
-            }
-            if (!knownAgentNames.has(agentName)) {
-              if (declaredReviewerNames.has(agentName)) {
-                errors.push(`Agent "${agentName}" in \`models.agents\` matches a reviewer declared under \`reviewers:\` but that entry is invalid. Check its \`name\` and \`focus\` fields.`);
-              } else {
-                const known = Array.from(knownAgentNames).map(n => `"${n}"`).join(', ');
-                errors.push(`Unknown agent name "${agentName}" in \`models.agents\`. Known agents: ${known}`);
-              }
-            }
-          }
-        }
+      if ('fallback' in models && (typeof models.fallback !== 'string' || models.fallback === '')) {
+        errors.push('`models.fallback` must be a non-empty string');
+      }
+      for (const [key, model] of Object.entries(models)) {
+        if (!MODEL_KEYS.has(key)) warnings.push(`Unknown config key: "models.${key}"`);
+        else if (typeof model === 'string' && model !== '') pushModelError(errors, `models.${key}`, model);
       }
     }
   }
@@ -217,25 +264,86 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     if (!planner || typeof planner !== 'object' || Array.isArray(planner)) {
       errors.push('`planner` must be an object');
     } else {
+      warnUnknownKeys(planner, PLANNER_KEYS, 'planner', warnings);
       if ('enabled' in planner && typeof planner.enabled !== 'boolean') {
         errors.push('`planner.enabled` must be a boolean');
+      }
+      if ('paired' in planner) {
+        if (!PAIRED_PINS.includes(planner.paired as PairedPin)) {
+          errors.push('`planner.paired` must be one of: auto, always, never');
+        }
+        warnings.push('`planner.paired` is deprecated. Route classes to review groups with `review.routing` instead: `always` is `behavior` and `internal` on a two-finder group, `never` is `behavior` on a one-finder group.');
       }
     }
   }
 
-  if ('nit_handling' in config) {
-    if (config.nit_handling === 'issues' || config.nit_handling === 'comments') {
-      warnings.push("`nit_handling: '" + config.nit_handling + "'` is deprecated and ignored, surviving nit findings now post inline. See https://github.com/manki-review/manki/issues/738 for context.");
+  if ('judge' in config) {
+    const judge = config.judge as Record<string, unknown>;
+    if (!judge || typeof judge !== 'object' || Array.isArray(judge)) {
+      errors.push('`judge` must be an object');
     } else {
-      warnings.push(`\`nit_handling: '${String(config.nit_handling)}'\` is not a recognized value. Remove it from your config.`);
+      warnUnknownKeys(judge, JUDGE_KEYS, 'judge', warnings);
+      if ('tool_steps' in judge && (!Number.isInteger(judge.tool_steps) || (judge.tool_steps as number) < 0 || (judge.tool_steps as number) > MAX_JUDGE_TOOL_STEPS)) {
+        errors.push(`\`judge.tool_steps\` must be an integer from 0 to ${MAX_JUDGE_TOOL_STEPS}`);
+      }
+      if ('effort' in judge && !EFFORT_CHOICES.has(judge.effort as string)) errors.push('`judge.effort` must be one of: low, medium, high, xhigh, max, auto');
     }
   }
 
-  if ('noise_level' in config) {
-    const valid = new Set(['low', 'medium', 'high']);
-    if (typeof config.noise_level !== 'string' || !valid.has(config.noise_level)) {
-      errors.push('`noise_level` must be one of: low, medium, high');
+  if ('review' in config) {
+    validateReviewBlock(config.review, errors, warnings);
+  }
+
+  if ('static_analysis' in config) {
+    const staticAnalysis = config.static_analysis as Record<string, unknown>;
+    if (!staticAnalysis || typeof staticAnalysis !== 'object' || Array.isArray(staticAnalysis)) {
+      errors.push('`static_analysis` must be an object');
+    } else {
+      warnUnknownKeys(staticAnalysis, STATIC_ANALYSIS_KEYS, 'static_analysis', warnings);
+      for (const key of ['checks', 'code_scanning', 'dependency_review']) {
+        if (key in staticAnalysis && typeof staticAnalysis[key] !== 'boolean') {
+          errors.push(`\`static_analysis.${key}\` must be a boolean`);
+        }
+      }
+      const waitFor = staticAnalysis.wait_for_checks;
+      if (waitFor !== undefined && (!Array.isArray(waitFor) || !waitFor.every(name => typeof name === 'string' && name.trim() !== ''))) {
+        errors.push('`static_analysis.wait_for_checks` must be a list of check run names');
+      }
+      const timeout = staticAnalysis.wait_timeout_seconds;
+      if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 1 || timeout > MAX_WAIT_TIMEOUT_SECONDS)) {
+        errors.push(`\`static_analysis.wait_timeout_seconds\` must be an integer from 1 to ${MAX_WAIT_TIMEOUT_SECONDS}`);
+      }
+      const analyzers = staticAnalysis.analyzers;
+      if (analyzers !== undefined && analyzers !== 'all') {
+        if (!analyzers || typeof analyzers !== 'object' || Array.isArray(analyzers)) {
+          errors.push('`static_analysis.analyzers` must be `all` or an object');
+        } else {
+          for (const [key, value] of Object.entries(analyzers)) {
+            if (!(ANALYZERS as readonly string[]).includes(key)) {
+              errors.push(`\`static_analysis.analyzers.${key}\` is not a known analyzer. Known analyzers: ${ANALYZERS.join(', ')}`);
+            } else if (key === 'semgrep') {
+              if (value !== false && !isSemgrepSettings(value)) {
+                errors.push('`static_analysis.analyzers.semgrep` must be `false` or `{ rules: [...] }` listing `.yml` or `.yaml` rule files in the repository');
+              }
+            } else if (typeof value !== 'boolean') {
+              errors.push(`\`static_analysis.analyzers.${key}\` must be a boolean`);
+            }
+          }
+        }
+      }
     }
+  }
+
+  if ('related_repos' in config) {
+    validateRelatedRepos(config.related_repos, errors, warnings);
+  }
+
+  if ('author_clear_role' in config && !AUTHOR_CLEAR_ROLES.some(role => role === config.author_clear_role)) {
+    errors.push(`\`author_clear_role\` must be one of: ${[...AUTHOR_CLEAR_ROLES].reverse().join(', ')}`);
+  }
+
+  if ('drafts' in config && config.drafts !== 'skip' && config.drafts !== 'review') {
+    errors.push('`drafts` must be one of: skip, review');
   }
 
   if ('review_passes' in config) {
@@ -252,13 +360,11 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     if (!convergence || typeof convergence !== 'object' || Array.isArray(convergence)) {
       errors.push('`convergence` must be an object');
     } else {
-      if ('max_auto_rounds' in convergence) {
-        if (
-          typeof convergence.max_auto_rounds !== 'number' ||
-          !Number.isInteger(convergence.max_auto_rounds) ||
-          convergence.max_auto_rounds < 0
-        ) {
-          errors.push('`convergence.max_auto_rounds` must be a non-negative integer');
+      warnUnknownKeys(convergence, CONVERGENCE_KEYS, 'convergence', warnings);
+      for (const key of ['max_auto_rounds', 'rounds_after_restart']) {
+        const value = convergence[key];
+        if (key in convergence && (typeof value !== 'number' || !Number.isInteger(value) || value < 0)) {
+          errors.push(`\`convergence.${key}\` must be a non-negative integer`);
         }
       }
       if ('test_path_patterns' in convergence) {
@@ -276,24 +382,16 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
   }
 
   if ('stats' in config) {
-    const stats = config.stats as Record<string, unknown>;
-    if (!stats || typeof stats !== 'object' || Array.isArray(stats)) {
-      errors.push('`stats` must be an object');
-    } else {
-      if ('hidden' in stats && typeof stats.hidden !== 'boolean') {
-        errors.push('`stats.hidden` must be a boolean');
-      }
-    }
+    warnings.push('`stats` is deprecated and ignored. The round record is always a hidden comment in the review.');
   }
 
-  if ('concurrency_lock_ttl_seconds' in config) {
-    if (
-      typeof config.concurrency_lock_ttl_seconds !== 'number' ||
-      !Number.isFinite(config.concurrency_lock_ttl_seconds) ||
-      config.concurrency_lock_ttl_seconds < 0 ||
-      config.concurrency_lock_ttl_seconds > MAX_LOCK_TTL_SECONDS
-    ) {
-      errors.push(`\`concurrency_lock_ttl_seconds\` must be a non-negative number ≤ ${MAX_LOCK_TTL_SECONDS}`);
+  if ('metrics' in config) {
+    const metrics = config.metrics as Record<string, unknown>;
+    if (!metrics || typeof metrics !== 'object' || Array.isArray(metrics)) {
+      errors.push('`metrics` must be an object');
+    } else {
+      warnUnknownKeys(metrics, METRICS_KEYS, 'metrics', warnings);
+      if ('fix_rate' in metrics && typeof metrics.fix_rate !== 'boolean') errors.push('`metrics.fix_rate` must be a boolean');
     }
   }
 
@@ -302,6 +400,7 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
     if (!memory || typeof memory !== 'object' || Array.isArray(memory)) {
       errors.push('`memory` must be an object');
     } else {
+      warnUnknownKeys(memory, MEMORY_KEYS, 'memory', warnings);
       if ('enabled' in memory && typeof memory.enabled !== 'boolean') {
         errors.push('`memory.enabled` must be a boolean');
       }
@@ -316,40 +415,261 @@ function validateConfig(config: Record<string, unknown>): ConfigValidationResult
   return { valid: errors.length === 0, errors, warnings };
 }
 
+const MODEL_REFS: ReadonlySet<string> = new Set(['@reviewer', '@reviewer_pair']);
+
+/** Warns about each key of `block` that is not in `known`, named by its path under `prefix`. */
+function warnUnknownKeys(block: Record<string, unknown>, known: ReadonlySet<string>, prefix: string, warnings: string[]): void {
+  for (const key of Object.keys(block)) {
+    if (!known.has(key)) warnings.push(`Unknown config key: "${prefix}.${key}"`);
+  }
+}
+
+/** Adds an error when `model` is no model spec Manki can run, so a bad id never reaches a CLI. */
+function pushModelError(errors: string[], key: string, model: string): void {
+  try {
+    parseModelSpec(model);
+  } catch (error) {
+    errors.push(`\`${key}\`: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(v => typeof v === 'string' && v !== '');
+
+function validateRelatedRepos(value: unknown, errors: string[], warnings: string[]): void {
+  if (!Array.isArray(value)) {
+    errors.push('`related_repos` must be a list of repos');
+    return;
+  }
+  if (value.length > MAX_RELATED_REPOS) errors.push(`\`related_repos\` lists ${value.length} repos, at most ${MAX_RELATED_REPOS} are allowed`);
+  const seen = new Set<string>();
+  value.forEach((entry: unknown, i) => {
+    const at = `\`related_repos[${i}]`;
+    if (!isObject(entry)) {
+      errors.push(`${at}\` must be an object`);
+      return;
+    }
+    for (const key of Object.keys(entry)) {
+      if (!RELATED_REPO_KEYS.has(key)) warnings.push(`Unknown config key: "related_repos[${i}].${key}"`);
+    }
+    const { repo, kind, ref, paths } = entry;
+    if (typeof repo !== 'string' || !REPO_FORMAT.test(repo) || repo.split('/').some(part => part === '.' || part === '..')) {
+      errors.push(`${at}.repo\` must be in "owner/name" format`);
+    } else if (seen.has(repo.toLowerCase())) {
+      errors.push(`${at}.repo\` lists ${repo} a second time`);
+    } else {
+      seen.add(repo.toLowerCase());
+    }
+    if (!RELATED_REPO_KINDS.some(known => known === kind)) errors.push(`${at}.kind\` must be one of: ${RELATED_REPO_KINDS.join(', ')}`);
+    if (ref !== undefined && (typeof ref !== 'string' || !RELATED_REPO_REF.test(ref))) {
+      errors.push(`${at}.ref\` must be a branch, tag or commit name`);
+    } else if (typeof ref === 'string' && ABBREVIATED_COMMIT.test(ref)) {
+      errors.push(`${at}.ref\` looks like an abbreviated commit. Use the full hash, or \`refs/tags/${ref}\` or \`refs/heads/${ref}\` for a tag or branch of that name`);
+    }
+    if (paths !== undefined) {
+      if (!isStringArray(paths) || paths.length === 0 || paths.length > MAX_RELATED_REPO_PATHS) {
+        errors.push(`${at}.paths\` must be a list of 1 to ${MAX_RELATED_REPO_PATHS} paths`);
+      } else {
+        for (const p of paths) {
+          if (!isRepoRelativePattern(p)) errors.push(`${at}.paths\` has \`${p}\`, which must be a path or glob inside the repo`);
+        }
+      }
+    }
+  });
+}
+
+/** Whether `pattern` names files inside a repo: relative, without `..`, and without the characters a sparse checkout reads specially. */
+function isRepoRelativePattern(pattern: string): boolean {
+  return !/^[/!#-]/.test(pattern) && !pattern.includes('\\') && ![...pattern].some(c => c.charCodeAt(0) < 0x20)
+    && !pattern.split('/').includes('..');
+}
+
+/** Checks that `paths` is a non-empty list of globs and known path aliases. `at` names the setting in an error. */
+function checkPathList(paths: unknown, at: string, errors: string[]): void {
+  if (!isStringArray(paths) || paths.length === 0) {
+    errors.push(`${at} must be a non-empty array of strings`);
+    return;
+  }
+  for (const p of paths.filter(p => p.startsWith('@') && !(p in PATH_ALIASES))) {
+    errors.push(`${at} names unknown path alias \`${p}\`. Known aliases: ${Object.keys(PATH_ALIASES).join(', ')}`);
+  }
+}
+
+function validateReviewBlock(review: unknown, errors: string[], warnings: string[]): void {
+  if (!isObject(review)) {
+    errors.push('`review` must be an object');
+    return;
+  }
+  for (const key of Object.keys(review)) {
+    if (!REVIEW_KEYS.has(key)) warnings.push(`Unknown config key: "review.${key}"`);
+  }
+
+  const groups = new Set(Object.keys(BUILT_IN_GROUPS));
+  if ('groups' in review) {
+    if (!isObject(review.groups)) {
+      errors.push('`review.groups` must be an object mapping group names to groups');
+    } else {
+      for (const [name, group] of Object.entries(review.groups)) {
+        groups.add(name);
+        const reviewers = isObject(group) ? group.reviewers : undefined;
+        if (!Array.isArray(reviewers) || reviewers.length === 0) {
+          errors.push(`\`review.groups.${name}.reviewers\` must be a non-empty array`);
+          continue;
+        }
+        reviewers.forEach((reviewer: unknown, i) => {
+          const at = `\`review.groups.${name}.reviewers[${i}]`;
+          if (!isObject(reviewer)) {
+            errors.push(`${at}\` must be an object`);
+            return;
+          }
+          for (const key of Object.keys(reviewer)) {
+            if (!GROUP_REVIEWER_KEYS.has(key)) warnings.push(`Unknown config key: "review.groups.${name}.reviewers[${i}].${key}"`);
+          }
+          if ('model' in reviewer && (typeof reviewer.model !== 'string' || reviewer.model === '')) errors.push(`${at}.model\` must be a non-empty string`);
+          else if (typeof reviewer.model === 'string' && !MODEL_REFS.has(reviewer.model)) pushModelError(errors, `review.groups.${name}.reviewers[${i}].model`, reviewer.model);
+          if ('effort' in reviewer && !EFFORT_CHOICES.has(reviewer.effort as string)) errors.push(`${at}.effort\` must be one of: low, medium, high, xhigh, max, auto`);
+          if ('focus' in reviewer && (typeof reviewer.focus !== 'string' || reviewer.focus === '')) errors.push(`${at}.focus\` must be a non-empty string`);
+          if ('role' in reviewer && reviewer.role !== 'finder' && reviewer.role !== 'verifier') errors.push(`${at}.role\` must be one of: finder, verifier`);
+        });
+      }
+    }
+  }
+
+  const classes = new Set(Object.keys(BUILT_IN_CLASSES));
+  if ('classes' in review) {
+    if (!isObject(review.classes)) {
+      errors.push('`review.classes` must be an object mapping class names to classes');
+    } else {
+      const ranks = new Map(Object.entries(BUILT_IN_CLASSES).map(([name, c]) => [c.rank, name]));
+      for (const [name, def] of Object.entries(review.classes)) {
+        const at = `\`review.classes.${name}`;
+        classes.add(name);
+        if (!isObject(def)) {
+          errors.push(`${at}\` must be an object`);
+          continue;
+        }
+        const builtIn = BUILT_IN_CLASSES[name];
+        const match = def.match;
+        if ('critical' in def) errors.push(`${at}.critical\` is not a class setting. List the critical paths in \`review.critical_paths\``);
+        if (builtIn) {
+          if (!builtIn.match.paths_any || 'rank' in def || 'floor' in def || !isObject(match) || Object.keys(match).some(k => k !== 'paths_any')) {
+            errors.push(builtIn.match.paths_any
+              ? `${at}\` is built in: it takes only \`match.paths_any\`, which adds paths to its built-in rule`
+              : `${at}\` is built in and cannot be changed. Route it with \`review.routing\` instead`);
+            continue;
+          }
+        } else {
+          if ('floor' in def) errors.push(`${at}.floor\` is not allowed: only the built-in security, supply_chain and data_contract classes are floors`);
+          if (typeof def.rank !== 'number' || !Number.isInteger(def.rank)) {
+            errors.push(`${at}.rank\` must be an integer`);
+          } else if (ranks.has(def.rank)) {
+            errors.push(`${at}.rank\` ${def.rank} is already the rank of \`${ranks.get(def.rank)}\`. Each class needs its own rank`);
+          } else {
+            ranks.set(def.rank, name);
+          }
+          if (!isObject(match) || Object.keys(match).length === 0) {
+            errors.push(`${at}.match\` must set \`paths_any\`, \`triage\` or both`);
+            continue;
+          }
+          for (const key of Object.keys(match)) {
+            if (key !== 'paths_any' && key !== 'triage') errors.push(`${at}.match.${key}\` is not a known condition. Use \`paths_any\` or \`triage\``);
+          }
+          if ('triage' in match) {
+            if (!isObject(match.triage) || Object.entries(match.triage).some(([k, v]) => !TRIAGE_KEYS.has(k) || typeof v !== 'boolean')) {
+              errors.push(`${at}.match.triage\` must map trivial, subtle or paired to true or false`);
+            }
+          }
+        }
+        if ('paths_any' in match) checkPathList(match.paths_any, `${at}.match.paths_any\``, errors);
+      }
+    }
+  }
+
+  if ('critical_paths' in review) checkPathList(review.critical_paths, '`review.critical_paths`', errors);
+  if ('outside_input' in review && (typeof review.outside_input !== 'string' || !review.outside_input.trim())) {
+    errors.push('`review.outside_input` must be a non-empty string');
+  }
+  if ('sweep' in review && typeof review.sweep !== 'boolean') errors.push('`review.sweep` must be true or false');
+  if ('notes' in review && !(Number.isInteger(review.notes) && (review.notes as number) >= 0)) errors.push('`review.notes` must be a non-negative integer');
+  if ('rules' in review && review.rules !== 'warn' && review.rules !== 'block') errors.push('`review.rules` must be `warn` or `block`');
+  if ('examples' in review) {
+    const examples = review.examples;
+    if (!isObject(examples) || Object.keys(examples).length === 0) {
+      errors.push('`review.examples` must set `blocker`, `not_blocker` or both');
+    } else {
+      for (const [side, list] of Object.entries(examples)) {
+        if (side !== 'blocker' && side !== 'not_blocker') errors.push(`\`review.examples.${side}\` is not a known side. Use \`blocker\` or \`not_blocker\``);
+        else if (!isStringArray(list) || list.length === 0) errors.push(`\`review.examples.${side}\` must be a non-empty array of strings`);
+      }
+    }
+  }
+
+  if ('routing' in review) {
+    if (!isObject(review.routing)) {
+      errors.push('`review.routing` must be an object mapping class names to group names');
+    } else {
+      for (const [name, group] of Object.entries(review.routing)) {
+        if (!classes.has(name)) errors.push(`\`review.routing.${name}\` routes an unknown class. Define it under \`review.classes\``);
+        if (typeof group !== 'string' || !groups.has(group)) errors.push(`\`review.routing.${name}\` names unknown group \`${String(group)}\``);
+      }
+    }
+  }
+
+  if ('default_group' in review && (typeof review.default_group !== 'string' || !groups.has(review.default_group))) {
+    errors.push(`\`review.default_group\` names unknown group \`${String(review.default_group)}\``);
+  }
+
+  if ('allow_weaker' in review) {
+    const floors = Object.keys(BUILT_IN_CLASSES).filter(name => BUILT_IN_CLASSES[name].floor);
+    if (!isStringArray(review.allow_weaker) || review.allow_weaker.some(name => !floors.includes(name))) {
+      errors.push(`\`review.allow_weaker\` must be an array of floor classes: ${floors.join(', ')}`);
+    }
+  }
+}
+
+/**
+ * Returns an error for each floor class the `review` block routes to a group below the floor,
+ * unless `allow_weaker` names the class. The built-in `pair` group is accepted even when both
+ * of its finders resolve to one model, as they do on a non-Claude reviewer with no pair model.
+ */
+export function reviewFloorErrors(config: ReviewConfig): string[] {
+  if (!config.review) return [];
+  const routing = resolveRouting(config.review);
+  const errors: string[] = [];
+  for (const [name, c] of Object.entries(routing.classes)) {
+    if (!c.floor || routing.allowWeaker.includes(name)) continue;
+    const groupName = routeClass(routing, name);
+    const group = routing.groups[groupName];
+    if (group === BUILT_IN_GROUPS.pair) continue;
+    const shortfall = floorShortfall(group, ref => resolveReviewerModel(config, ref));
+    if (shortfall) {
+      errors.push(`\`review\` routes the \`${name}\` floor class to the \`${groupName}\` group, but ${shortfall}. A floor class needs two finders on two distinct models, none at \`low\` effort. Route it to a stronger group, or list it in \`review.allow_weaker\` to accept the weaker review`);
+    }
+  }
+  return errors;
+}
+
 function deepMerge(defaults: ReviewConfig, overrides: Record<string, unknown>): ReviewConfig {
   const result = { ...defaults };
 
   for (const key of Object.keys(overrides)) {
-    if (!KNOWN_KEYS.has(key)) continue;
+    if (!KNOWN_KEYS.has(key) || IGNORED_KEYS.has(key)) continue;
 
     const value = overrides[key];
 
     if (key === 'memory' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.memory = { ...defaults.memory, ...(value as Record<string, unknown>) } as ReviewConfig['memory'];
     } else if (key === 'models' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      const incoming = value as Record<string, unknown>;
-      const incomingAgents = incoming.agents as Record<string, string> | undefined;
-      const existingAgents = defaults.models?.agents;
-      const merged = { ...defaults.models, ...incoming } as ReviewConfig['models'];
-      if (merged) {
-        merged.agents = (existingAgents || incomingAgents)
-          ? { ...(existingAgents ?? {}), ...(incomingAgents ?? {}) }
-          : undefined;
-      }
-      result.models = merged;
+      const known = Object.entries(value as Record<string, unknown>).filter(([name]) => MODEL_KEYS.has(name));
+      result.models = { ...defaults.models, ...Object.fromEntries(known) } as ReviewConfig['models'];
     } else if (key === 'planner' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.planner = { ...defaults.planner, ...(value as Record<string, unknown>) } as ReviewConfig['planner'];
-    } else if (key === 'review_thresholds' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      result.review_thresholds = { ...defaults.review_thresholds, ...(value as Record<string, unknown>) } as ReviewConfig['review_thresholds'];
+    } else if (key === 'judge' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      result.judge = { ...defaults.judge, ...(value as Record<string, unknown>) } as ReviewConfig['judge'];
+    } else if (key === 'static_analysis' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      result.static_analysis = { ...defaults.static_analysis, ...(value as Record<string, unknown>) } as ReviewConfig['static_analysis'];
     } else if (key === 'convergence' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
       result.convergence = { ...defaults.convergence, ...(value as Record<string, unknown>) } as ReviewConfig['convergence'];
-    } else if (key === 'stats' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      result.stats = { ...defaults.stats, ...(value as Record<string, unknown>) } as ReviewConfig['stats'];
-    } else if (key === 'exclude_paths' && Array.isArray(value)) {
-      // Union with defaults so users adding a single pattern don't lose
-      // built-in skips (`*.lock`, `dist/**`, `*.generated.*`).
-      const userPatterns = value.filter((p): p is string => typeof p === 'string');
-      result.exclude_paths = Array.from(new Set([...defaults.exclude_paths, ...userPatterns]));
     } else {
       (result as Record<string, unknown>)[key] = value;
     }
@@ -358,27 +678,34 @@ function deepMerge(defaults: ReviewConfig, overrides: Record<string, unknown>): 
   return result;
 }
 
-export function loadConfigFromContent(content: string): ReviewConfig {
+/**
+ * Parses and validates a config file's content. Throws on invalid YAML or an invalid schema
+ * rather than falling back to defaults, because the defaults include `auto_approve: true`.
+ */
+export function loadConfigFromContent(content: string, source = '.manki.yml'): ReviewConfig {
   if (!content.trim()) {
     core.info('Empty config, using defaults');
     return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
   }
 
-  let parsed: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    parsed = parseYaml(content) as Record<string, unknown>;
+    parsed = parseYaml(content);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    core.warning(`Failed to parse config YAML: ${msg}. Using defaults.`);
+    throw new Error(`Invalid YAML in ${source}: ${msg}`);
+  }
+
+  if (parsed === null || parsed === undefined) {
+    core.info('Config has no settings, using defaults');
     return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
   }
 
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    core.warning('Config YAML root must be an object. Using defaults.');
-    return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Invalid config in ${source}: the top level must be a mapping of keys to values`);
   }
 
-  const validation = validateConfig(parsed);
+  const validation = validateConfig(parsed as Record<string, unknown>);
 
   for (const warning of validation.warnings) {
     core.warning(warning);
@@ -388,34 +715,54 @@ export function loadConfigFromContent(content: string): ReviewConfig {
     for (const error of validation.errors) {
       core.error(error);
     }
-    throw new Error(`Invalid config: ${validation.errors.join('; ')}`);
+    throw new Error(`Invalid config in ${source}: ${validation.errors.join('; ')}`);
   }
 
-  const merged = deepMerge(DEFAULT_CONFIG, parsed);
-
-  if (merged.review_thresholds.small >= merged.review_thresholds.medium) {
-    throw new Error('Invalid config: `review_thresholds.small` must be less than `review_thresholds.medium`');
+  const config = deepMerge(DEFAULT_CONFIG, parsed as Record<string, unknown>);
+  const floorErrors = reviewFloorErrors(config);
+  if (floorErrors.length > 0) {
+    for (const error of floorErrors) core.error(error);
+    throw new Error(`Invalid config in ${source}: ${floorErrors.join('; ')}`);
   }
-
-  return merged;
+  return config;
 }
 
-export function loadConfigFromFile(filePath: string): ReviewConfig {
-  if (!fs.existsSync(filePath)) {
-    core.info(`Config file not found at ${filePath}, using defaults`);
-    return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
-  }
+function isSemgrepSettings(value: unknown): boolean {
+  const rules = (value as { rules?: unknown } | null)?.rules;
+  // Registry names such as `p/default` and URLs are refused: Manki only runs rule files it reads from the base branch.
+  return Array.isArray(rules) && rules.length > 0 && rules.every(rule => typeof rule === 'string'
+    && /\.ya?ml$/.test(rule) && !rule.startsWith('/') && !rule.includes('://') && !rule.split('/').includes('..'));
+}
 
-  let content: string;
+/**
+ * Returns the `static_analysis` block of a config file's content, with defaults for missing keys.
+ * Falls back to the defaults when the content is missing or invalid, so a broken file never turns sources off.
+ */
+export function loadStaticAnalysisConfig(content: string | null, source = '.manki.yml'): StaticAnalysisConfig {
+  const defaults = DEFAULT_CONFIG.static_analysis!;
+  if (!content) return { ...defaults };
   try {
-    content = fs.readFileSync(filePath, 'utf-8');
+    const parsed: unknown = parseYaml(content);
+    const block = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).static_analysis
+      : undefined;
+    if (block === undefined) return { ...defaults };
+    const validation = validateConfig({ static_analysis: block });
+    if (!validation.valid) {
+      core.info(`Ignoring invalid \`static_analysis\` in ${source} on the base branch: ${validation.errors.join('; ')}`);
+      return { ...defaults };
+    }
+    return { ...defaults, ...(block as Partial<StaticAnalysisConfig>) };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    core.warning(`Failed to read config file at ${filePath}: ${msg}. Using defaults.`);
-    return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
+    core.info(`Could not parse ${source} on the base branch, using the default \`static_analysis\`: ${e instanceof Error ? e.message : String(e)}`);
+    return { ...defaults };
   }
+}
 
-  return loadConfigFromContent(content);
+/** Returns the top-level keys whose values differ between the PR's config and the base branch's. */
+export function changedKeys(head: ReviewConfig, base: ReviewConfig): string[] {
+  const values = (config: ReviewConfig) => config as unknown as Record<string, unknown>;
+  return [...KNOWN_KEYS].filter(key => !IGNORED_KEYS.has(key) && canonicalJson(values(head)[key]) !== canonicalJson(values(base)[key]));
 }
 
 export function resolveModel(config: ReviewConfig, stage: 'planner' | 'reviewer' | 'judge' | 'dedup'): string {
@@ -423,33 +770,57 @@ export function resolveModel(config: ReviewConfig, stage: 'planner' | 'reviewer'
 }
 
 /**
- * Resolves the model for a specific reviewer agent. Resolution order:
- * `models.agents[agentName]` → `models[stage]` → built-in default for `stage`.
+ * Returns the model for the second finder: `models.reviewer_pair`, else the other Claude tier of the
+ * reviewer model, else the reviewer model itself. The tier swap needs no credential beyond the reviewer's.
  */
-export function resolveAgentModel(
-  config: ReviewConfig,
-  agentName: string,
-  stage: 'planner' | 'reviewer' | 'judge' | 'dedup',
-): string {
-  const override = config.models?.agents?.[agentName];
-  if (override) return override;
-  return resolveModel(config, stage);
+export function resolvePairModel(config: ReviewConfig): string {
+  return config.models?.reviewer_pair || otherClaudeTier(resolveModel(config, 'reviewer'));
 }
 
-export function loadConfig(yamlContent: string | undefined): ReviewConfig {
+/**
+ * Returns the model a stage on `stageModel` moves to when a safety filter refuses it: `models.fallback`,
+ * else `models.reviewer`. A stage already on that model moves to its other Claude tier instead.
+ * Returns undefined when no other model is left.
+ */
+export function resolveFallbackModel(config: ReviewConfig, stageModel: string): string | undefined {
+  const fallback = config.models?.fallback || resolveModel(config, 'reviewer');
+  const model = sameModel(fallback, stageModel) ? otherClaudeTier(stageModel) : fallback;
+  return sameModel(model, stageModel) ? undefined : model;
+}
+
+function sameModel(a: string, b: string): boolean {
+  return a.replace(/^anthropic\//, '') === b.replace(/^anthropic\//, '');
+}
+
+/** Returns the other Claude tier of `model` (Sonnet for Opus and Haiku, Opus for Sonnet and Fable), or `model` itself for other providers. */
+function otherClaudeTier(model: string): string {
+  const id = model.replace(/^anthropic\//, '');
+  if (id.startsWith('claude-opus-')) return SONNET_MODEL;
+  if (id.startsWith('claude-sonnet-') || id.startsWith('claude-fable-')) return OPUS_MODEL;
+  if (id.startsWith('claude-haiku-')) return SONNET_MODEL;
+  return model;
+}
+
+/** Returns the model a group reviewer runs on. `@reviewer` and `@reviewer_pair` resolve through `models`, and unset means `@reviewer`. */
+export function resolveReviewerModel(config: ReviewConfig, ref: string | undefined): string {
+  if (ref === undefined || ref === '@reviewer') return resolveModel(config, 'reviewer');
+  if (ref === '@reviewer_pair') return resolvePairModel(config);
+  return ref;
+}
+
+/**
+ * Returns the defaults for a base branch config that could not be read or loaded. `author_clear_role` is `admin` in
+ * them, the one role that may clear under every value the repository can have set.
+ */
+export function fallbackConfig(): ReviewConfig {
+  return { ...loadConfig(undefined), author_clear_role: 'admin' };
+}
+
+export function loadConfig(yamlContent: string | undefined, source?: string): ReviewConfig {
   if (!yamlContent) {
     core.info('No config content provided, using defaults');
     return { ...DEFAULT_CONFIG, reviewers: [...DEFAULT_CONFIG.reviewers], memory: { ...DEFAULT_CONFIG.memory } };
   }
 
-  return loadConfigFromContent(yamlContent);
-}
-
-export function sanitizeForkConfig(config: ReviewConfig): ReviewConfig {
-  return {
-    ...config,
-    instructions: DEFAULT_CONFIG.instructions,
-    reviewers: [...DEFAULT_CONFIG.reviewers],
-    memory: { ...config.memory, repo: DEFAULT_CONFIG.memory.repo },
-  };
+  return loadConfigFromContent(yamlContent, source);
 }

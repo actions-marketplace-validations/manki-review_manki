@@ -1,4 +1,5 @@
-import { extractCurrentCodeWindow } from './code-window';
+import { extractCurrentCodeWindow, locatePostedFile, locatePostedLine } from './code-window';
+import { expectLinearTime } from './test-utils';
 
 describe('extractCurrentCodeWindow', () => {
   function makeFile(lineCount: number): string {
@@ -75,5 +76,44 @@ describe('extractCurrentCodeWindow', () => {
   it('returns empty string for empty file path', () => {
     const fileContents = new Map([['src/a.ts', makeFile(10)]]);
     expect(extractCurrentCodeWindow(fileContents, '', 5)).toBe('');
+  });
+});
+
+describe('locatePostedLine', () => {
+  const body = ['function read(path) {', '  const data = fs.readFileSync(path);', '  if (!data) return null;', '  return parse(data);', '}'];
+  const posted = body.join('\n');
+
+  it('finds the posted code where it moved by the lines around it, and never by one generic line', () => {
+    expect(locatePostedLine(posted, 2, ['// header', '', '', ...body].join('\n'))).toBe(5);
+    // Indentation does not count, and the nearest place wins when the code appears twice.
+    expect(locatePostedLine(posted, 2, [...body.map(l => `  ${l}`), '', ...body].join('\n'))).toBe(2);
+    // The flagged line was edited in place: its neighbours still place it.
+    expect(locatePostedLine(posted, 2, posted.replace('fs.readFileSync(path)', 'await fs.promises.readFile(path)'))).toBe(2);
+    // Only one generic line of the window is left, so nothing places the code.
+    expect(locatePostedLine(posted, 4, ['function other() {', '  return parse(data);', '}'].join('\n'))).toBeUndefined();
+    expect(locatePostedLine(posted, 2, 'nothing here')).toBeUndefined();
+  });
+
+  it('stays linear on a head file of many repeated lines, which the PR author controls', async () => {
+    await expectLinearTime((size) => {
+      const repeated = [...Array(2 * size).fill(''), ...Array(size).fill('  return parse(data);'), ...body].join('\n');
+      const started = performance.now();
+      expect(locatePostedLine(posted, 2, repeated)).toBe(3 * size + 2);
+      return performance.now() - started;
+    }, 100_000);
+    // A size too small to divide, or a smaller size that is not smaller, would pass without comparing anything.
+    await expect(expectLinearTime(() => 0, 7)).rejects.toThrow('needs 0 < smaller < size, got smaller 0 and size 7');
+    await expect(expectLinearTime(() => 0, 100, { smaller: 100 })).rejects.toThrow('needs 0 < smaller < size');
+  }, 60_000);
+
+  it('finds the posted code in another file only when exactly one holds its whole window unchanged', () => {
+    const whole = ['// header', ...body.map(l => `  ${l}`)].join('\n');
+    const part = posted.replace('return null', 'throw new Error()');
+    expect(locatePostedFile(posted, 2, [['src/part.ts', part], ['src/whole.ts', whole]])).toEqual({ file: 'src/whole.ts', line: 3 });
+    // A file that holds only part of the window does not hold the code, and two files that hold it give no certain place.
+    expect(locatePostedFile(posted, 2, [['src/part.ts', part]])).toBeUndefined();
+    expect(locatePostedFile(posted, 2, [['src/a.ts', whole], ['src/b.ts', posted]])).toBeUndefined();
+    expect(locatePostedFile(posted, 2, [['src/other.ts', 'nothing here']])).toBeUndefined();
+    expect(locatePostedFile(posted, 2, [])).toBeUndefined();
   });
 });

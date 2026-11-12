@@ -1,10 +1,6 @@
 auto_review: true
 auto_approve: true
 
-exclude_paths:
-  - "*.lock"
-  - "dist/**"
-
 instructions: |
   This is a TypeScript GitHub Action project.
   Focus on: correct GitHub API usage, proper error handling, TypeScript type safety.
@@ -12,4 +8,7 @@ instructions: |
 
 memory:
   enabled: true
-  repo: "manki-review/review-memory"
+
+# The token service depends on Manki's dispatch inputs, progress comment and settings boxes.
+related_repos:
+  - { repo: manki-review/token-service, kind: consumer, paths: [src/, README.md] }

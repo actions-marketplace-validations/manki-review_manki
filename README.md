@@ -11,55 +11,84 @@
 
 <p align="center"><strong>Your tokens, your rules.</strong> Self-hosted AI code review that runs on your own GitHub runners and learns from your team.</p>
 
-Manki assembles a dynamic review team sized to your PR's content and complexity. Dedup drops repeats from prior reviews, a judge filters noise and classifies what remains, and manki learns your team's conventions over time.
+Manki sizes each review to the nature of the change, and you decide who reviews what. By default a change where no defect could hide gets one quick check, and one that could reach your users gets two finders on different models. In `.manki.yml` you can set up your own review groups, each reader with its own model, effort and focus, and route kinds of changes to them. Dedup drops repeats from prior reviews, a judge filters noise and classifies what remains, and manki learns your team's conventions over time.
 
 <p align="center">
-  <img src="assets/review-example.png" alt="Example manki review comment" width="800" />
+  <img src="assets/review-example.png" alt="Manki's progress comment after a review: the planner's triage, the review group picked for the change (here the default pair of finders, each with its model), and the judge's result" width="800" />
 </p>
 
 ## Why Manki
 
-- **Multi-stage pipeline** — a planner picks the team, agents review in parallel, dedup catches repeats from prior reviews, a judge filters noise and classifies findings by severity
-- **Adaptive team sizing** — 1, 3, 5, or 7 reviewers chosen per PR based on content and complexity
-- **Smart verdicts** — blocks PRs on real issues, approves over style nitpicks; auto-approves when all blocking threads resolve
-- **Multi-provider** — Anthropic, OpenAI, and Gemini, mix-and-match per agent via `.manki.yml`
-- **Self-learning memory** — `/manki remember` teaches conventions, `/manki dismiss` suppresses false positives, patterns stick across PRs
-- **Conversational** — reply to any review comment to discuss, or use `@manki explain`/`forget` inline
-- **Self-hosted GitHub Action** — your API key, your compute, no SaaS intermediary
+- **Multi-stage pipeline**: a planner triages the change, finders review in parallel, dedup catches repeats from prior reviews, a judge filters noise and classifies findings by severity
+- **You decide who reviews what**: a review group lists the readers for a kind of change, each with its own model, effort and focus, and you route changes to groups by path or by the planner's triage. By default a change that could reach a user gets a second finder on another model with the same checklist, so the two models miss different things
+- **Smart verdicts**: blocks PRs on real issues, approves over optional notes, and auto-approves when all blocking threads resolve
+- **Multi-provider**: Anthropic, OpenAI, and Gemini, mix-and-match per stage and per reader via `.manki.yml`
+- **Self-learning memory**: `/manki remember` teaches conventions, `/manki dismiss` suppresses false positives, patterns stick across PRs
+- **Conversational**: reply to any review comment to discuss, or use `@manki explain`/`forget` inline
+- **Self-hosted GitHub Action**: your API key, your compute. The Manki service only puts the events in order and starts the runs
 
 ## Quick start
 
-1. **Install the app** — [github.com/apps/manki-review](https://github.com/apps/manki-review)
-2. **Add a provider secret** — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` (OAuth subscription paths are also supported, see [SETUP.md](SETUP.md#choosing-a-provider))
-3. **Add the workflow** — copy the YAML from the [Setup Guide](SETUP.md#step-3-add-the-workflow)
+1. **Install the app**: [github.com/apps/manki-review](https://github.com/apps/manki-review). The Manki service serves only the accounts it lists, so ask the maintainers to add yours
+2. **Add a provider secret**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` (OAuth subscription paths are also supported, see [Getting started](docs/getting-started.md#choosing-a-provider))
+3. **Add the workflow**: copy the YAML from [Getting started](docs/getting-started.md#step-3-add-the-workflow)
 
-Full setup guide with memory and troubleshooting: **[SETUP.md](SETUP.md)**
+Full setup guide with troubleshooting: **[Getting started](docs/getting-started.md)**. Coming from v6? See [Migrating to v7](docs/migrating-to-v7.md). More in [How reviews work](docs/how-reviews-work.md), [Configuration](docs/configuration.md), [Review memory](docs/memory.md) and the [Security model](docs/security.md).
 
 ## How it works
 
-Manki wakes up when a PR is opened. A fast planner (Haiku) picks the team size and effort, reviewers work in parallel, dedup drops findings that match repeats from prior reviews, and the judge evaluates and classifies what remains. Results land as inline comments plus a summary and verdict. When all blocking threads resolve, manki approves.
+Manki wakes up when a PR is opened. A fast planner (Haiku) triages the change and sets the effort, the finders of its review group review it in parallel (one or two by default), dedup drops findings that match repeats from prior reviews, and the judge evaluates and classifies what remains. When nothing blocks, a verdict reader reads the whole diff cold before Manki approves. Results land as inline comments plus a summary and verdict. A finding shows what goes wrong, with everything else in one collapsed section: how to fix it, why it matters, and how it was checked. Its summary names those parts, counts the places read and, for a blocker or a warning, says how it was checked: proven from the cited lines, confirmed with tools or not confirmed. Inside, up to three places show as GitHub code previews, each under the sentence its check gives, and the rest are linked. A finding that cites nothing says so. When all blocking threads resolve, manki approves.
 
 <p align="center">
-  <img src="assets/pipeline.svg" alt="Manki review pipeline: Planner → Reviewers → Dedup → Judge → Review Posted" />
+  <img src="assets/pipeline.svg" alt="Manki review pipeline: Planner → Finders → Dedup → Judge → Verdict reader → Review posted" />
 </p>
 
-See [SETUP.md](SETUP.md#review-pipeline) for the full walkthrough.
+See [How reviews work](docs/how-reviews-work.md#review-pipeline) for the full walkthrough.
+
+One or two finders is only the default. The `review` block in `.manki.yml` sets who reviews what. This example sends changes to security-sensitive and data contract paths to two strong readers on two providers, and keeps the defaults for everything else:
+
+```yaml
+review:
+  groups:
+    deep:
+      reviewers:
+        - { model: claude-opus-5-5, effort: high, focus: "authz, injection, secret handling" }
+        - { model: gpt-5.5, effort: high }
+  routing:
+    security: deep
+    data_contract: deep
+```
+
+Changes to security-sensitive paths, CI or dependency files and data contracts always get at least two finders on two distinct models, unless you allow less with `allow_weaker`. See [Review groups](docs/how-reviews-work.md#review-groups) for groups, classes and routing.
 
 ## Talk to Manki
 
 | Command | What it does |
 |---------|-------------|
-| `/manki review` | Trigger a full multi-agent review |
+| `/manki review` | Review the head commit, unless Manki already has a complete review of it. Then the settings block shows it as up to date, and ticking Review again there reviews the commit again |
 | `/manki explain [topic]` | Ask about the PR changes |
-| `/manki dismiss [finding]` | Dismiss a finding (stored as suppression in memory) |
+| `/manki dismiss [finding]` | Dismiss a finding. In a Manki finding's thread it resolves the thread, or says in the thread why it stays open or keeps blocking. A named finding is stored as a suppression in memory when its text matches a finding Manki posted on the PR. Without either, Manki replies with how to use it |
 | `/manki remember <instruction>` | Teach it something for future reviews |
-| `/manki remember global: <instruction>` | Teach globally (applies to all repos) |
+| `/manki remember global: <instruction>` | Stores nothing. Global learnings apply to every repo sharing the memory, so the owner of the memory repo edits `_global/` by hand |
 | `/manki check` | Check thread resolution and auto-approve if clear |
 | `/manki forget <text>` | Remove a learning matching the text |
 | `/manki forget suppression <pattern>` | Remove a suppression matching the pattern |
 | `/manki help` | Show all commands |
 
-You can also use `@manki` as the command prefix, or reply to any review comment to start a conversation. Tip: edit a comment to add `/manki` if you forgot to include it.
+You can also use `@manki` as the command prefix. A reply in one of Manki's review threads needs no prefix. It gets one short answer that starts with Fixed, Withdrawn, Agreed, Kept or Unverified. With the Claude or Codex CLI, Manki checks the reply against the PR head with the same read-only tools its reviewers use. It answers Withdrawn only when the code proves the finding wrong, Agreed when you defer the finding to later work, Kept only with new lines that show the problem still happens, and Unverified when the reply rests on facts it can't check from the code, so a maintainer should confirm them and resolve the thread. For Fixed, Withdrawn and Agreed, Manki resolves the thread when the PR author or a collaborator wrote the reply. A blocker or a security finding is resolved only for a collaborator other than the PR author. When a collaborator's reply gets a finding withdrawn and memory is on, Manki saves a learning for that file and says how to remove it with `/manki forget`. A security finding never leaves a learning. Once Manki has answered a thread, a later review that finds the same problem again never opens a new thread for it. It replies in that thread only when the code there got worse, and reopens the thread when it was closed. The next review bodies list the findings Manki agreed to leave for later under a "follow-ups" heading. Tip: edit a PR comment to add `/manki` if you forgot to include it. An edited reply in a review thread is not read again.
+
+## Review locally
+
+`manki review` runs the same review on your branch before you push: the planner, the finders, dedup, the judge and the verdict reader. It reviews the change from the merge base with the base branch to `HEAD`, as the pull request would show it, reads `.manki.yml` and the instruction files from the base, and writes nothing to GitHub. Memory, earlier rounds and CI results stay out, since they live on GitHub.
+
+```sh
+export CLAUDE_CODE_OAUTH_TOKEN=...      # or any key the Action takes, as an environment variable
+npx github:manki-review/manki#v7 review               # current branch against the remote's default branch
+npx github:manki-review/manki#v7 review main..topic   # a range
+npx github:manki-review/manki#v7 review --json --record round.json
+```
+
+The findings print as Markdown, or as JSON with `--json`. `--record` writes the round record a pull request round would post. The exit code is 0 when a pull request round would approve, 1 when something blocks, the base config did not load or the change breaks it, and 2 when the review is incomplete or failed. Run `manki review --help` for every option.
 
 ## Configure
 
@@ -68,24 +97,24 @@ Create `.manki.yml` in your repo root:
 ```yaml
 auto_review: true
 auto_approve: true
-exclude_paths: ["*.lock"]
-review_level: auto      # auto | small | medium | large
+exclude_paths: ["Cargo.lock", "vendor/**"]
 
 instructions: |
   This is a Rust project. Focus on ownership and error handling.
 
 models:
-  planner: claude-haiku-4-5
-  reviewer: claude-sonnet-4-6
-  judge: claude-opus-4-6
-  dedup: claude-haiku-4-5
+  planner: claude-haiku-5-5
+  reviewer: claude-sonnet-5-5
+  reviewer_pair: claude-opus-5-5   # second finder of the default pair
+  judge: claude-opus-5-5
+  dedup: claude-haiku-5-5
 ```
 
-See [`.manki.yml.example`](.manki.yml.example) for all options, or [SETUP.md](SETUP.md) for the full guide.
+See [`.manki.yml.example`](.manki.yml.example) for all options, or [Configuration](docs/configuration.md) for the full guide.
 
 ## Security
 
-Secrets are masked, PR content is sanitized before posting, and memory access is restricted to repo collaborators. See [SETUP.md](SETUP.md#security) for the full security model.
+Secrets are masked, PR content is sanitized before posting, and only people with write access to the repo can start Manki from a comment or change its memory. See the [Security model](docs/security.md).
 
 ## License
 

@@ -1,23 +1,28 @@
 import { spawn } from 'child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import OpenAI from 'openai';
 import * as core from '@actions/core';
 
 import {
   buildOpenAIAuth,
-  isReasoningModel,
   OpenAIClient,
+  readCodexLimits,
   resetCLIInstallPromise,
   resolveCodexHome,
-  resolveEffortTier,
+  resolveReasoningEffort,
   sanitizeLogOutput,
   STALE_TIMEOUT_MS,
 } from './openai';
+import { QuotaError, RefusalError } from './types';
 
 // Seeding `$CODEX_HOME/auth.json` is exercised separately in `cli-utils.test.ts`.
 // Stub it out here so the provider tests don't touch the filesystem.
 jest.mock('./cli-utils', () => ({
   ...jest.requireActual('./cli-utils'),
   seedAuthFile: jest.fn(),
+  registerAuthFileSecrets: jest.fn(),
 }));
 
 jest.mock('child_process', () => ({
@@ -60,23 +65,120 @@ describe('buildOpenAIAuth', () => {
   });
 });
 
-describe('isReasoningModel', () => {
-  it('detects o-series models', () => {
-    expect(isReasoningModel('o1')).toBe(true);
-    expect(isReasoningModel('o3')).toBe(true);
-    expect(isReasoningModel('o3-mini')).toBe(true);
-    expect(isReasoningModel('o4-mini')).toBe(true);
+describe('resolveReasoningEffort', () => {
+  it.each([
+    ['o1', 'high'],
+    ['o3', 'high'],
+    ['o3-mini', 'high'],
+    ['o4-mini', 'high'],
+    ['gpt-5', 'high'],
+    ['gpt-5-mini', 'high'],
+    ['gpt-5-nano-2025-08-07', 'high'],
+    ['gpt-5.1', 'high'],
+    ['gpt-5.2', 'xhigh'],
+    ['gpt-5.3-codex', 'xhigh'],
+    ['gpt-5.4-nano', 'xhigh'],
+    ['gpt-5.5', 'xhigh'],
+    ['gpt-5.6-sol', 'max'],
+    ['gpt-5.6-luna', 'max'],
+    ['GPT-6-Luna', 'max'],
+    ['gpt-6-astra', 'max'],
+    ['gpt-6.1-sol', 'max'],
+    ['gpt-6.1-terra', 'max'],
+  ])('maps max to the highest effort %s accepts, and xhigh to at most that', (model, expected) => {
+    expect(resolveReasoningEffort(model, 'max')).toBe(expected);
+    expect(resolveReasoningEffort(model, 'xhigh')).toBe(expected === 'high' ? 'high' : 'xhigh');
+    for (const tier of ['low', 'medium', 'high'] as const) {
+      expect(resolveReasoningEffort(model, tier)).toBe(tier);
+    }
+    for (const auth of [{ kind: 'apiKey', key: 'k' }, { kind: 'oauth', token: 't' }] as const) {
+      expect(new OpenAIClient({ auth, model }).sentEffort('max')).toBe(expected);
+    }
   });
 
-  it('rejects gpt-family models', () => {
-    expect(isReasoningModel('gpt-4o')).toBe(false);
-    expect(isReasoningModel('gpt-4.1')).toBe(false);
-    expect(isReasoningModel('gpt-4o-mini')).toBe(false);
+  it.each([
+    'gpt-4o',
+    'gpt-4o-mini',
+    'gpt-4.1',
+    'gpt-4.1-mini',
+    'gpt-3.5-turbo',
+    'gpt-5-chat-latest',
+    'gpt-5.3-chat-latest',
+    'gpt-5-pro',
+    'o3-pro-2025-06-10',
+    'gpt-realtime-2.1',
+    'gpt-image-2.5',
+    'claude-opus-4-6',
+    'overlord',
+  ])('returns undefined for %s, which rejects reasoning effort', (model) => {
+    expect(resolveReasoningEffort(model, 'high')).toBeUndefined();
+    expect(resolveReasoningEffort(model, 'xhigh')).toBeUndefined();
+    expect(resolveReasoningEffort(model, 'max')).toBeUndefined();
+    expect(new OpenAIClient({ auth: { kind: 'apiKey', key: 'k' }, model }).sentEffort('max')).toBeUndefined();
+  });
+});
+
+describe('readCodexLimits', () => {
+  const tokenCount = (rateLimits: unknown) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: rateLimits } });
+  const NOW = Date.UTC(2026, 10, 9, 12);
+  const T = NOW / 1000;
+  let home: string;
+  const writeSession = (name: string, lines: string[], mtimeSeconds: number, folder = '2026/11/09') => {
+    const dir = join(home, 'sessions', ...folder.split('/'));
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, name);
+    writeFileSync(path, `${lines.join('\n')}\n`);
+    utimesSync(path, mtimeSeconds, mtimeSeconds);
+  };
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'manki-codex-limits-'));
+    jest.spyOn(Date, 'now').mockReturnValue(NOW);
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    rmSync(home, { recursive: true, force: true });
   });
 
-  it('rejects unrelated names', () => {
-    expect(isReasoningModel('claude-opus-4-6')).toBe(false);
-    expect(isReasoningModel('overlord')).toBe(false);
+  it('reads the last recorded limits of the newest session written since the call started that has any', () => {
+    writeSession('rollout-old.jsonl', [tokenCount({ primary: { used_percent: 99, window_minutes: 300 } })], T - 3000);
+    writeSession('rollout-new.jsonl', [
+      tokenCount({ primary: { used_percent: 10, window_minutes: 300 } }),
+      tokenCount({ primary: { used_percent: 72.4, window_minutes: 300, resets_at: 1794000000 }, secondary: { used_percent: 91, window_minutes: 10080 } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message' } }),
+    ], T - 1000);
+    // A call running in parallel started a newer session that has no readings yet.
+    writeSession('rollout-parallel.jsonl', [JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message' } })], T - 500);
+    // A folder of an earlier day is never read, even with a file touched since the call started.
+    writeSession('rollout-history.jsonl', [tokenCount({ primary: { used_percent: 50, window_minutes: 300 } })], T - 100, '2026/11/07');
+
+    expect(readCodexLimits(home, (T - 2000) * 1000)).toEqual([
+      { account: 'ChatGPT subscription', window: '5-hour', usedPercent: 72, resetsAt: 1794000000 },
+      { account: 'ChatGPT subscription', window: 'weekly', usedPercent: 91 },
+    ]);
+    expect(readCodexLimits(home, (T - 800) * 1000)).toEqual([]);
+  });
+
+  it.each([
+    ['the day the call runs', '2026/11/09'],
+    ['the day before, for a CLI at UTC-12', '2026/11/08'],
+    ['the day after, for a CLI at UTC+14', '2026/11/10'],
+  ])('reads the folder of %s', (_case, folder) => {
+    writeSession('rollout.jsonl', [tokenCount({ primary: { used_percent: 40, window_minutes: 300 } })], T - 60, folder);
+    expect(readCodexLimits(home, (T - 600) * 1000)).toEqual([{ account: 'ChatGPT subscription', window: '5-hour', usedPercent: 40 }]);
+  });
+
+  it('names other window lengths by days or hours, and skips a window without a length or share', () => {
+    writeSession('rollout.jsonl', [tokenCount({ primary: { used_percent: 5, window_minutes: 2880 }, secondary: { used_percent: 6, window_minutes: 60 } })], T - 10);
+    expect(readCodexLimits(home, (T - 60) * 1000).map(l => l.window)).toEqual(['2-day', '1-hour']);
+
+    writeSession('rollout.jsonl', ['{"rate_limits": not json', tokenCount({ primary: { used_percent: 5 }, secondary: null }), tokenCount(null)], T - 10);
+    expect(readCodexLimits(home, (T - 60) * 1000)).toEqual([]);
+  });
+
+  it('returns none when Codex wrote no sessions', () => {
+    expect(readCodexLimits(home, (T - 60) * 1000)).toEqual([]);
+    expect(readCodexLimits(join(home, 'missing'), (T - 60) * 1000)).toEqual([]);
   });
 });
 
@@ -182,11 +284,21 @@ describe('sendMessage (API path)', () => {
     expect(mockCreate.mock.calls[0][0].reasoning_effort).toBe('high');
   });
 
-  it('maps max effort to reasoning_effort=high (the highest tier the API exposes)', async () => {
-    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'o4-mini' });
+  it('maps max effort to the highest reasoning_effort the model accepts', async () => {
+    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'o3' });
     await client.sendMessage('sys', 'user', { effort: 'max' });
+    const gpt6 = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-6.1-sol' });
+    await gpt6.sendMessage('sys', 'user', { effort: 'max' });
 
     expect(mockCreate.mock.calls[0][0].reasoning_effort).toBe('high');
+    expect(mockCreate.mock.calls[1][0].reasoning_effort).toBe('max');
+  });
+
+  it('sends reasoning_effort to GPT-5 family models', async () => {
+    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-5.6-terra' });
+    await client.sendMessage('sys', 'user', { effort: 'low' });
+
+    expect(mockCreate.mock.calls[0][0].reasoning_effort).toBe('low');
   });
 
   it('omits reasoning_effort when no effort is provided on a reasoning model', async () => {
@@ -234,17 +346,41 @@ describe('sendMessage (API path)', () => {
     expect(result.usage).toEqual({
       inputTokens: 200,
       outputTokens: 60,
-      cachedTokens: 40,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 0,
       reasoningTokens: 15,
     });
     expect(result.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it.each<[string | undefined, boolean]>([
+    ['length', true],
+    ['stop', false],
+    [undefined, false],
+  ])('reports truncated for finish_reason %s', async (finishReason, expected) => {
+    mockCreate.mockResolvedValueOnce({ choices: [{ message: { content: '[' }, finish_reason: finishReason }] });
+    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-4o' });
+    const result = await client.sendMessage('sys', 'user');
+    expect(result.truncated).toBe(expected);
+  });
+
+  it.each([
+    [{ message: { content: '' }, finish_reason: 'content_filter' }, 'content_filter'],
+    [{ message: { content: null, refusal: "I can't help with that." }, finish_reason: 'stop' }, 'refusal'],
+  ])('throws a `RefusalError` for a policy refusal (%j)', async (choice, reason) => {
+    mockCreate.mockResolvedValueOnce({ choices: [choice] });
+    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-4o' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(RefusalError);
+    expect((error as RefusalError).reason).toBe(reason);
   });
 
   it('returns zero usage when the SDK omits the usage block', async () => {
     mockCreate.mockResolvedValueOnce({ choices: [{ message: { content: 'response text' } }] });
     const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-4o' });
     const result = await client.sendMessage('sys', 'user');
-    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 });
+    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 });
   });
 
   it('throws when client is not initialized (oauth path called via API method)', async () => {
@@ -256,6 +392,18 @@ describe('sendMessage (API path)', () => {
     ) => Promise<unknown>;
 
     await expect(sendViaAPI.call(client, 'sys', 'user')).rejects.toThrow('OpenAI client not initialized');
+  });
+
+  it.each<[string, object, object]>([
+    ['a used-up quota', { status: 429, code: 'insufficient_quota', message: '429 You exceeded your current quota, please check your plan and billing details.' }, { limit: 'OpenAI API quota exhausted', resetsAt: undefined }],
+    ['a rate limit', { status: 429, code: 'rate_limit_exceeded', message: '429 Rate limit reached for gpt-5.5. Please try again in 20s. Visit the docs.' }, { limit: 'OpenAI API rate limit reached', resetsAt: 'in 20s' }],
+  ])('throws a `QuotaError` on %s', async (_case, fields, expected) => {
+    mockCreate.mockRejectedValueOnce(Object.assign(new Error(), fields));
+    const client = new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-5.5' });
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(error).toBeInstanceOf(QuotaError);
+    expect(error).toMatchObject({ ...expected, credential: 'key' });
   });
 
   it('propagates SDK errors from chat.completions.create to the caller', async () => {
@@ -286,7 +434,10 @@ describe('sendViaOAuth (Codex CLI path)', () => {
     jest.restoreAllMocks();
   });
 
-  function setupSpawnMock(stdout: string, opts: { exitCode?: number; stderr?: string } = {}): void {
+  const instructionsPath = (args: string[]): string => JSON.parse(args.at(-2)!.replace(/^model_instructions_file=/, ''));
+
+  /** Mocks the CLI and returns its stdin and the instructions file of each call, which is gone once the call returns. */
+  function setupSpawnMock(stdout: string, opts: { exitCode?: number; stderr?: string } = {}): { stdin: jest.Mock; instructions: string[] } {
     const proc = {
       stdin: { write: jest.fn().mockReturnValue(true), end: jest.fn(), on: jest.fn() },
       stdout: { on: jest.fn() },
@@ -311,20 +462,115 @@ describe('sendViaOAuth (Codex CLI path)', () => {
       }
     });
 
-    mockSpawn.mockReturnValue(proc as unknown as ReturnType<typeof spawn>);
+    const instructions: string[] = [];
+    mockSpawn.mockImplementation((_command, args) => {
+      instructions.push(readFileSync(instructionsPath(args as string[]), 'utf8'));
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+    return { stdin: proc.stdin.write, instructions };
   }
 
-  it('passes --model and exec subcommand to codex CLI', async () => {
-    setupSpawnMock('hello\n');
+  it('runs `codex exec` read-only with no built-in tool and Manki\'s instructions in a file, in an empty temp directory', async () => {
+    const { stdin, instructions } = setupSpawnMock('hello\n');
     const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'o3' });
 
     await client.sendMessage('sys', 'user');
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-    expect(spawnArgs[0]).toBe('exec');
-    const modelIdx = spawnArgs.indexOf('--model');
-    expect(modelIdx).toBeGreaterThan(-1);
-    expect(spawnArgs[modelIdx + 1]).toBe('o3');
+    expect(spawnArgs).toEqual([
+      'exec', '--skip-git-repo-check', '--model=o3', '--sandbox', 'read-only', '-c', 'approval_policy=never',
+      '-c', 'features.shell_tool=false', '-c', 'features.view_image=false', '-c', 'web_search=disabled', '-c', 'features.apps=false',
+      '-c', 'features.plugins=false', '-c', 'features.multi_agent=false', '-c', 'features.image_generation=false',
+      '-c', expect.stringMatching(/^model_instructions_file=".*\/instructions\.md"$/), '-',
+    ]);
+    expect(instructions).toEqual(['sys']);
+    expect(existsSync(instructionsPath(spawnArgs))).toBe(false);
+    expect(stdin.mock.calls.map(c => String(c[0])).join('')).toBe('user');
+    const { cwd } = mockSpawn.mock.calls[0][2] as { cwd: string };
+    expect(cwd.startsWith(join(tmpdir(), 'manki-cli-'))).toBe(true);
+    expect(readdirSync(cwd)).toEqual([]);
+  });
+
+  it('gives Codex Manki\'s tool server with the file tools, and tells it about them, only when asked', async () => {
+    const { stdin, instructions } = setupSpawnMock('[]\n');
+    const savedRunnerTemp = process.env.RUNNER_TEMP;
+    const savedApiUrl = process.env.GITHUB_API_URL;
+    const savedProxy = process.env.HTTPS_PROXY;
+    const savedSecret = process.env.OPENAI_API_KEY;
+    process.env.RUNNER_TEMP = '/runner/temp';
+    process.env.GITHUB_API_URL = 'https://ghe.example/api/v3';
+    process.env.HTTPS_PROXY = 'http://user:secret@proxy:3128';
+    process.env.OPENAI_API_KEY = 'sk-not-for-the-server';
+    try {
+      const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'gpt-5.5' });
+      expect(client.repoTools).toBe(true);
+      expect(new OpenAIClient({ auth: { kind: 'apiKey', key: 'sk' }, model: 'gpt-5.5' }).repoTools).toBe(false);
+
+      await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15 } });
+      await client.sendMessage('Review the diff.', 'the diff');
+    } finally {
+      if (savedRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+      else process.env.RUNNER_TEMP = savedRunnerTemp;
+      if (savedApiUrl === undefined) delete process.env.GITHUB_API_URL;
+      else process.env.GITHUB_API_URL = savedApiUrl;
+      if (savedProxy === undefined) delete process.env.HTTPS_PROXY;
+      else process.env.HTTPS_PROXY = savedProxy;
+      if (savedSecret === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = savedSecret;
+    }
+
+    const [withTools, without] = mockSpawn.mock.calls.map(call => call[1] as string[]);
+    expect(withTools.join(' ')).toContain([
+      `-c mcp_servers.manki.command=${JSON.stringify(process.execPath)}`,
+      `-c mcp_servers.manki.args=${JSON.stringify([process.argv[1], 'mcp-server', '/work/repo', '--file-tools', '--steps', '15'])}`,
+      '-c mcp_servers.manki.default_tools_approval_mode="approve"',
+    ].join(' '));
+    // The server gets the CLI's own environment by name, so no value, such as a proxy password, is on the command line.
+    const envVars = JSON.parse(withTools.find(arg => arg.startsWith('mcp_servers.manki.env_vars='))!.slice('mcp_servers.manki.env_vars='.length)) as string[];
+    expect(envVars).toEqual(expect.arrayContaining(['RUNNER_TEMP', 'HTTPS_PROXY', 'GITHUB_API_URL']));
+    expect(envVars).not.toContain('OPENAI_API_KEY');
+    expect(withTools.join(' ')).not.toContain('secret@proxy');
+    expect(withTools.some(arg => arg.startsWith('mcp_servers.manki.env.'))).toBe(false);
+    const { env: codexEnv } = mockSpawn.mock.calls[0][2] as { env: NodeJS.ProcessEnv };
+    expect(codexEnv).toMatchObject({ RUNNER_TEMP: '/runner/temp', HTTPS_PROXY: 'http://user:secret@proxy:3128', GITHUB_API_URL: 'https://ghe.example/api/v3' });
+    expect(codexEnv).not.toHaveProperty('OPENAI_API_KEY');
+    expect(withTools).toContain('features.shell_tool=false');
+    expect(without.join(' ')).not.toContain('mcp_servers');
+    expect(instructions[0]).toMatch(/^Review the diff\.\n\n## Tools\n\nThe PR's head commit is checked out at `\/work\/repo`\. `read_file`, `grep` and `glob` read files/);
+    expect(instructions[0]).not.toContain('## Related repos');
+    expect(instructions[1]).toBe('Review the diff.');
+    expect(stdin.mock.calls.map(c => String(c[0]))).toEqual(['the diff', 'the diff']);
+  });
+
+  it('reads back how often the tool server read each related repo, and passes no reads file without related repos', async () => {
+    setupSpawnMock('[]\n');
+    const spawnFromHelper = mockSpawn.getMockImplementation()!;
+    mockSpawn.mockImplementation((...spawnArgs: Parameters<typeof spawnFromHelper>) => {
+      const serverArgs = JSON.parse((spawnArgs[1] as string[]).find(arg => arg.startsWith('mcp_servers.manki.args='))!.slice('mcp_servers.manki.args='.length)) as string[];
+      const at = serverArgs.indexOf('--reads-file');
+      if (at !== -1) writeFileSync(serverArgs[at + 1], JSON.stringify({ 'dashpay/dash': 2 }));
+      return spawnFromHelper(...spawnArgs);
+    });
+    const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'gpt-5.5' });
+    const related = { repos: [{ repo: 'dashpay/dash', kind: 'reference' as const }], cacheDir: '/runner/temp/related', stateDir: '/runner/temp/state' };
+
+    const withRelated = await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15, related } });
+    const withoutRelated = await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15 } });
+
+    expect(withRelated.relatedReads).toEqual({ 'dashpay/dash': 2 });
+    expect(withoutRelated.relatedReads).toBeUndefined();
+    expect((mockSpawn.mock.calls[1][1] as string[]).join(' ')).not.toContain('--reads-file');
+
+    // A call that fails still reports the reads it made, on its error.
+    setupSpawnMock('', { exitCode: 1, stderr: 'ERROR: something broke' });
+    const failingSpawn = mockSpawn.getMockImplementation()!;
+    mockSpawn.mockImplementation((...spawnArgs: Parameters<typeof failingSpawn>) => {
+      const serverArgs = JSON.parse((spawnArgs[1] as string[]).find(arg => arg.startsWith('mcp_servers.manki.args='))!.slice('mcp_servers.manki.args='.length)) as string[];
+      writeFileSync(serverArgs[serverArgs.indexOf('--reads-file') + 1], JSON.stringify({ 'dashpay/dash': 4 }));
+      return failingSpawn(...spawnArgs);
+    });
+    const failure = await client.sendMessage('Review the diff.', 'the diff', { repoTools: { root: '/work/repo', steps: 15, related } }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ message: expect.stringContaining('Codex CLI invocation failed'), relatedReads: { 'dashpay/dash': 4 } });
   });
 
   it('passes model_reasoning_effort override when effort is set on o-series model', async () => {
@@ -415,8 +661,8 @@ describe('sendViaOAuth (Codex CLI path)', () => {
     }
   });
 
-  it('seeds `$CODEX_HOME/auth.json` from the OAuth secret before invoking the CLI', async () => {
-    const { seedAuthFile } = jest.requireMock('./cli-utils') as { seedAuthFile: jest.Mock };
+  it('seeds `$CODEX_HOME/auth.json` from the OAuth secret before invoking the CLI, and registers its tokens again after', async () => {
+    const { seedAuthFile, registerAuthFileSecrets } = jest.requireMock('./cli-utils') as { seedAuthFile: jest.Mock; registerAuthFileSecrets: jest.Mock };
     seedAuthFile.mockClear();
     setupSpawnMock('ok\n');
     const savedCodexHome = process.env.CODEX_HOME;
@@ -433,6 +679,7 @@ describe('sendViaOAuth (Codex CLI path)', () => {
         requiredFields: ['tokens.access_token', 'tokens.refresh_token'],
         bootstrapHint: expect.stringContaining('codex login'),
       });
+      expect(registerAuthFileSecrets).toHaveBeenCalledWith('/tmp/manki-codex-seed-fixture/auth.json');
     } finally {
       if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = savedCodexHome;
@@ -518,15 +765,15 @@ describe('sendViaOAuth (Codex CLI path)', () => {
     expect(spawnArgs[overrideIdx]).toBe('model_reasoning_effort=medium');
   });
 
-  it('maps max effort to model_reasoning_effort=high on o-series CLI invocation', async () => {
+  it('maps max effort to the highest model_reasoning_effort the model accepts on CLI invocation', async () => {
     setupSpawnMock('ok\n');
-    const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'o4-mini' });
+    const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'gpt-5.4' });
 
     await client.sendMessage('sys', 'user', { effort: 'max' });
 
     const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
     const overrideIdx = spawnArgs.findIndex(a => a.startsWith('model_reasoning_effort'));
-    expect(spawnArgs[overrideIdx]).toBe('model_reasoning_effort=high');
+    expect(spawnArgs[overrideIdx]).toBe('model_reasoning_effort=xhigh');
   });
 
   it('returns trimmed stdout content on success', async () => {
@@ -535,7 +782,7 @@ describe('sendViaOAuth (Codex CLI path)', () => {
 
     const result = await client.sendMessage('sys', 'user');
     expect(result.content).toBe('hello world');
-    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 });
+    expect(result.usage).toBeUndefined();
     expect(result.latencyMs).toBeGreaterThanOrEqual(0);
   });
 
@@ -546,6 +793,37 @@ describe('sendViaOAuth (Codex CLI path)', () => {
     await expect(client.sendMessage('sys', 'user', { effort: 'high' })).rejects.toThrow(
       /Codex CLI invocation failed.*model=o3.*effort=high.*promptChars=\d+.*elapsedMs=\d+.*stderrChars=\d+/s,
     );
+  });
+
+  it('throws a `QuotaError` on a ChatGPT usage limit, reading only the `ERROR:` line', async () => {
+    const stderr = "user\nreview this: rate limit reached\nERROR: You've hit your usage limit. Upgrade your plan or add credits to continue, or try again at 20 Aug 2026, 16:29.\n";
+    setupSpawnMock('', { exitCode: 1, stderr });
+    jest.spyOn(core, 'warning').mockImplementation(() => {});
+    const client = new OpenAIClient({ auth: { kind: 'oauth', token: 'tok' }, model: 'gpt-5.5' });
+    // The session Codex wrote before it stopped records the limit that ran out.
+    const savedCodexHome = process.env.CODEX_HOME;
+    const home = mkdtempSync(join(tmpdir(), 'manki-codex-quota-'));
+    process.env.CODEX_HOME = home;
+    const today = new Date();
+    const folder = join(home, 'sessions', String(today.getFullYear()), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0'));
+    const session = join(folder, 'rollout.jsonl');
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(session, `${JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { secondary: { used_percent: 100, window_minutes: 10080 } } } })}\n`);
+    const later = Date.now() / 1000 + 60;
+    utimesSync(session, later, later);
+
+    const error = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e).finally(() => {
+      if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = savedCodexHome;
+      rmSync(home, { recursive: true, force: true });
+    });
+    expect(error).toBeInstanceOf(QuotaError);
+    expect(error).toMatchObject({ limit: 'ChatGPT subscription limit reached', resetsAt: 'at 20 Aug 2026, 16:29', credential: 'token' });
+    expect(error).toMatchObject({ limits: [{ account: 'ChatGPT subscription', window: 'weekly', usedPercent: 100 }] });
+
+    setupSpawnMock('', { exitCode: 1, stderr: 'user\nreview this: rate limit reached\nERROR: stream disconnected\n' });
+    const other = await client.sendMessage('sys', 'user').then(() => null, (e: Error) => e);
+    expect(other).not.toBeInstanceOf(QuotaError);
   });
 
   it('surfaces stdout tail and <empty stderr> marker when exit-1 has no stderr', async () => {
@@ -613,19 +891,6 @@ describe('sanitizeLogOutput', () => {
   it('returns empty string unchanged', () => {
     expect(sanitizeLogOutput('')).toBe('');
   });
-});
-
-describe('resolveEffortTier', () => {
-  it('passes through low/medium/high unchanged', () => {
-    expect(resolveEffortTier('low')).toBe('low');
-    expect(resolveEffortTier('medium')).toBe('medium');
-    expect(resolveEffortTier('high')).toBe('high');
-  });
-
-  it('collapses max to high', () => {
-    expect(resolveEffortTier('max')).toBe('high');
-  });
-
 });
 
 describe('sendViaOAuth — extended coverage', () => {

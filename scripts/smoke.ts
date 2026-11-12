@@ -17,14 +17,14 @@ import {
   buildAuthForProvider,
   createLLMClient,
   parseModelSpec,
+  readProviderInputsFromEnv,
   sanitizeLogOutput,
-  type ProviderInputs,
   type SendMessageOptions,
 } from '../src/providers';
 
 interface SmokeArgs {
   model: string;
-  effort?: 'low' | 'medium' | 'high' | 'max';
+  effort?: SendMessageOptions['effort'];
   prompt: string;
 }
 
@@ -36,13 +36,13 @@ function printHelp(): void {
 
 Arguments:
   --model    Required. Any model ID recognised by parseModelSpec.
-             Examples: claude-haiku-4-5, gpt-4o-mini, o4-mini, gemini-2.5-flash.
+             Examples: claude-haiku-5-5, gpt-6-luna, gpt-6.1-sol, gemini-3.5-flash-lite.
              Or use provider/model syntax: anthropic/claude-..., openai/gpt-..., gemini/gemini-...
-  --effort   Optional. low | medium | high | max. Provider behaviour varies.
-             For non-reasoning OpenAI models (GPT family), --effort is ignored.
-             The Codex CLI (OAuth path) applies its own default effort; the API
-             path silently omits reasoning_effort. A warning is emitted in both
-             cases so the effective effort is visible in CI logs.
+  --effort   Optional. low | medium | high | xhigh | max. Provider behaviour varies.
+             OpenAI models that reject reasoning effort (gpt-4o, gpt-4.1, ...)
+             ignore --effort. The Codex CLI (OAuth path) then applies its own
+             default effort and the API path omits reasoning_effort. A warning
+             is emitted in both cases so the effective effort is visible in CI logs.
   --prompt   Optional. Override the default test prompt.
   --help     Print this message.
 
@@ -70,8 +70,8 @@ export function parseArgs(argv: string[] = process.argv.slice(2)): SmokeArgs {
     } else if (arg === '--effort') {
       const val = argv[++i];
       if (!val) throw new Error('--effort requires a value.');
-      if (val !== 'low' && val !== 'medium' && val !== 'high' && val !== 'max') {
-        throw new Error(`Invalid --effort "${val}". Use: low | medium | high | max.`);
+      if (val !== 'low' && val !== 'medium' && val !== 'high' && val !== 'xhigh' && val !== 'max') {
+        throw new Error(`Invalid --effort "${val}". Use: low | medium | high | xhigh | max.`);
       }
       effort = val;
     } else if (arg === '--prompt') {
@@ -89,17 +89,6 @@ export function parseArgs(argv: string[] = process.argv.slice(2)): SmokeArgs {
     throw new Error('--model is required. Run with --help for usage.');
   }
   return { model, effort, prompt: prompt ?? DEFAULT_PROMPT };
-}
-
-export function readProviderInputsFromEnv(): ProviderInputs {
-  return {
-    anthropicOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? '',
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
-    openaiOauthToken: process.env.OPENAI_OAUTH_TOKEN ?? '',
-    openaiApiKey: process.env.OPENAI_API_KEY ?? '',
-    geminiOauthToken: process.env.GEMINI_OAUTH_TOKEN ?? '',
-    geminiApiKey: process.env.GEMINI_API_KEY ?? '',
-  };
 }
 
 async function main(): Promise<number> {

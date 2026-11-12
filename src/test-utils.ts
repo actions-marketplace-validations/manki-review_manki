@@ -1,5 +1,69 @@
-import { AuthorReplyClass, FindingFingerprint, FindingFingerprintEntry, FindingSeverity, RoundContext } from './types';
-import { titleToSlug } from './github';
+import { execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+
+import { AuthorReplyClass, FindingFingerprint, FindingFingerprintEntry, FindingSeverity, ParsedDiff, RoundContext } from './types';
+import { BotIdentity, CodeLinks, titleToSlug } from './github';
+import { parsePRDiff } from './diff';
+
+/** Runs git in `cwd` with a fixed author and returns its trimmed output. */
+export function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8' }).trim();
+}
+
+/** Commits `base` in a new git repo, writes `head` over it and returns the repo with the staged diff between the two. */
+export function gitWorkspace(base: Record<string, string>, head: Record<string, string>): { root: string; diff: ParsedDiff } {
+  const root = mkdtempSync(join(tmpdir(), 'manki-workspace-'));
+  const write = (files: Record<string, string>) => {
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(root, path)), { recursive: true });
+      writeFileSync(join(root, path), content);
+    }
+  };
+  write(base);
+  git(root, 'init', '-q');
+  git(root, 'add', '-A');
+  git(root, 'commit', '-qm', 'base');
+  write(head);
+  git(root, 'add', '-A');
+  return { root, diff: parsePRDiff(git(root, 'diff', '--cached', '--no-color', '--no-ext-diff', '--src-prefix=a/', '--dst-prefix=b/')) };
+}
+
+/** How many times larger the large input of `expectLinearTime` is than the small one, unless the caller gives both. */
+const SIZE_RATIO = 16;
+/** A small input faster than this is mostly fixed cost and timer noise, so the bound is taken from this time instead. */
+const TIME_FLOOR_MS = 50;
+
+/** How many times the size ratio the large input may take. A linear step takes the ratio itself, and a busy runner more. */
+const MARGIN = 4;
+
+/**
+ * Checks that a step takes time linear in its input size. `time` runs the step on an input of the given size and returns
+ * the milliseconds the step took. A linear step takes `size / smaller` times as long on `size` as on `smaller`, and
+ * `MARGIN` times that is allowed. Throws when `smaller` is not between 0 and `size`, since such a pair compares nothing.
+ */
+export async function expectLinearTime(
+  time: (size: number) => number | Promise<number>, size: number, { smaller = Math.round(size / SIZE_RATIO) } = {},
+): Promise<void> {
+  if (!(smaller > 0 && smaller < size)) throw new Error(`expectLinearTime needs 0 < smaller < size, got smaller ${smaller} and size ${size}`);
+  // Load only adds time, so the fastest of three runs is the closest to the step's own time.
+  let small = Infinity;
+  for (let i = 0; i < 3; i++) small = Math.min(small, await time(smaller));
+  const bound = MARGIN * (size / smaller) * Math.max(small, TIME_FLOOR_MS);
+  // One stretched run fails nothing: a large run over the bound is timed again, twice at most.
+  let large = await time(size);
+  for (let i = 0; i < 2 && large >= bound; i++) large = Math.min(large, await time(size));
+  expect(large).toBeLessThan(bound);
+}
+
+/** `pageInfo` of the last page of a GraphQL connection. */
+export const LAST_PAGE = { hasNextPage: false, endCursor: null };
+
+/** Stands in for `octokit.paginate` over a mocked list method that resolves one page as `{ data }`. */
+export function paginateSinglePage(method: (params: unknown) => Promise<{ data: unknown[] }>, params: unknown): Promise<unknown[]> {
+  return method(params).then(response => response.data);
+}
 
 /**
  * Build a `RoundContext` test fixture. Required-but-uninteresting fields are
@@ -22,7 +86,7 @@ export function makeRoundContext(round: number, overrides: Partial<RoundContext>
     config: { reviewLevel: 'medium', memoryEnabled: false },
     diff: { lines: 0, additions: 0, deletions: 0, filesReviewed: 0, fileTypes: {} },
     models: { reviewer: 'r', judge: 'j' },
-    planner: { source: 'disabled', used: false, coreAgentInjections: [], priorRoundEffortDowngrades: [] },
+    planner: { source: 'disabled', used: false },
     reviewers: { agents: [] },
     judge: { summary: '' },
     dedup: {},
@@ -61,8 +125,10 @@ export function makeFindingFingerprintEntry(
     severity: overrides.severity ?? 'warning',
     authorReplyClass: overrides.authorReplyClass ?? 'none',
     ...(overrides.threadId !== undefined && { threadId: overrides.threadId }),
+    ...(overrides.reviewers !== undefined && { reviewers: overrides.reviewers }),
     ...(overrides.specialist !== undefined && { specialist: overrides.specialist }),
     ...(overrides.suggestedFix !== undefined && { suggestedFix: overrides.suggestedFix }),
+    ...(overrides.posted !== undefined && { posted: overrides.posted }),
     title,
   };
 }
@@ -140,3 +206,14 @@ function legacyFindingToFingerprintEntry(f: LegacyHandoverFindingFixture): Findi
     title: f.title,
   };
 }
+
+/** The identity a run without custom App credentials resolves to. */
+export const TEST_BOT: BotIdentity = { logins: ['manki-review[bot]'] };
+
+const numberedLines = (count: number): string[] => Array.from({ length: count }, (_, i) => `line ${i + 1}`);
+
+/** Links a finding comment's code to a fixed commit, with the lines of two files. */
+export const TEST_LINKS: CodeLinks = {
+  linkTo: (file, line, end = line) => `https://github.com/o/r/blob/sha/${file}#L${line}${end > line ? `-L${end}` : ''}`,
+  files: new Map([['src/main.ts', numberedLines(60)], ['src/util.ts', numberedLines(30)]]),
+};

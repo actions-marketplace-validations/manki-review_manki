@@ -2,23 +2,32 @@
 
 Manki is a GitHub Action that runs a multi-agent LLM code review on pull requests. This file captures the repo conventions that both human contributors and coding agents (Claude Code, Codex, Cursor, Aider, Continue, etc.) should follow. It's read natively by all of those tools — one file, all agents.
 
-See `README.md` for what manki does and `SETUP.md` for installing it in a repo. This file is strictly about conventions for working on manki itself.
+See `README.md` for what manki does and `docs/getting-started.md` for installing it in a repo. This file is strictly about conventions for working on manki itself.
 
 ## Pipeline order
 
-Manki's review pipeline runs in this order:
+The review stages are listed in this order: **planner, reviewer, judge, dedup**. Per-stage config keys (`models.{planner,reviewer,reviewer_pair,judge,refuter_pair,dedup}`), logs and docs follow it, so keep new per-stage items in the same order. `reviewer_pair` is the second finder's model and sits next to `reviewer`. `refuter_pair` is the second refuter's model and sits next to `judge`. `fallback` is not a stage and comes last.
 
-1. **Planner** — picks team size and effort levels (pre-review)
-2. **Reviewer** — parallel specialist agents produce findings
-3. **Judge** — evaluates, filters, and classifies findings by severity
-4. **Dedup** — filters findings that match previously-dismissed ones (post-judge)
+At run time, `runReview` in `src/review.ts` calls dedup before the judge:
 
-When listing per-stage items anywhere — code, docs, logs, config keys — **use this order**. Config key order should mirror the pipeline mental model.
+1. **Planner** triages the change (`trivial`, `subtle`, `paired`) and picks the judge effort. `selectTeam` sorts the PR into a review class (`classifyPr` in `src/routing.ts`) and runs the class's review group: the trivial verifier alone, one finder, or two finders on different models. Every finder gets the same `buildFinderAgent` checklist, so a pair differs only in its models. Security-sensitive, CI or dependency, and data contract paths are floor classes that force two finders.
+2. **Finders** run in parallel and produce findings. A finder that fails after its retry makes the round incomplete. Alongside them, the sibling comparisons (`runComparisons` in `src/compare.ts`) ask one small call per sibling field or sibling implementation that `listUsesOutsideDiff` found, and add their findings to the finders'.
+3. **Dedup** drops findings matching resolved findings from earlier rounds, first statically, then with the `dedup` model.
+4. **Judge** evaluates the rest, merges same-round duplicates and states each finding's severity table cell, from which `mapJudgedToFindings` works out the grade. A judge with repository tools then tries to refute the blockers and the findings it doubted (`refuteBlockers` in `src/refute.ts`). Memory suppressions then hide matching findings, never a blocker, a security finding or a tool alert. A warning that neither its cited lines nor a tool check proves is kept in the round record only (`hideUnprovenWarnings`), unless it would be a blocker if true. Each posted blocker and warning gets its `checkStatus` there (`checkStatus` in `src/refute.ts`). `determineOutcome` then decides whether any finding blocks.
+5. **Verdict reader** runs only when nothing blocks. It reads the whole diff cold on the judge's client and returns `READY` or `ADDRESS_FIRST` (`src/verdict.ts`).
 
 ## Commit messages
 
 - Short, imperative, with backtick highlighting for identifiers (function names, types, file paths, etc.)
 - Example: `` fix: handle `None` case in `parseConfig` for missing `models` field ``
+
+## Changelog
+
+- Never edit `CHANGELOG.md` in a feature or fix PR. CI rejects it. The release PR writes the changelog from the merged PRs, so put what users need to know in the PR title and body.
+
+## Docs
+
+- A change to behavior, config, action inputs or review output updates the docs it affects in the same pull request. [Where to look](#where-to-look) says which file covers what.
 
 ## Code style
 
@@ -32,22 +41,38 @@ When listing per-stage items anywhere — code, docs, logs, config keys — **us
 - Before adding a new `test()`/`it()`, search for an existing test that fits the context and extend it with a new case.
 - Before creating a test helper, search for existing utilities — test helpers typically live next to the code they exercise in `src/*.test.ts`.
 - Never ignore or skip failing tests. Fix the root cause. If the fix is genuinely out of scope, open an issue first and link it from the skip.
+- Never open, search or quote the benchmark's hold-out cases in `bench/holdout/` while working on Manki. Exclude that directory from every search. Develop and debug against `bench/cases` only, since the hold-out score decides releases.
 
 ## Architecture quick reference
 
-- `src/claude.ts` — the **single LLM integration point** (`ClaudeClient.sendMessage`). All model calls go through here.
-- `src/config.ts` — config schema, defaults, validation (`DEFAULT_CONFIG`, `KNOWN_KEYS`, `validateConfig`).
-- `src/review.ts` — team selection (`selectTeam`), planner, parallel reviewer loop.
-- `src/judge.ts` — judge agent (filters + classifies findings by severity).
-- `src/recap.ts` — dedup (static + LLM) against previously-dismissed findings.
-- `src/index.ts` — top-level orchestration and GitHub API I/O.
-- `action.yml` — action inputs/outputs.
+- `src/providers/` holds the LLM integration. Every model call goes through the `LLMClient` interface (`types.ts`), built per stage by `createLLMClient` (`factory.ts`). `anthropic.ts`, `openai.ts` and `gemini.ts` implement it over each provider's SDK or CLI.
+- `src/config.ts`: config schema, defaults, validation (`DEFAULT_CONFIG`, `KNOWN_KEYS`, `validateConfig`).
+- `src/review.ts`: planner (`runPlanner`), team selection (`selectTeam`), parallel finder loop, dedup and judge calls, round outcome (`runReview`, `determineOutcome`).
+- `src/agents.ts`: the finder prompt (`buildFinderAgent`) and the trivial verifier.
+- `src/routing.ts`: review classes, groups and floors (`classifyPr`).
+- `src/judge.ts`: judge agent (`runJudgeAgent`).
+- `src/refute.ts`: the refuter (`refuteBlockers`).
+- `src/verdict.ts`: verdict reader (`runVerdictReader`).
+- `src/compare.ts`: sibling comparisons (`runComparisons`) on the questions `listUsesOutsideDiff` (`src/symbol-uses.ts`) finds.
+- `src/sweep.ts`: with `review.sweep`, one search of the diff per kept blocker for other instances of its defect class (`runSweeps`).
+- `src/recap.ts`: prior-round state from review threads, and dedup (static and LLM) against earlier findings.
+- `src/github.ts`: GitHub API helpers (diffs, progress comments, posting reviews).
+- `src/interaction.ts`: comment commands and replies in review threads.
+- `src/state.ts`: the approval check after a thread or review changes.
+- `src/index.ts`: top-level orchestration per dispatched event (`src/dispatch.ts`).
+- `action.yml`: action inputs/outputs.
 
-Per-stage models are configured via `config.models.{planner,reviewer,judge,dedup}` (see pipeline order). The reviewer `effort` parameter maps to provider-specific thinking budgets inside `ClaudeClient.sendMessage`.
+The `effort` level maps to provider-specific thinking or reasoning settings inside each client's `sendMessage`.
 
 ## Where to look
 
 - Config schema + defaults: `src/config.ts`
+- Config reference: `docs/configuration.md`. A new or changed setting needs its entry in `scripts/config-reference.ts`, then `npm run config-reference`, and its line in `.manki.yml.example`.
 - Action inputs/outputs: `action.yml`
-- User-facing docs: `README.md`, `SETUP.md`
+- User-facing docs, by what each covers:
+  - `README.md`: overview, commands, local review. `docs/index.html`: the homepage.
+  - `docs/getting-started.md`: setup, the workflow, action inputs and outputs, events, the settings block.
+  - `docs/how-reviews-work.md`: pipeline, review groups, severity, review output, CI results, analyzers, related repositories, round records.
+  - `docs/memory.md`: review memory. `docs/security.md`: tokens, untrusted content, reviewer tools.
+  - `RELEASE.md`: release steps. This file: pipeline order and architecture.
 - Convention changes or open design questions: GitHub issues

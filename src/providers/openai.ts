@@ -1,18 +1,19 @@
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { StringDecoder } from 'string_decoder';
 import { promisify } from 'util';
 
 import OpenAI from 'openai';
 import type { ChatCompletionCreateParamsNonStreaming } from 'openai/resources/chat/completions';
 import * as core from '@actions/core';
 
-import { buildExitDiagnostics, buildTimeoutDiagnostics, seedAuthFile } from './cli-utils';
-import { LLMClient, LLMResponse, LLMUsage, OpenAIAuth, readCount, SendMessageOptions, ZERO_USAGE } from './types';
+import { buildExitDiagnostics, callWithTimeout, carryReadings, cliEnv, extractCliErrorSnippet, MankiCommand, matchQuotaText, readRelatedReads, registerAuthFileSecrets, relatedReadsFile, repoToolsPrompt, runCli, seedAuthFile, STALE_TIMEOUT_MS, toolServerCommand, warnReplyTail, withPromptDir } from './cli-utils';
+import { LimitUsage, LLMClient, LLMResponse, LLMUsage, OpenAIAuth, QuotaError, readCount, RefusalError, SendMessageOptions, ZERO_USAGE } from './types';
 
 const execFileAsync = promisify(execFile);
 
-export const STALE_TIMEOUT_MS = 90_000;
+// Re-export for existing test imports.
+export { STALE_TIMEOUT_MS };
 
 export function resolveCodexHome(): string {
   const explicit = process.env.CODEX_HOME;
@@ -26,22 +27,105 @@ export function resolveCodexHome(): string {
   return join(home, '.codex');
 }
 
+/** Names a Codex window by its length: `5-hour`, `weekly`, or its hours or days. */
+function codexWindowName(minutes: number): string {
+  if (minutes === 7 * 24 * 60) return 'weekly';
+  return minutes % (24 * 60) === 0 ? `${minutes / (24 * 60)}-day` : `${Math.round(minutes / 60)}-hour`;
+}
+
+/** Lists the `.jsonl` files under `dir` and its subfolders with their modification times, skipping what cannot be read. */
+function listSessionFiles(dir: string): { path: string; mtimeMs: number }[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return listSessionFiles(path);
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) return [];
+      try {
+        return [{ path, mtimeMs: statSync(path).mtimeMs }];
+      } catch {
+        return [];
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * Returns the `sessions/YYYY/MM/DD` folders under `codexHome` that can hold a session started since `since`, so the scan
+ * never walks the whole history. Codex names them by its own local date, and its time zone can differ from Manki's, so
+ * the folders span every zone from UTC-12 to UTC+14.
+ */
+function sessionFolders(codexHome: string, since: number): string[] {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const folders = new Set<string>();
+  const end = Date.now() + 14 * HOUR_MS;
+  for (let time = since - 12 * HOUR_MS; ; time = Math.min(time + DAY_MS, end)) {
+    const date = new Date(time);
+    folders.add(join(codexHome, 'sessions', String(date.getUTCFullYear()), pad(date.getUTCMonth() + 1), pad(date.getUTCDate())));
+    if (time >= end) break;
+  }
+  return [...folders];
+}
+
+/**
+ * Reads the usage limits Codex recorded as `rate_limits` under `codexHome` since `since`, in milliseconds, from the newest
+ * session file that has any. Calls run in parallel, so the newest file can be another call's with none yet. Every file
+ * reads the same account. Returns none when nothing was recorded.
+ */
+export function readCodexLimits(codexHome: string, since: number): LimitUsage[] {
+  const files = sessionFolders(codexHome, since).flatMap(dir => listSessionFiles(dir))
+    .filter(f => f.mtimeMs >= since)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const file of files) {
+    const limits = readSessionLimits(file.path);
+    if (limits.length > 0) return limits;
+  }
+  return [];
+}
+
+/** Reads the usage limits last recorded in the Codex session file at `path`, or none. */
+function readSessionLimits(path: string): LimitUsage[] {
+  let lines: string[];
+  try {
+    lines = readFileSync(path, 'utf8').split('\n');
+  } catch {
+    return [];
+  }
+  for (const line of lines.reverse()) {
+    if (!line.includes('"rate_limits"')) continue;
+    let rateLimits: unknown;
+    try {
+      rateLimits = (JSON.parse(line) as { payload?: { rate_limits?: unknown } }).payload?.rate_limits;
+    } catch {
+      continue;
+    }
+    if (!rateLimits || typeof rateLimits !== 'object') continue;
+    const { primary, secondary } = rateLimits as { primary?: unknown; secondary?: unknown };
+    return [primary, secondary].flatMap(w => {
+      const { used_percent: used, window_minutes: minutes, resets_at: resets } = (w ?? {}) as Record<string, unknown>;
+      if (typeof used !== 'number' || !Number.isFinite(used) || typeof minutes !== 'number' || minutes <= 0) return [];
+      return [{
+        account: 'ChatGPT subscription',
+        window: codexWindowName(minutes),
+        usedPercent: Math.round(used),
+        ...(typeof resets === 'number' && Number.isFinite(resets) && { resetsAt: resets }),
+      }];
+    });
+  }
+  return [];
+}
+
 const OPENAI_OAUTH_BOOTSTRAP_HINT =
-  'Bootstrap with `codex login` then `cat ~/.codex/auth.json | base64 | gh secret set OPENAI_OAUTH_TOKEN`. Re-run the bootstrap when the refresh_token expires.';
+  'Bootstrap with `codex login` then `cat ~/.codex/auth.json | base64 | gh secret set OPENAI_OAUTH_TOKEN`. Codex rotates the tokens when it refreshes them, so the stored copy goes stale: re-run the bootstrap when Codex fails to authenticate, or use openai_api_key instead.';
 
 // Pin Codex CLI to a known-good version and disable lifecycle scripts on install
 // to mitigate supply-chain risk if a compromised release is published. Keep this
 // in sync with the explicit install step in `.github/workflows/manki.yml`.
-export const CODEX_CLI_VERSION = '0.129.0';
-
-const CODEX_BLOCKED_BARE = new Set([
-  'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN',
-  'GEMINI_API_KEY', 'GEMINI_OAUTH_TOKEN',
-  'OPENAI_API_KEY', 'OPENAI_OAUTH_TOKEN', 'CODEX_OAUTH_TOKEN',
-  'GITHUB_TOKEN', 'GITHUB_APP_PRIVATE_KEY',
-  'REVIEW_MEMORY_TOKEN',
-  'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN', 'ACTIONS_RESULTS_URL',
-]);
+export const CODEX_CLI_VERSION = '0.166.0';
 
 export function buildOpenAIAuth(oauthToken: string, apiKey: string): OpenAIAuth {
   if (oauthToken) return { kind: 'oauth', token: oauthToken };
@@ -54,23 +138,63 @@ export function sanitizeLogOutput(text: string): string {
   return text.replace(/^::[a-z].*$/gim, '[redacted-workflow-cmd]');
 }
 
+type OpenAIReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+const REASONING_ORDER: readonly OpenAIReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
 /**
- * o-series reasoning models (o1, o3, o4, ...) accept the `reasoning_effort`
- * parameter on the chat completions API; GPT-family models (gpt-4o, gpt-4.1,
- * gpt-5, ...) do not and will reject the field.
+ * Returns the highest `reasoning_effort` the model accepts, or `undefined` if it rejects the
+ * parameter. Per OpenAI's model pages: `high` for o-series, `gpt-5` and `gpt-5.1`, `xhigh` for
+ * `gpt-5.2` to `gpt-5.5`, `max` from `gpt-5.6`. GPT-4, `-chat` and `-pro` models take none.
  */
-export function isReasoningModel(model: string): boolean {
-  return /^o\d/i.test(model);
+function maxReasoningEffort(model: string): OpenAIReasoningEffort | undefined {
+  const name = model.toLowerCase();
+  if (/-(chat|pro)(-|$)/.test(name)) return undefined;
+  if (/^o\d/.test(name)) return 'high';
+  const gpt = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/.exec(name);
+  if (!gpt) return undefined;
+  const major = Number(gpt[1]);
+  const minor = Number(gpt[2] ?? 0);
+  if (major < 5) return undefined;
+  if (major > 5 || minor >= 6) return 'max';
+  return minor >= 2 ? 'xhigh' : 'high';
 }
 
 /**
- * Map manki's effort tiers (`low|medium|high|max`) to the values the OpenAI
- * stack accepts. Both the chat completions API and the Codex CLI cap reasoning
- * effort at `'high'`, so manki's `'max'` collapses to `'high'` on both paths.
+ * Maps manki's effort tier to the `reasoning_effort` value for `model`, or `undefined`
+ * when the model rejects the parameter. `max`, and a tier above the model's highest value, become that value.
+ * The chat completions API and the Codex CLI accept the same values.
  */
-export function resolveEffortTier(effort: 'low' | 'medium' | 'high' | 'max'): 'low' | 'medium' | 'high' {
-  if (effort === 'max') return 'high';
-  return effort;
+export function resolveReasoningEffort(
+  model: string,
+  effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+): OpenAIReasoningEffort | undefined {
+  const ceiling = maxReasoningEffort(model);
+  if (!ceiling) return undefined;
+  return effort === 'max' || REASONING_ORDER.indexOf(effort) > REASONING_ORDER.indexOf(ceiling) ? ceiling : effort;
+}
+
+/** Maps an SDK 429, a used-up quota (`insufficient_quota`) or a rate limit, to a `QuotaError`. */
+function openAIQuotaError(error: unknown): QuotaError | undefined {
+  const { status, code, message } = (error ?? {}) as { status?: unknown; code?: unknown; message?: unknown };
+  if (status !== 429 && code !== 'insufficient_quota' && code !== 'rate_limit_exceeded') return undefined;
+  const text = sanitizeLogOutput(String(message ?? '')).slice(0, 500);
+  const limit = code === 'insufficient_quota' ? 'OpenAI API quota exhausted' : 'OpenAI API rate limit reached';
+  return new QuotaError(`${limit}: ${text}`, limit, matchQuotaText(text)?.resetsAt, 'key');
+}
+
+/**
+ * Returns the `-c` overrides that give Codex Manki's tool server. Its tools are read-only, so they run without
+ * approval. Codex starts the server with a few default variables only, so `env_vars` names the rest of the CLI's own
+ * environment, such as the runner temp folder, the proxy settings and the GitHub API URL `repo_info` needs. Codex reads
+ * their values from its own environment, so none of them, such as a proxy password, lands on the command line.
+ */
+function codexToolServerArgs({ command, args }: MankiCommand, env: NodeJS.ProcessEnv): string[] {
+  return [
+    '-c', `mcp_servers.manki.command=${JSON.stringify(command)}`,
+    '-c', `mcp_servers.manki.args=${JSON.stringify(args)}`,
+    '-c', 'mcp_servers.manki.default_tools_approval_mode="approve"',
+    '-c', `mcp_servers.manki.env_vars=${JSON.stringify(Object.keys(env).filter(name => name !== 'CODEX_HOME'))}`,
+  ];
 }
 
 let cliInstallPromise: Promise<string> | null = null;
@@ -99,6 +223,14 @@ export class OpenAIClient implements LLMClient {
       // 1200s hard deadline. The SDK default (600s) leaves the action hanging on slow calls.
       this.openai = new OpenAI({ apiKey: this.auth.key, timeout: 300_000 });
     }
+  }
+
+  get repoTools(): boolean {
+    return this.auth.kind === 'oauth';
+  }
+
+  sentEffort(effort: OpenAIReasoningEffort): OpenAIReasoningEffort | undefined {
+    return resolveReasoningEffort(this.model, effort);
   }
 
   async sendMessage(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
@@ -153,7 +285,9 @@ export class OpenAIClient implements LLMClient {
   }
 
   private async sendViaOAuth(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
-    const fullPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
+    const repoTools = options?.repoTools;
+    const toolsPrompt = repoTools ? `\n\n${repoToolsPrompt(repoTools, '`read_file`, `grep` and `glob`')}` : '';
+    const instructions = `${systemPrompt}${toolsPrompt}`;
     const codexHome = resolveCodexHome();
     const oauthToken = this.auth.kind === 'oauth' ? this.auth.token : undefined;
     const model = this.model;
@@ -168,217 +302,109 @@ export class OpenAIClient implements LLMClient {
     }
     const cliPath = await this.ensureCLI();
     const startTime = Date.now();
+    // A failed run keeps the readings too, since a used-up limit is when they matter most.
+    const limitReadings = () => {
+      const limits = readCodexLimits(codexHome, startTime);
+      return limits.length > 0 ? { limits } : {};
+    };
 
-    return new Promise((resolve, reject) => {
-      // `codex exec` runs a non-interactive completion, reading the prompt from stdin
-      // when invoked with `-` as the prompt argument. `--model` selects the model.
-      const args = ['exec', '--model', this.model];
+    // `codex exec` runs a non-interactive completion, reading the prompt from stdin
+    // when invoked with `-` as the prompt argument. `--model` selects the model.
+    // `runCli` runs it in an empty directory, which is not a git repository.
+    // The read-only sandbox still lets tools read every file, such as the auth files, so every built-in tool
+    // that reads files or reaches the network or an account is off, and only Manki's tool server is left.
+    const args = [
+      'exec', '--skip-git-repo-check', `--model=${this.model}`, '--sandbox', 'read-only', '-c', 'approval_policy=never',
+      '-c', 'features.shell_tool=false', '-c', 'features.view_image=false', '-c', 'web_search=disabled', '-c', 'features.apps=false',
+      '-c', 'features.plugins=false', '-c', 'features.multi_agent=false', '-c', 'features.image_generation=false',
+    ];
 
-      if (options?.effort && isReasoningModel(this.model)) {
-        // Codex CLI's `-c` accepts bare `key=value` overrides; embedded double-quotes
-        // here would be passed as literal characters because `spawn` bypasses the shell.
-        args.push('-c', `model_reasoning_effort=${resolveEffortTier(options.effort)}`);
-      } else if (options?.effort) {
-        core.warning(`Ignoring effort=${options.effort} for model "${this.model}" — not a reasoning model. The Codex CLI will apply its own default effort instead.`);
+    const reasoningEffort = options?.effort && resolveReasoningEffort(this.model, options.effort);
+    if (reasoningEffort) {
+      // Codex CLI's `-c` accepts bare `key=value` overrides; embedded double-quotes
+      // here would be passed as literal characters because `spawn` bypasses the shell.
+      args.push('-c', `model_reasoning_effort=${reasoningEffort}`);
+    } else if (options?.effort) {
+      core.warning(`Ignoring effort=${options.effort} for model "${this.model}": it does not accept reasoning effort. The Codex CLI will apply its own default effort instead.`);
+    }
+
+    // The GitHub API URL is for the tool server's `repo_info`, which Codex starts with names from this environment.
+    const apiUrl = process.env.GITHUB_API_URL;
+    const env = cliEnv('codex', { CODEX_HOME: codexHome, ...(repoTools && apiUrl && { GITHUB_API_URL: apiUrl }) });
+
+    let output = '';
+    const { code, signal, stderr, lastStdoutChunk, relatedReads } = await withPromptDir(async (promptDir) => {
+      // Manki's instructions replace Codex's own, so stdin carries only the untrusted content.
+      const instructionsPath = join(promptDir, 'instructions.md');
+      writeFileSync(instructionsPath, instructions, { mode: 0o600 });
+      const readsFile = relatedReadsFile(promptDir);
+      const toolArgs = repoTools
+        ? codexToolServerArgs(toolServerCommand(repoTools.root, { fileTools: true, steps: repoTools.steps, related: repoTools.related, readsFile }), env)
+        : [];
+      const reads = () => (repoTools?.related ? readRelatedReads(readsFile) : undefined);
+      const exit = await runCli({
+        label: 'Codex',
+        cliPath,
+        args: [...args, ...toolArgs, '-c', `model_instructions_file=${JSON.stringify(instructionsPath)}`, '-'],
+        env,
+        input: userMessage,
+        hardTimeoutMs: options?.timeoutMs,
+        signal: options?.signal,
+        onStdout: (chunk) => { output += chunk; },
+        stderrResetsStale: true,
+      }).catch((error: unknown) => { throw carryReadings(error, { relatedReads: reads(), ...limitReadings() }); });
+      return { ...exit, relatedReads: reads() };
+    }).catch((error: unknown) => {
+      warnReplyTail('Codex CLI', output);
+      throw error;
+    }).finally(() => registerAuthFileSecrets(join(codexHome, 'auth.json')));
+
+    const limits = limitReadings();
+    if (code !== 0) {
+      // Codex echoes the prompt to stderr, so only its `ERROR:` line is read for a limit.
+      const errorLine = extractCliErrorSnippet(stderr);
+      const quota = matchQuotaText(errorLine);
+      if (quota && !quota.overloaded) {
+        const message = `ChatGPT subscription limit reached: ${errorLine}`;
+        core.warning(message);
+        throw carryReadings(new QuotaError(message, 'ChatGPT subscription limit reached', quota.resetsAt, 'token'), { relatedReads, ...limits });
       }
-
-      // Read prompt from stdin
-      args.push('-');
-
-      const safeCodexEnv = Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([k]) => !CODEX_BLOCKED_BARE.has(k) && !k.startsWith('INPUT_'),
-        ),
-      ) as NodeJS.ProcessEnv;
-
-      const child = spawn(cliPath, args, {
-        env: { ...safeCodexEnv, CODEX_HOME: codexHome },
-        stdio: ['pipe', 'pipe', 'pipe'],
+      const msg = buildExitDiagnostics({
+        exitCode: code,
+        signal,
+        stderr,
+        lastStdoutChunk,
+        model,
+        effort: options?.effort,
+        promptChars: instructions.length + userMessage.length,
+        elapsedMs: Date.now() - startTime,
       });
-
-      let output = '';
-      let stderr = '';
-      let timedOut = false;
-      let stale = false;
-      let outputExceeded = false;
-      let settled = false;
-      let killTimer: NodeJS.Timeout | undefined;
-      let staleKillTimer: NodeJS.Timeout | undefined;
-      let outputKillTimer: NodeJS.Timeout | undefined;
-      let stdinKillTimer: NodeJS.Timeout | undefined;
-      let lastStdoutChunk = '';
-      let rawStdoutBytes = 0;
-      let rawStderrBytes = 0;
-
-      const clearAllTimers = (): void => {
-        clearTimeout(timer);
-        clearTimeout(staleTimer);
-        if (killTimer) clearTimeout(killTimer);
-        if (staleKillTimer) clearTimeout(staleKillTimer);
-        if (outputKillTimer) clearTimeout(outputKillTimer);
-        if (stdinKillTimer) clearTimeout(stdinKillTimer);
-      };
-
-      const timer = setTimeout(() => {
-        timedOut = true;
-        clearTimeout(staleTimer);
-        child.kill('SIGTERM');
-        killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
-        killTimer.unref();
-      }, 1200000);
-      timer.unref();
-
-      const handleStale = (): void => {
-        if (outputExceeded || timedOut) return;
-        stale = true;
-        clearTimeout(timer);
-        child.kill('SIGTERM');
-        staleKillTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
-        staleKillTimer.unref();
-      };
-      let staleTimer = setTimeout(handleStale, STALE_TIMEOUT_MS);
-      staleTimer.unref();
-
-      const MAX_OUTPUT = 50 * 1024 * 1024; // 50 MB
-      const killOnOutputExceeded = (): void => {
-        if (outputExceeded) return;
-        outputExceeded = true;
-        clearTimeout(timer);
-        clearTimeout(staleTimer);
-        child.kill('SIGTERM');
-        outputKillTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
-        outputKillTimer.unref();
-      };
-      const stdoutDecoder = new StringDecoder('utf8');
-      const stderrDecoder = new StringDecoder('utf8');
-      child.stdout.on('data', (data: Buffer) => {
-        if (outputExceeded || settled || stale || timedOut) return;
-        clearTimeout(staleTimer);
-        staleTimer = setTimeout(handleStale, STALE_TIMEOUT_MS);
-        staleTimer.unref();
-
-        rawStdoutBytes += data.length;
-        if (rawStdoutBytes + rawStderrBytes > MAX_OUTPUT) { killOnOutputExceeded(); return; }
-
-        const chunk = stdoutDecoder.write(data);
-        if (chunk.length >= 500) {
-          lastStdoutChunk = chunk.slice(-500);
-        } else {
-          lastStdoutChunk = (lastStdoutChunk + chunk).slice(-500);
-        }
-        output += chunk;
-      });
-      child.stderr.on('data', (data: Buffer) => {
-        if (outputExceeded || settled || stale || timedOut) return;
-        // Stderr counts as forward progress: long-running CLI invocations may write
-        // diagnostics exclusively to stderr while still actively making progress.
-        clearTimeout(staleTimer);
-        staleTimer = setTimeout(handleStale, STALE_TIMEOUT_MS);
-        staleTimer.unref();
-        rawStderrBytes += data.length;
-        stderr += stderrDecoder.write(data);
-        if (rawStdoutBytes + rawStderrBytes > MAX_OUTPUT) killOnOutputExceeded();
-      });
-
-      child.on('close', (code, signal) => {
-        clearAllTimers();
-        if (settled) return;
-        settled = true;
-        const remaining = stdoutDecoder.end();
-        if (remaining) output += remaining;
-        stderr += stderrDecoder.end();
-        if (stale) {
-          const details = buildTimeoutDiagnostics(lastStdoutChunk, stderr);
-          const msg = `Codex CLI stale — no output for ${STALE_TIMEOUT_MS / 1000}s${details ? `. ${details}` : ''}`;
-          core.warning(msg);
-          reject(new Error(msg));
-          return;
-        }
-        if (timedOut) {
-          const details = buildTimeoutDiagnostics(lastStdoutChunk, stderr);
-          const msg = `Codex CLI timed out after 1200s${details ? `. ${details}` : ''}`;
-          core.warning(msg);
-          reject(new Error(msg));
-          return;
-        }
-        if (outputExceeded) {
-          reject(new Error('Codex CLI output exceeded 50MB limit'));
-          return;
-        }
-        if (code !== 0) {
-          const msg = buildExitDiagnostics({
-            exitCode: code,
-            signal,
-            stderr,
-            lastStdoutChunk,
-            model,
-            effort: options?.effort,
-            promptChars: fullPrompt.length,
-            elapsedMs: Date.now() - startTime,
-          });
-          core.warning(`Codex CLI failed (${msg})`);
-          reject(new Error(`Codex CLI invocation failed (${msg})`));
-          return;
-        }
-        const content = output.trim();
-        core.debug(sanitizeLogOutput(content.slice(0, 200)));
-        resolve({
-          content,
-          usage: { ...ZERO_USAGE },
-          latencyMs: Date.now() - startTime,
-        });
-      });
-
-      child.on('error', (error) => {
-        clearAllTimers();
-        if (settled) return;
-        settled = true;
-        reject(new Error(`Codex CLI spawn failed: ${error.message}`));
-      });
-
-      child.stdin.on('error', (err) => {
-        core.warning(`stdin write error: ${err.message}`);
-      });
-
-      try {
-        const canWrite = child.stdin.write(fullPrompt);
-        if (!canWrite) {
-          child.stdin.once('drain', () => {
-            if (!settled) {
-              try { child.stdin.end(); } catch { /* stream already destroyed */ }
-            }
-          });
-        } else {
-          try { child.stdin.end(); } catch { /* stream may be destroyed */ }
-        }
-      } catch (err) {
-        core.warning(`stdin write failed: ${(err as Error).message}`);
-        if (!settled) {
-          settled = true;
-          clearAllTimers();
-          reject(new Error(`stdin write failed: ${(err as Error).message}`));
-        }
-        try { child.kill('SIGTERM'); } catch { /* already dead */ }
-        stdinKillTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already dead */ } }, 5000);
-        stdinKillTimer.unref();
-      }
-    });
+      core.warning(`Codex CLI failed (${msg})`);
+      warnReplyTail('Codex CLI', output);
+      throw carryReadings(new Error(`Codex CLI invocation failed (${msg})`), { relatedReads, ...limits });
+    }
+    const content = output.trim();
+    core.debug(sanitizeLogOutput(content.slice(0, 200)));
+    return {
+      content,
+      latencyMs: Date.now() - startTime,
+      model: this.model,
+      ...(relatedReads && { relatedReads }),
+      ...limits,
+    };
   }
 
   private async sendViaAPI(systemPrompt: string, userMessage: string, options?: SendMessageOptions): Promise<LLMResponse> {
     if (!this.openai) throw new Error('OpenAI client not initialized');
 
-    const reasoning = isReasoningModel(this.model);
-    if (options?.effort && !reasoning) {
-      core.warning(`Ignoring effort=${options.effort} for model "${this.model}" — not a reasoning model. Effort has no effect via the OpenAI API for GPT-family models.`);
+    const reasoningEffort = options?.effort && resolveReasoningEffort(this.model, options.effort);
+    if (options?.effort && !reasoningEffort) {
+      core.warning(`Ignoring effort=${options.effort} for model "${this.model}": it does not accept reasoning effort. Effort has no effect via the OpenAI API for this model.`);
     }
 
-    // `reasoning_effort` is only valid on o-series chat completions and the SDK's
-    // non-streaming union doesn't always surface it on every model branch. Intersecting
-    // with a narrow `{ reasoning_effort?: ... }` keeps the rest of the call site fully
-    // typed while letting us assign the field with compile-time checking.
-    type ParamsWithReasoningEffort = ChatCompletionCreateParamsNonStreaming & {
-      reasoning_effort?: 'low' | 'medium' | 'high';
+    // The SDK's `reasoning_effort` union lacks `max`, which `gpt-5.6` onwards accept.
+    type ParamsWithReasoningEffort = Omit<ChatCompletionCreateParamsNonStreaming, 'reasoning_effort'> & {
+      reasoning_effort?: OpenAIReasoningEffort;
     };
     const params: ParamsWithReasoningEffort = {
       model: this.model,
@@ -388,14 +414,27 @@ export class OpenAIClient implements LLMClient {
       ],
     };
 
-    if (reasoning && options?.effort) {
-      params.reasoning_effort = resolveEffortTier(options.effort);
+    if (reasoningEffort) {
+      params.reasoning_effort = reasoningEffort;
     }
 
     const startTime = Date.now();
-    const response = await this.openai.chat.completions.create(params);
-    const content = response.choices?.[0]?.message?.content ?? '';
+    const openai = this.openai;
+    const response = await callWithTimeout('OpenAI API', options, (signal) =>
+      openai.chat.completions.create(params as ChatCompletionCreateParamsNonStreaming, signal ? { signal } : undefined))
+      .catch((error: unknown) => { throw openAIQuotaError(error) ?? error; });
+    const choice = response.choices?.[0];
+    const content = choice?.message?.content ?? '';
     core.debug(sanitizeLogOutput(content.slice(0, 200)));
+    if (choice?.finish_reason === 'length' || choice?.finish_reason === 'content_filter') {
+      core.warning(`OpenAI API reply ended on finish_reason ${choice.finish_reason}`);
+      warnReplyTail('OpenAI API', content);
+    }
+    const refusal = choice?.message?.refusal;
+    if (choice?.finish_reason === 'content_filter' || refusal) {
+      const reason = refusal ? 'refusal' : 'content_filter';
+      throw new RefusalError(`OpenAI API declined the request: ${reason}${refusal ? `. ${sanitizeLogOutput(refusal).slice(0, 300)}` : ''}`, reason);
+    }
 
     const sdkUsage = response.usage as undefined | {
       prompt_tokens?: number;
@@ -407,11 +446,12 @@ export class OpenAIClient implements LLMClient {
       ? {
           inputTokens: readCount(sdkUsage.prompt_tokens),
           outputTokens: readCount(sdkUsage.completion_tokens),
-          cachedTokens: readCount(sdkUsage.prompt_tokens_details?.cached_tokens),
+          cacheReadTokens: readCount(sdkUsage.prompt_tokens_details?.cached_tokens),
+          cacheWriteTokens: 0,
           reasoningTokens: readCount(sdkUsage.completion_tokens_details?.reasoning_tokens),
         }
       : { ...ZERO_USAGE };
 
-    return { content, usage, latencyMs: Date.now() - startTime };
+    return { content, usage, latencyMs: Date.now() - startTime, model: this.model, truncated: choice?.finish_reason === 'length' };
   }
 }

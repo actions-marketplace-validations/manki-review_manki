@@ -2,33 +2,54 @@
 # Place this file as .manki.yml in your repository root
 
 # Automatically review PRs on open/update (default: true)
-# When false, reviews only run via @manki review
+# When false, Manki reviews only on request, such as @manki review
 # auto_review: true
 
 # Auto-approve when all blocking findings are resolved (default: true)
 # Triggers on thread resolution and via @manki check
 # auto_approve: true
 
+# The lowest repository role with which a PR author may clear a blocker or a
+# security finding on their own PR: admin, maintain or write (default: maintain).
+# Read from the base branch only. With `write`, everyone who can push may clear
+# the blockers on their own PRs.
+# author_clear_role: maintain
+
 # File filtering
-# Defaults: ["*.lock", "dist/**", "*.generated.*"]
+# Defaults: the known package lockfiles that end in ".lock", such as "Cargo.lock" and
+# "poetry.lock", then "dist/**" and "*.generated.*". Any other ".lock" file, such
+# as ".github/workflows/actions.lock", is read. The list replaces the defaults,
+# so repeat the ones you keep. [] excludes nothing.
 # exclude_paths:
-#   - "*.lock"
+#   - "Cargo.lock"
 #   - "dist/**"
-#   - "*.generated.*"
+#   - "vendor/**"
 
-# Maximum diff lines before skipping review (default: 50000)
-# max_diff_lines: 50000
+# PRs that get no automatic review (default: none). Read from the base branch
+# only. Labels and authors compare case-insensitively. Branches are globs on the
+# head branch. Label and branch rules skip only branches in the repo itself. A skipped Manki check passes a
+# required status check, so prefer skip_authors for bots: GitHub sets the author.
+# skip_labels: ["dependencies"]
+# skip_authors: ["dependabot[bot]"]
+# skip_branches: ["dependabot/**"]
 
-# Team sizing: auto (default), small (3 agents), medium (5), large (7)
-# review_level: auto
-# review_thresholds:
-#   small: 200   # diffs under this many lines get a small team
-#   medium: 1000  # diffs under this many lines get a medium team
+# Draft PRs (default: skip). `skip` reviews a draft only on request, such as
+# `@manki review`. `review` reviews drafts automatically. A draft review never
+# approves and does not count toward the round cap.
+# drafts: skip
 
-# Custom reviewer agents (added to the built-in 7-agent pool)
-# The built-in pool covers: Security, Architecture, Correctness, Testing,
-# Performance, Maintainability, Dependencies. Custom reviewers get a scoring
-# boost during team selection.
+# Review size limits, in reviewable lines after exclude_paths, read from the
+# base branch only. A PR up to auto_review_max_lines is reviewed automatically.
+# A larger one gets a request to split it, with Review again in its settings block. A forced
+# review covers it up to max_diff_lines. Above that Manki never reviews. A finder
+# reads a diff over slice_lines (at least 200) in slices of that size.
+# auto_review_max_lines: 8000
+# max_diff_lines: 15000
+# slice_lines: 1500
+
+# Extra checks for the finders. Each entry becomes one more line in the
+# finder prompt, after correctness, security, error paths, tests that cannot
+# fail and contract breaks. Both finders get the same prompt.
 # reviewers:
 #   - name: "Protocol Compliance"
 #     focus: "DIP compliance, consensus rules, protocol-specific invariants"
@@ -37,57 +58,178 @@
 # instructions: |
 #   This is a Rust project. Focus on ownership and error handling.
 
+# A short phrase naming what the project is (default: none). The finders read
+# it as "This PR is in a blockchain consensus library project".
+# project: "blockchain consensus library"
+
 # Per-stage model selection
 # models:
-#   planner: claude-haiku-4-5      # fast pre-review planning pass
-#   reviewer: claude-sonnet-4-6    # fast, parallel reviewers
-#   judge: claude-sonnet-4-6        # precise, single judge
-#   dedup: claude-haiku-4-5        # fast LLM dedup against prior findings
-#   # Per-agent model overrides. Keys must match a known reviewer name
-#   # (built-in agent or one declared under `reviewers:` above).
-#   # Resolution order per agent: agents[name] -> models.reviewer -> default.
-#   agents:
-#     "Security & Safety": claude-opus-4-7
+#   planner: claude-haiku-5-5      # fast pre-review planning pass
+#   reviewer: claude-sonnet-5-5    # the finder of the built-in groups, and `@reviewer` in a group of your own
+#   reviewer_pair: gpt-6.1-terra   # the second finder of the built-in `pair` group, and `@reviewer_pair` in a group of your own (default: the other Claude tier, Sonnet with Opus)
+#   judge: claude-opus-5-5         # precise, single judge
+#   refuter_pair: gpt-6.1-sol      # a second refuter on another model, beside the first on the judge's model (default: off, needs the Claude or Codex CLI)
+#   dedup: claude-haiku-5-5        # fast LLM dedup against prior findings
+#   fallback: claude-sonnet-5-5    # reruns a stage a safety filter refused (default: reviewer, or the other Claude tier for a stage already on it)
 #
 # To use OpenAI, set `openai_api_key` (or `openai_oauth_token` for Codex CLI) and override models:
 # models:
-#   planner: gpt-4o-mini
-#   reviewer: gpt-4o-mini
-#   judge: o4-mini
-#   dedup: gpt-4o-mini
+#   planner: gpt-6-luna
+#   reviewer: gpt-6.1-terra
+#   judge: gpt-6.1-sol
+#   dedup: gpt-6-luna
 #
 # To use Gemini, set `gemini_api_key` (or `gemini_oauth_token` for Gemini CLI) and override models:
 # models:
-#   planner: gemini-2.5-flash
-#   reviewer: gemini-2.5-flash
-#   judge: gemini-2.5-pro
-#   dedup: gemini-2.5-flash
+#   planner: gemini-3.5-flash-lite
+#   reviewer: gemini-3.8-flash
+#   judge: gemini-3.8-flash
+#   dedup: gemini-3.5-flash-lite
 #
 # Models are auto-detected by prefix: `claude-*` -> Anthropic, `gpt-*` / `o*` -> OpenAI, `gemini-*` -> Gemini.
-# You can also use explicit `provider/model` syntax (e.g. `anthropic/claude-haiku-4-5`).
+# You can also use explicit `provider/model` syntax (e.g. `anthropic/claude-haiku-5-5`).
 
 # Planner stage (default: enabled)
-# When enabled and review_level is "auto", a fast pre-review pass chooses the
-# team size (1/2/3/4/5/6/7), reviewer/judge effort, and PR type. teamSize=1 routes
-# trivial changes (docs, renames, comment-only edits) to a single Trivial
-# Change Verifier. Disable to always use the heuristic team selector.
+# A fast pre-review pass answers three questions about the nature of the change:
+# trivial (a single quick check reads it), subtle (finders run at high effort
+# instead of medium) and paired (a second finder on another model reads it
+# too). These are the defaults, and the `review` block below changes who reads
+# what. An unclear answer takes the side that adds review. Disabled, every
+# round gets two finders at high effort by default. A diff that touches a
+# security-sensitive path, CI, a dependency manifest or a data contract
+# (migrations, SQL, protobuf, schemas, OpenAPI) always gets two finders.
 # planner:
 #   enabled: true
 
-# Where to post nit findings: 'issues' (separate GitHub issue) or 'comments' (inline PR comments)
-# nit_handling: issues
+# Judge stage. `effort` is low, medium, high, xhigh, max or auto (default),
+# which takes the level the planner picks. `tool_steps` is the number of
+# read-only repository tool calls the judge may make while it grades, on the
+# Claude or Codex CLI (default: 0, none).
+# judge:
+#   effort: auto
+#   tool_steps: 0
+
+# Who reviews what. A group lists one or more readers, each with its own model
+# (any supported provider), effort and `focus`. A class matches PRs by path or
+# by the planner's answers, and `routing` names the group for each class.
+# Without this block the built-ins below apply: a quick check, one finder or
+# two. Read from the base branch only, so a PR cannot weaken its own review.
+# Each PR falls in the highest ranked matching class:
+# security (100), supply_chain (90), data_contract (80), behavior (50, planner
+# said paired), internal (30) or docs (20, planner said trivial). The first
+# three are floors: at least two finders on two distinct models, none at `low`
+# effort, unless `allow_weaker` names the class. Built-in groups: trivial (the
+# quick check), solo (one finder) and pair (two finders). See
+# docs/how-reviews-work.md, "Review groups".
+#
+# Minimal: two strong readers on security and data contract PRs only.
+# review:
+#   groups:
+#     deep:
+#       reviewers:
+#         - { model: claude-opus-5-5, effort: high }
+#         - { model: gpt-5.5, effort: high }
+#   routing:
+#     security: deep
+#     data_contract: deep
+#
+# Typical:
+# review:
+#   default_group: pair            # group for a class with no route
+#   groups:
+#     solo:
+#       reviewers: [{ model: "@reviewer", effort: auto }]
+#     pair:
+#       reviewers:
+#         - { model: "@reviewer", effort: auto }        # `@reviewer` and `@reviewer_pair` resolve through `models`
+#         - { model: "@reviewer_pair", effort: auto }   # effort: low, medium, high, xhigh, max or auto
+#     deep:
+#       reviewers:
+#         - { model: claude-opus-5-5, effort: high, focus: "authz, injection, secret handling" }
+#         - { model: gemini-3-pro, effort: high }
+#         - { model: claude-sonnet-5-5, effort: medium, focus: "error paths and rollback" }
+#   classes:
+#     security:                      # adds paths to the built-in rule, never narrows it
+#       match: { paths_any: ["src/billing/**"] }
+#     hot_path:
+#       rank: 85
+#       match: { paths_any: ["src/consensus/**", "src/net/**"] }
+#   routing:
+#     security: deep
+#     hot_path: deep
+#     internal: solo
+#   allow_weaker: []                 # floor classes allowed below the floor
+#   critical_paths: ["src/ledger/**"]   # any wrong result in these paths is severe, for the judge
+#   outside_input: "HTTP requests and webhook payloads"   # for the judge
+#   examples:                        # findings from this repo on each side of the bar, for the judge
+#     blocker:
+#       - "A rounding error in a ledger balance, however rare."
+#     not_blocker:
+#       - "A slow export of the monthly report: `note`."
+#   sweep: false                     # search the diff for other instances of each kept blocker's defect class
+#   notes: 3                         # how many notes a review lists at most. 0 lists none
+#   rules: warn                      # a broken required rule of your instruction files, such as
+#                                    # "every migration needs a rollback", is at least a warning. `block` makes it
+#                                    # a blocker, so the PR is not approved until the rule is followed
+
+# CI results the reviewers read as evidence (default: all on), and the
+# analyzers Manki runs itself.
+# Manki reads what CI reported on the PR head commit and keeps the results on
+# lines of the diff. A Manki note on the same file and line
+# is dropped. Warnings, blockers and security findings are kept. This block is read from the base branch,
+# never from the PR, so a PR cannot turn a source off. A source the workflow
+# token cannot read is skipped. See docs/how-reviews-work.md, "Reading CI results"
+# and "Running Manki's analyzers".
+# static_analysis:
+#   checks: true             # check-run annotations, needs `checks: read`
+#   code_scanning: true      # code scanning alerts, needs `security-events: read`
+#   dependency_review: true  # vulnerable packages the PR adds
+#   wait_for_checks: []      # check runs to wait for, such as [lint, CodeQL]
+#   wait_timeout_seconds: 300
+#   analyzers:               # analyzers Manki runs itself, or `all`
+#     ast_grep: false        # Manki's ast-grep rules for JS, TS and Python. The Rust rules run in a Cargo repository
+#     secrets: false         # gitleaks on the added lines
+#     dependencies: false    # OSV-Scanner on the changed lockfiles, Cargo.lock included
+#     semgrep: false         # or `rules: [...]`, your Semgrep rule files
+#     actionlint: true       # on changed workflows, unless CI runs it
+#     zizmor: true           # on changed workflows, unless CI runs it
+#     shellcheck: true       # on changed shell scripts, unless CI runs it
+
+# Public github.com repos the review may read as context (default: none).
+# `reference`: a repo this one implements or ports. `consumer`: a repo that
+# depends on this one. `dependency`: a repo this one depends on, with `ref` set
+# to the version this repo pins. `ref` (branch, tag or full commit hash) and `paths` are optional.
+# Read from the base branch, never from the PR. See docs/how-reviews-work.md, "Related repositories".
+# related_repos:
+#   - { repo: dashpay/dash, kind: reference, paths: [src/] }
+#   - { repo: dashpay/platform, kind: consumer, ref: master, paths: ["packages/rs-*"] }
+#   - { repo: tokio-rs/tokio, kind: dependency, ref: tokio-1.38.0, paths: [tokio/src/] }
 
 # Multi-pass verification: run each reviewer N times with shuffled file ordering.
 # Only findings that appear consistently across passes are kept, reducing false positives.
 # Must be an integer between 1 and 5. Default: 1 (no multi-pass).
 # review_passes: 1
 
-# Hide the structured `Manki context` block as an HTML comment instead of a `<details>` block (default: false)
-# stats:
-#   hidden: false
+# How rounds end. After `max_auto_rounds` automatic rounds since Manki's last
+# approval, automatic review pauses until a review is started by hand, which
+# turns it back on for `rounds_after_restart` rounds. 0 turns the cap off.
+# convergence:
+#   max_auto_rounds: 10
+#   rounds_after_restart: 3
+#   test_path_patterns: ["**/*.test.*", "**/*.spec.*", "**/tests/**", "**/__tests__/**"]   # test files, where later rounds drop the notes
+#   suppress_resolved_threads: true   # a resolved thread suppresses matching findings in later rounds
 
-# Review memory (requires memory_repo_token)
-# Stores learnings, suppressions, and patterns to improve reviews over time
+# On merge, count per severity and finder how many posted findings were fixed,
+# dismissed or left untouched. Written to the job summary, and appended to
+# `metrics/fix-rate.jsonl` in the repo's memory when memory is enabled.
+# Default: on when `memory.enabled` is true.
+# metrics:
+#   fix_rate: true
+
+# Review memory: stores learnings and suppressions to improve reviews over time.
+# Without `repo`, a public repo's memory lives in the central memory repository
+# and needs no token. A repo of your own needs the `memory_repo_token` input, and
+# a private repo needs one that is private and has the same owner.
 # memory:
 #   enabled: false
-#   repo: ""  # defaults to {owner}/review-memory
+#   repo: ""
